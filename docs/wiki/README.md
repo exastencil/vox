@@ -2,6 +2,7 @@
 
 This folder contains technical documentation and design notes for the Vox Aetatum engine and its reference content.
 
+- Client/Server Split and Runtime Topology: See `architecture-client-server.md`.
 - Minecraft Technical Summary (reference): See `minecraft-technical-summary.md` for an overview of systems we aim to replicate as a baseline for the engine and the base game mods.
 
 Over time we will expand this with:
