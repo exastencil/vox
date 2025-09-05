@@ -4,6 +4,7 @@ const slog = sokol.log;
 const sg = sokol.gfx;
 const sapp = sokol.app;
 const sglue = sokol.glue;
+const sdtx = sokol.debugtext;
 const gs = @import("gs.zig");
 const worldgen = @import("worldgen.zig");
 const registry = @import("registry.zig");
@@ -44,6 +45,8 @@ export fn init() void {
         .environment = sglue.environment(),
         .logger = .{ .func = slog.func },
     });
+    // debug text setup
+    sdtx.setup(.{});
     // Clear to solid black (default is zero-initialized, but set explicitly for clarity)
     state.pass_action.colors[0] = .{
         .load_action = .CLEAR,
@@ -58,7 +61,30 @@ export fn init() void {
 }
 
 export fn frame() void {
+    // advance simulation one tick per frame for now
+    if (state.sim) |*s| {
+        s.tick();
+    }
+
     sg.beginPass(.{ .action = state.pass_action, .swapchain = sglue.swapchain() });
+
+    // draw tick counter in upper-right
+    if (state.sim) |s| {
+        var buf: [64:0]u8 = undefined;
+        const text_slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "tick: {d}", .{s.tick_counter}) catch "tick: ?";
+        buf[text_slice.len] = 0; // ensure 0-terminated for sdtx
+        const text: [:0]const u8 = buf[0..text_slice.len :0];
+        const w: i32 = sapp.width();
+        const cols: i32 = @divTrunc(w, 8); // assume 8px cell width for debugtext
+        const col_start: i32 = @max(0, cols - @as(i32, @intCast(text.len)));
+        sdtx.canvas(@floatFromInt(sapp.width()), @floatFromInt(sapp.height()));
+        sdtx.origin(0, 0);
+        sdtx.move(@floatFromInt(col_start), 0);
+        sdtx.color3b(255, 255, 255);
+        sdtx.puts(text);
+        sdtx.draw();
+    }
+
     sg.endPass();
     sg.commit();
 }
@@ -69,6 +95,9 @@ export fn cleanup() void {
         s.deinit();
         state.sim = null;
     }
+
+    // shutdown debug text first
+    sdtx.shutdown();
 
     sg.shutdown();
     if (reg) |*r| {
