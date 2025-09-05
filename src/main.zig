@@ -93,10 +93,11 @@ export fn frame() void {
     // ensure C64 font in case other code changes it later
     sdtx.font(4);
 
-    // Right-aligned tick text (row 1)
+    // Right-aligned tick/TPS text (row 1)
     if (state.sim) |s| {
-        var buf: [64:0]u8 = undefined;
-        const text_slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "tick: {d}", .{s.tick_counter.load(.monotonic)}) catch "tick: ?";
+        const snap = s.getSnapshot();
+        var buf: [96:0]u8 = undefined;
+        const text_slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "tick: {d}  tps: {d:.2}", .{ snap.tick, snap.rolling_tps }) catch "tick: ?";
         buf[text_slice.len] = 0; // ensure 0-terminated for sdtx
         const text: [:0]const u8 = buf[0..text_slice.len :0];
         const cols_f: f32 = (w_px / scale) / 8.0;
