@@ -10,12 +10,10 @@ const worldgen = @import("worldgen.zig");
 const registry = @import("registry.zig");
 const ids = @import("ids.zig");
 const simulation = @import("simulation.zig");
-const client = @import("client.zig");
 
 const State = struct {
     pass_action: sg.PassAction = .{},
     sim: ?simulation.Simulation = null,
-    cl: ?client.Client = null,
     ui_scale: f32 = 1.0,
 };
 
@@ -76,16 +74,12 @@ export fn init() void {
     };
     state.sim = sim;
 
-    // initialize client (simulation owns fixed-timestep)
-    const cl_local = client.Client.init(&state.sim.?);
-    state.cl = cl_local;
+    // start simulation thread (decoupled from rendering)
+    state.sim.?.start() catch return;
 }
 
 export fn frame() void {
-    // advance simulation at fixed 20 TPS using client accumulator
-    if (state.cl) |*c| {
-        c.update();
-    }
+    // rendering only; simulation ticks on its own thread
 
     sg.beginPass(.{ .action = state.pass_action, .swapchain = sglue.swapchain() });
 
@@ -102,7 +96,7 @@ export fn frame() void {
     // Right-aligned tick text (row 1)
     if (state.sim) |s| {
         var buf: [64:0]u8 = undefined;
-        const text_slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "tick: {d}", .{s.tick_counter}) catch "tick: ?";
+        const text_slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "tick: {d}", .{s.tick_counter.load(.monotonic)}) catch "tick: ?";
         buf[text_slice.len] = 0; // ensure 0-terminated for sdtx
         const text: [:0]const u8 = buf[0..text_slice.len :0];
         const cols_f: f32 = (w_px / scale) / 8.0;
@@ -120,13 +114,9 @@ export fn frame() void {
 }
 
 export fn cleanup() void {
-    // drop client first
-    if (state.cl) |_| {
-        state.cl = null;
-    }
-
-    // deinit simulation if present
+    // stop and deinit simulation if present
     if (state.sim) |*s| {
+        s.stop();
         s.deinit();
         state.sim = null;
     }

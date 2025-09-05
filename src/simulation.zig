@@ -23,12 +23,17 @@ pub const Simulation = struct {
     mode: StorageMode,
     section_count_y: u16,
     world_seed: u64,
-    tick_counter: u64 = 0,
+    // tick counter and thread control
+    tick_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
     // fixed-timestep timing owned by simulation
     target_tps: f64 = 20.0,
-    accumulator: f64 = 0.0,
-    last_time_ns: i128 = 0,
+    last_tick_ns: i128 = 0,
     max_accum: f64 = 0.25,
+    // metrics
+    last_tick_dt_sec: f64 = 0.0,
+    actual_tps: f64 = 0.0,
     chunks: std.ArrayList(gs.Chunk),
 
     pub fn init(opts: SimulationOptions) !Simulation {
@@ -42,11 +47,14 @@ pub const Simulation = struct {
             .mode = opts.mode,
             .section_count_y = opts.section_count_y,
             .world_seed = seed,
-            .tick_counter = 0,
+            .tick_counter = std.atomic.Value(u64).init(0),
+            .running = std.atomic.Value(bool).init(false),
+            .thread = null,
             .target_tps = 20.0,
-            .accumulator = 0.0,
-            .last_time_ns = std.time.nanoTimestamp(),
+            .last_tick_ns = 0,
             .max_accum = 0.25,
+            .last_tick_dt_sec = 0.0,
+            .actual_tps = 0.0,
             .chunks = undefined,
         };
 
@@ -85,24 +93,45 @@ pub const Simulation = struct {
     }
 
     pub fn tick(self: *Simulation) void {
-        // Placeholder: follow docs/wiki/architecture-simulation-update-order.md in future
-        self.tick_counter += 1;
+        // pacing + one simulation step
+        const target_ns: i128 = @intFromFloat(1_000_000_000.0 / self.target_tps);
+        const t0: i128 = std.time.nanoTimestamp();
+
+        // TODO: real simulation step phases go here (terrain, entities, etc.)
+        // increment tick counter
+        _ = self.tick_counter.fetchAdd(1, .monotonic);
+
+        const t1: i128 = std.time.nanoTimestamp();
+        var dt_ns: i128 = t1 - t0;
+        if (dt_ns < 0) dt_ns = 0;
+        self.last_tick_dt_sec = @as(f64, @floatFromInt(dt_ns)) / 1_000_000_000.0;
+        if (self.last_tick_dt_sec > 0) {
+            self.actual_tps = 1.0 / self.last_tick_dt_sec;
+        }
+        // sleep to maintain target TPS if able
+        if (dt_ns < target_ns) {
+            const remain: i128 = target_ns - dt_ns;
+            std.Thread.sleep(@intCast(remain));
+        }
     }
 
-    pub fn update(self: *Simulation) void {
-        const now_ns: i128 = std.time.nanoTimestamp();
-        var dt_ns: i128 = now_ns - self.last_time_ns;
-        if (dt_ns < 0) dt_ns = 0;
-        const dt_sec: f64 = @as(f64, @floatFromInt(dt_ns)) / 1_000_000_000.0;
-        self.last_time_ns = now_ns;
+    fn tickThreadMain(self_ptr: *Simulation) void {
+        while (self_ptr.running.load(.acquire)) {
+            self_ptr.tick();
+        }
+    }
 
-        const clamped_dt = if (dt_sec > self.max_accum) self.max_accum else dt_sec;
-        self.accumulator += clamped_dt;
+    pub fn start(self: *Simulation) !void {
+        if (self.running.swap(true, .acquire)) return; // already running
+        self.last_tick_ns = std.time.nanoTimestamp();
+        self.thread = try std.Thread.spawn(.{}, tickThreadMain, .{self});
+    }
 
-        const step: f64 = 1.0 / self.target_tps;
-        while (self.accumulator >= step) {
-            self.tick();
-            self.accumulator -= step;
+    pub fn stop(self: *Simulation) void {
+        if (!self.running.swap(false, .release)) return;
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
         }
     }
 };
