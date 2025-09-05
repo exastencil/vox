@@ -4,6 +4,7 @@ const sg = sokol.gfx;
 const sapp = sokol.app;
 const sglue = sokol.glue;
 const gs = @import("gs.zig");
+const worldgen = @import("worldgen.zig");
 
 const State = struct {
     pass_action: sg.PassAction = .{},
@@ -14,6 +15,7 @@ var state: State = .{};
 export fn init() void {
     // touch GS types to ensure they compile
     _ = gs.GameState;
+    _ = worldgen.generateChunk; // ensure worldgen compiles
     sg.setup(.{
         .environment = sglue.environment(),
         .logger = .{ .func = slog.func },
