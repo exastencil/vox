@@ -97,7 +97,7 @@ export fn frame() void {
     if (state.sim) |s| {
         const snap = s.getSnapshot();
         var buf: [96:0]u8 = undefined;
-        const text_slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "tick: {d}  tps: {d:.2}", .{ snap.tick, snap.rolling_tps }) catch "tick: ?";
+        const text_slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "tick: {d}  tps: {d:.2}  players: {d}", .{ snap.tick, snap.rolling_tps, snap.player_count }) catch "tick: ?";
         buf[text_slice.len] = 0; // ensure 0-terminated for sdtx
         const text: [:0]const u8 = buf[0..text_slice.len :0];
         const cols_f: f32 = (w_px / scale) / 8.0;

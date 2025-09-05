@@ -4,6 +4,7 @@ const ids = @import("ids.zig");
 const registry = @import("registry.zig");
 const worldgen = @import("worldgen.zig");
 const constants = @import("constants.zig");
+const player = @import("player.zig");
 
 pub const StorageMode = union(enum) {
     memory,
@@ -25,6 +26,8 @@ pub const Snapshot = struct {
     world_seed: u64,
     section_count_y: u16,
     chunk_count: usize,
+    player_count: usize,
+    dynamic_entity_count: usize,
 };
 
 pub const Simulation = struct {
@@ -55,6 +58,12 @@ pub const Simulation = struct {
     snapshots: [2]Snapshot = undefined,
     snapshot_index: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
+    // player systems
+    players: player.PlayerRegistry,
+    next_eid: u64 = 1,
+    dynamic_entities: std.ArrayList(gs.EntityRecord),
+    entity_by_player: std.AutoHashMap(player.PlayerId, usize),
+
     chunks: std.ArrayList(gs.Chunk),
 
     pub fn init(opts: SimulationOptions) !Simulation {
@@ -78,10 +87,16 @@ pub const Simulation = struct {
             .actual_tps = 0.0,
             .snapshots = undefined,
             .snapshot_index = std.atomic.Value(u8).init(0),
+            .players = player.PlayerRegistry.init(opts.allocator),
+            .next_eid = 1,
+            .dynamic_entities = undefined,
+            .entity_by_player = std.AutoHashMap(player.PlayerId, usize).init(opts.allocator),
             .chunks = undefined,
         };
         // initialize snapshot buffers
         sim.publishSnapshot();
+        // initialize dynamic entities list
+        sim.dynamic_entities = try std.ArrayList(gs.EntityRecord).initCapacity(opts.allocator, 0);
 
         // Bootstrap vox:default: only core:void biome. Generate an 8x8 around origin.
         // For symmetry around origin, generate ranges [-4..3] inclusive on both axes.
@@ -115,6 +130,9 @@ pub const Simulation = struct {
     pub fn deinit(self: *Simulation) void {
         for (self.chunks.items) |*c| worldgen.deinitChunk(self.allocator, c);
         self.chunks.deinit(self.allocator);
+        self.dynamic_entities.deinit(self.allocator);
+        self.entity_by_player.deinit();
+        self.players.deinit();
     }
 
     pub fn tick(self: *Simulation) void {
@@ -228,6 +246,8 @@ pub const Simulation = struct {
             .world_seed = self.world_seed,
             .section_count_y = self.section_count_y,
             .chunk_count = self.chunks.items.len,
+            .player_count = self.players.by_id.count(),
+            .dynamic_entity_count = self.dynamic_entities.items.len,
         };
         self.snapshots[next] = snap;
         self.snapshot_index.store(next, .release);
@@ -289,6 +309,31 @@ pub const Simulation = struct {
     }
     fn phaseTickEnd(self: *Simulation) void {
         _ = self;
+    }
+
+    // Player connection and entity management
+    pub fn connectOrGetPlayer(self: *Simulation, account_name: []const u8, display_name: []const u8) !player.PlayerId {
+        return try self.players.getOrCreate(account_name, display_name);
+    }
+
+    pub fn ensurePlayerEntity(self: *Simulation, pid: player.PlayerId) !usize {
+        if (self.entity_by_player.get(pid)) |idx| return idx;
+        // spawn at origin for now
+        const eid = self.next_eid;
+        self.next_eid += 1;
+        const rec: gs.EntityRecord = .{
+            .eid = eid,
+            .kind = 0, // 0 reserved for player entity kind for now
+            .pos = .{ 0, 0, 0 },
+            .vel = .{ 0, 0, 0 },
+            .yaw_pitch_roll = .{ 0, 0, 0 },
+            .aabb_half_extents = .{ 0.5, 0.9, 0.5 },
+            .flags = .{},
+        };
+        try self.dynamic_entities.append(self.allocator, rec);
+        const new_idx = self.dynamic_entities.items.len - 1;
+        try self.entity_by_player.put(pid, new_idx);
+        return new_idx;
     }
 
     pub fn start(self: *Simulation) !void {
