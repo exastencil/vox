@@ -22,5 +22,15 @@ pub fn build(b: *Build) !void {
     const run = b.addRunArtifact(exe);
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run Vox Aetatum").dependOn(&run.step);
+
+    // Unit tests for worldgen and core types
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/worldgen.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.step("test", "Run unit tests").dependOn(&tests.step);
 }
 
