@@ -1,0 +1,16 @@
+.{
+    .name = .vox_aetatum,
+    .version = "0.0.0",
+    .fingerprint = 0x5202a90dd88ca660,
+    .paths = .{
+        "src",
+        "build.zig",
+        "build.zig.zon",
+    },
+    .dependencies = .{
+        .sokol = .{
+            .url = "git+https://github.com/floooh/sokol-zig.git#4b8c06c546ad503d4c765ba5cd9fe8ee3afe3f5b",
+            .hash = "sokol-0.1.0-pb1HK0YZLgBxZgCUlZs-sEZwIgtqS2NbMByXA9d04Spd",
+        },
+    },
+}
