@@ -61,7 +61,7 @@ Note: Simulation distance/config belongs to SIM, not GS. GS only stores the stat
 - geometry: 16 × (32 \* section_count_y) × 16 blocks.
 - sections: contiguous array sections[section_count_y] ordered bottom to top (section_y increasing with y).
 - heightmaps: precomputed per-column values for terrain, motion blocking, and skylight heuristics.
-- entities: list of Entity IDs within or intersecting this chunk (spatial index may live alongside GS for fast queries).
+- entities: in-chunk storage of entities owned by this chunk; soft cap 256 entities per chunk. Entities transfer ownership when crossing chunk boundaries. An optional global read-only index may exist for queries, but GS ownership is per-chunk.
 - dirty flags: fine-grained flags for persistence and remeshing (set by SIM; GS just carries them).
 
 ## Section
@@ -105,6 +105,7 @@ Note: Simulation distance/config belongs to SIM, not GS. GS only stores the stat
 
 - entity_id: stable numeric ID (registry) for the type.
 - eid: unique runtime identifier.
+- residency: owned by a single chunk (chunk_x, chunk_z); SIM updates residency when crossing chunk boundaries; per-chunk soft cap: 256 entities.
 - transform: position (floating-point), velocity, orientation.
 - AABB: collision bounds; flags (on_ground, in_fluid, etc.).
 - attributes/components: health, inventory ref, AI state refs (componentized design is acceptable so long as GS remains serializable).
@@ -131,7 +132,7 @@ Note: Simulation distance/config belongs to SIM, not GS. GS only stores the stat
   - lighting arrays
   - biome arrays (section-level palette + per-voxel indices)
   - block entities
-  - entities (or entity references if stored separately)
+  - entities (in-chunk array; up to 256 entries per chunk)
   - heightmaps and chunk metadata
 - Compression: per-chunk section streams can be compressed independently.
 - Versioning: file header + per-record schema versions; migrations on load.
@@ -151,5 +152,5 @@ Note: Simulation distance/config belongs to SIM, not GS. GS only stores the stat
 
 - Eighth-subdivision representation: fixed as an 8-bit occupancy mask with xyz bit mapping (i = x | y<<1 | z<<2).
 - 3D biomes: store biome IDs per voxel using section-level palette + per-voxel indices (decided).
-- Entity storage co-location with chunks vs global entity graph with spatial indexing.
+- Entity storage: decided — entities are stored in their owning chunk with a soft cap of 256 per chunk; an optional global index may exist for queries.
 - None for section height: it is fixed at 32 (constant).
