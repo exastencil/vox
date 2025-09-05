@@ -8,15 +8,14 @@ const gs = @import("gs.zig");
 const worldgen = @import("worldgen.zig");
 const registry = @import("registry.zig");
 const ids = @import("ids.zig");
+const simulation = @import("simulation.zig");
 
 const State = struct {
     pass_action: sg.PassAction = .{},
-    chunks: std.ArrayList(gs.Chunk),
-    world_seed: u64 = 0,
-    section_count_y: u16 = 0,
+    sim: ?simulation.Simulation = null,
 };
 
-var state: State = .{ .chunks = undefined };
+var state: State = .{};
 var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
 var reg: ?registry.Registry = null;
 
@@ -33,8 +32,8 @@ export fn init() void {
         r.deinit();
         return;
     };
-    // register default void biome
-    const void_biome = r.addBiome("core:void") catch {
+    // register default void biome (id unused here; Simulation will look it up)
+    _ = r.addBiome("core:void") catch {
         r.deinit();
         return;
     };
@@ -51,37 +50,11 @@ export fn init() void {
         .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 1 },
     };
 
-    // worldgen: create void world seed and generate chunks in a 3-chunk radius around (0,0)
-    state.section_count_y = 4; // 4*32 = 128 world height for now
-    // random seed
-    var seed_bytes: [8]u8 = undefined;
-    std.crypto.random.bytes(&seed_bytes);
-    state.world_seed = std.mem.readInt(u64, &seed_bytes, .little);
-
-    const radius: i32 = 3;
-    const expected: usize = @intCast((radius * 2 + 1) * (radius * 2 + 1));
-    state.chunks = std.ArrayList(gs.Chunk).initCapacity(allocator, expected) catch {
+    // Create in-memory simulation with a default height of 4 sections (4*32 = 128)
+    const sim = simulation.Simulation.initMemory(allocator, &reg.?, 4) catch {
         return;
     };
-
-    // use registered ids
-    const air_id: ids.BlockStateId = 0; // ensured by ensureAir
-    const void_biome_id: ids.BiomeId = void_biome;
-
-    var z: i32 = -radius;
-    while (z <= radius) : (z += 1) {
-        var x: i32 = -radius;
-        while (x <= radius) : (x += 1) {
-            const pos = gs.ChunkPos{ .x = x, .z = z };
-            const chunk = worldgen.generateVoidChunk(allocator, state.section_count_y, pos, air_id, void_biome_id) catch {
-                // if any generation fails, free previously generated chunks and abort init
-                for (state.chunks.items) |*c| worldgen.deinitChunk(allocator, c);
-                state.chunks.deinit(allocator);
-                return;
-            };
-            state.chunks.appendAssumeCapacity(chunk);
-        }
-    }
+    state.sim = sim;
 }
 
 export fn frame() void {
@@ -91,13 +64,10 @@ export fn frame() void {
 }
 
 export fn cleanup() void {
-    // free generated chunks
-    const allocator = gpa.allocator();
-    if (@hasField(State, "chunks")) {
-        if (@TypeOf(state.chunks) == std.ArrayList(gs.Chunk)) {
-            for (state.chunks.items) |*c| worldgen.deinitChunk(allocator, c);
-            state.chunks.deinit(allocator);
-        }
+    // deinit simulation if present
+    if (state.sim) |*s| {
+        s.deinit();
+        state.sim = null;
     }
 
     sg.shutdown();

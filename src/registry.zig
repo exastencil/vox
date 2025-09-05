@@ -72,6 +72,13 @@ pub const Registry = struct {
         return self.biomes.items[@intCast(id)].name;
     }
 
+    pub fn findBiome(self: *const Registry, name: []const u8) ?ids.BiomeId {
+        for (self.biomes.items, 0..) |b, i| {
+            if (std.mem.eql(u8, b.name, name)) return @intCast(i);
+        }
+        return null;
+    }
+
     pub fn blockCount(self: *const Registry) usize {
         return self.blocks.items.len;
     }
