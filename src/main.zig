@@ -10,10 +10,12 @@ const worldgen = @import("worldgen.zig");
 const registry = @import("registry.zig");
 const ids = @import("ids.zig");
 const simulation = @import("simulation.zig");
+const client = @import("client.zig");
 
 const State = struct {
     pass_action: sg.PassAction = .{},
     sim: ?simulation.Simulation = null,
+    cl: ?client.Client = null,
     ui_scale: f32 = 1.0,
 };
 
@@ -73,12 +75,16 @@ export fn init() void {
         return;
     };
     state.sim = sim;
+
+    // initialize client with fixed-timestep simulation at 20 TPS
+    const cl_local = client.Client.init(&state.sim.?, 20.0);
+    state.cl = cl_local;
 }
 
 export fn frame() void {
-    // advance simulation one tick per frame for now
-    if (state.sim) |*s| {
-        s.tick();
+    // advance simulation at fixed 20 TPS using client accumulator
+    if (state.cl) |*c| {
+        c.update();
     }
 
     sg.beginPass(.{ .action = state.pass_action, .swapchain = sglue.swapchain() });
@@ -114,6 +120,11 @@ export fn frame() void {
 }
 
 export fn cleanup() void {
+    // drop client first
+    if (state.cl) |_| {
+        state.cl = null;
+    }
+
     // deinit simulation if present
     if (state.sim) |*s| {
         s.deinit();
