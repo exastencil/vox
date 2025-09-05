@@ -163,6 +163,69 @@ pub fn generateChunk(
     };
 }
 
+pub fn generateVoidChunk(
+    allocator: std.mem.Allocator,
+    section_count_y: u16,
+    chunk_pos: gs.ChunkPos,
+    air: ids.BlockStateId,
+    void_biome: ids.BiomeId,
+) !gs.Chunk {
+    const sections_len: usize = section_count_y;
+    var sections = try allocator.alloc(gs.Section, sections_len);
+
+    const bpi: u6 = 1; // using 1-bit indices, value always 0 for air
+    const voxel_count: usize = constants.chunk_size_x * constants.section_height * constants.chunk_size_z;
+    const words_per_section: usize = ceilDiv(voxel_count * bpi, 32);
+    const light_bytes_per_section: usize = voxel_count / 2; // nibble-packed
+
+    for (0..sections_len) |sy| {
+        var palette = try allocator.alloc(ids.BlockStateId, 1);
+        palette[0] = air;
+        const indices_bits = try allocator.alloc(u32, words_per_section);
+        @memset(indices_bits, 0);
+        const skylight = try allocator.alloc(u8, light_bytes_per_section);
+        const blocklight = try allocator.alloc(u8, light_bytes_per_section);
+        @memset(skylight, 0);
+        @memset(blocklight, 0);
+        const biome_palette = try allocator.alloc(ids.BiomeId, 1);
+        biome_palette[0] = void_biome;
+        const biome_indices_bits = try allocator.alloc(u32, 0);
+        const block_entities = try allocator.alloc(gs.BlockEntityRecord, 0);
+
+        sections[sy] = .{
+            .palette = palette,
+            .blocks_indices_bits = indices_bits,
+            .skylight = skylight,
+            .blocklight = blocklight,
+            .biome_palette = biome_palette,
+            .biome_indices_bits = biome_indices_bits,
+            .block_entities = block_entities,
+        };
+    }
+
+    var heightmaps: gs.Heightmaps = .{
+        .motion_blocking = undefined,
+        .world_surface = undefined,
+    };
+    // In void, no terrain -> set to -1 for all columns
+    for (0..constants.chunk_size_z) |lz| {
+        for (0..constants.chunk_size_x) |lx| {
+            const idx = lz * constants.chunk_size_x + lx;
+            heightmaps.motion_blocking[idx] = -1;
+            heightmaps.world_surface[idx] = -1;
+        }
+    }
+
+    const entities = try allocator.alloc(gs.EntityRecord, 0);
+
+    return .{
+        .pos = chunk_pos,
+        .sections = sections,
+        .heightmaps = heightmaps,
+        .entities = entities,
+    };
+}
+
 pub fn deinitChunk(allocator: std.mem.Allocator, chunk: *const gs.Chunk) void {
     // free per-section allocations, then the sections slice and entities slice
     for (chunk.sections) |s| {
@@ -254,6 +317,55 @@ test "generateChunk determinism and basic structure" {
             } else {
                 try testing.expectEqual(@as(u32, 0), bit);
             }
+        }
+    }
+}
+
+test "generateVoidChunk structure and determinism" {
+    const testing = std.testing;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const ok = gpa.deinit();
+        testing.expect(ok == .ok) catch {};
+    }
+    const allocator = gpa.allocator();
+
+    const section_count_y: u16 = 3;
+    const pos = gs.ChunkPos{ .x = 0, .z = 0 };
+    const air: ids.BlockStateId = 0;
+    const void_biome: ids.BiomeId = 0;
+
+    var chunk1 = try generateVoidChunk(allocator, section_count_y, pos, air, void_biome);
+    defer deinitChunk(allocator, &chunk1);
+    var chunk2 = try generateVoidChunk(allocator, section_count_y, pos, air, void_biome);
+    defer deinitChunk(allocator, &chunk2);
+
+    try testing.expectEqual(@as(usize, section_count_y), chunk1.sections.len);
+    const voxel_count = constants.chunk_size_x * constants.section_height * constants.chunk_size_z;
+    const words_per_section = (voxel_count * 1 + 31) / 32; // bpi=1
+    const light_bytes = voxel_count / 2;
+
+    for (chunk1.sections, 0..) |s, i| {
+        _ = i;
+        try testing.expectEqual(@as(usize, 1), s.palette.len);
+        try testing.expectEqual(@as(ids.BlockStateId, 0), s.palette[0]);
+        try testing.expectEqual(@as(usize, words_per_section), s.blocks_indices_bits.len);
+        try testing.expectEqual(@as(usize, light_bytes), s.skylight.len);
+        try testing.expectEqual(@as(usize, light_bytes), s.blocklight.len);
+        try testing.expectEqual(@as(usize, 1), s.biome_palette.len);
+        try testing.expectEqual(@as(ids.BiomeId, 0), s.biome_palette[0]);
+        try testing.expectEqual(@as(usize, 0), s.biome_indices_bits.len);
+        try testing.expectEqual(@as(usize, 0), s.block_entities.len);
+    }
+
+    // heightmaps are all -1 and equal between chunks
+    for (0..constants.chunk_size_z) |lz| {
+        for (0..constants.chunk_size_x) |lx| {
+            const idx = lz * constants.chunk_size_x + lx;
+            try testing.expectEqual(@as(i32, -1), chunk1.heightmaps.motion_blocking[idx]);
+            try testing.expectEqual(@as(i32, -1), chunk1.heightmaps.world_surface[idx]);
+            try testing.expectEqual(chunk1.heightmaps.motion_blocking[idx], chunk2.heightmaps.motion_blocking[idx]);
+            try testing.expectEqual(chunk1.heightmaps.world_surface[idx], chunk2.heightmaps.world_surface[idx]);
         }
     }
 }
