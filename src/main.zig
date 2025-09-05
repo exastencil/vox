@@ -76,8 +76,8 @@ export fn init() void {
     };
     state.sim = sim;
 
-    // initialize client with fixed-timestep simulation at 20 TPS
-    const cl_local = client.Client.init(&state.sim.?, 20.0);
+    // initialize client (simulation owns fixed-timestep)
+    const cl_local = client.Client.init(&state.sim.?);
     state.cl = cl_local;
 }
 

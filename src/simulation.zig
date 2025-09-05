@@ -24,6 +24,11 @@ pub const Simulation = struct {
     section_count_y: u16,
     world_seed: u64,
     tick_counter: u64 = 0,
+    // fixed-timestep timing owned by simulation
+    target_tps: f64 = 20.0,
+    accumulator: f64 = 0.0,
+    last_time_ns: i128 = 0,
+    max_accum: f64 = 0.25,
     chunks: std.ArrayList(gs.Chunk),
 
     pub fn init(opts: SimulationOptions) !Simulation {
@@ -37,6 +42,11 @@ pub const Simulation = struct {
             .mode = opts.mode,
             .section_count_y = opts.section_count_y,
             .world_seed = seed,
+            .tick_counter = 0,
+            .target_tps = 20.0,
+            .accumulator = 0.0,
+            .last_time_ns = std.time.nanoTimestamp(),
+            .max_accum = 0.25,
             .chunks = undefined,
         };
 
@@ -77,5 +87,22 @@ pub const Simulation = struct {
     pub fn tick(self: *Simulation) void {
         // Placeholder: follow docs/wiki/architecture-simulation-update-order.md in future
         self.tick_counter += 1;
+    }
+
+    pub fn update(self: *Simulation) void {
+        const now_ns: i128 = std.time.nanoTimestamp();
+        var dt_ns: i128 = now_ns - self.last_time_ns;
+        if (dt_ns < 0) dt_ns = 0;
+        const dt_sec: f64 = @as(f64, @floatFromInt(dt_ns)) / 1_000_000_000.0;
+        self.last_time_ns = now_ns;
+
+        const clamped_dt = if (dt_sec > self.max_accum) self.max_accum else dt_sec;
+        self.accumulator += clamped_dt;
+
+        const step: f64 = 1.0 / self.target_tps;
+        while (self.accumulator >= step) {
+            self.tick();
+            self.accumulator -= step;
+        }
     }
 };
