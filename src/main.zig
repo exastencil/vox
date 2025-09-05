@@ -3,6 +3,7 @@ const slog = sokol.log;
 const sg = sokol.gfx;
 const sapp = sokol.app;
 const sglue = sokol.glue;
+const gs = @import("gs.zig");
 
 const State = struct {
     pass_action: sg.PassAction = .{},
@@ -11,6 +12,8 @@ const State = struct {
 var state: State = .{};
 
 export fn init() void {
+    // touch GS types to ensure they compile
+    _ = gs.GameState;
     sg.setup(.{
         .environment = sglue.environment(),
         .logger = .{ .func = slog.func },
