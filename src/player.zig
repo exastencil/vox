@@ -15,6 +15,7 @@ pub const PlayerData = struct {
     id: PlayerId,
     account_name: []const u8, // global account name (owned)
     display_name: []const u8, // per-save display name (owned)
+    connected: bool = false,
     // TODO: inventory, stats, etc.
 };
 
@@ -61,5 +62,24 @@ pub const PlayerRegistry = struct {
     pub fn get(self: *const PlayerRegistry, id: PlayerId) ?PlayerData {
         if (self.by_id.get(id)) |pd| return pd;
         return null;
+    }
+
+    pub fn connectWithId(self: *PlayerRegistry, id: PlayerId, account_name: []const u8, display_name: []const u8) !void {
+        if (self.by_id.getPtr(id)) |pd_ptr| {
+            // mark connected; keep existing names
+            pd_ptr.connected = true;
+            // ensure account map has an entry
+            if (self.by_account.get(account_name) == null) {
+                const acc_key = try self.allocator.dupe(u8, account_name);
+                try self.by_account.put(acc_key, id);
+            }
+            return;
+        }
+        // insert new record
+        const acc = try self.allocator.dupe(u8, account_name);
+        const disp = try self.allocator.dupe(u8, display_name);
+        try self.by_id.put(id, .{ .id = id, .account_name = acc, .display_name = disp, .connected = true });
+        const acc_key = try self.allocator.dupe(u8, account_name);
+        try self.by_account.put(acc_key, id);
     }
 };

@@ -63,6 +63,7 @@ pub const Simulation = struct {
     next_eid: u64 = 1,
     dynamic_entities: std.ArrayList(gs.EntityRecord),
     entity_by_player: std.AutoHashMap(player.PlayerId, usize),
+    connections_mutex: std.Thread.Mutex = .{},
 
     chunks: std.ArrayList(gs.Chunk),
 
@@ -316,7 +317,17 @@ pub const Simulation = struct {
         return try self.players.getOrCreate(account_name, display_name);
     }
 
-    pub fn ensurePlayerEntity(self: *Simulation, pid: player.PlayerId) !usize {
+    // Client-server API (temporary direct call): connect by PlayerId and account_name
+    // Arguments must be serializable: PlayerId bytes and UTF-8 account_name
+    pub fn connectPlayer(self: *Simulation, pid: player.PlayerId, account_name: []const u8) !void {
+        self.connections_mutex.lock();
+        defer self.connections_mutex.unlock();
+        // trust the provided identity for now; display_name := account_name
+        try self.players.connectWithId(pid, account_name, account_name);
+        _ = try self.ensurePlayerEntityLocked(pid);
+    }
+
+    fn ensurePlayerEntityLocked(self: *Simulation, pid: player.PlayerId) !usize {
         if (self.entity_by_player.get(pid)) |idx| return idx;
         // spawn at origin for now
         const eid = self.next_eid;
@@ -334,6 +345,12 @@ pub const Simulation = struct {
         const new_idx = self.dynamic_entities.items.len - 1;
         try self.entity_by_player.put(pid, new_idx);
         return new_idx;
+    }
+
+    pub fn ensurePlayerEntity(self: *Simulation, pid: player.PlayerId) !usize {
+        self.connections_mutex.lock();
+        defer self.connections_mutex.unlock();
+        return self.ensurePlayerEntityLocked(pid);
     }
 
     pub fn start(self: *Simulation) !void {

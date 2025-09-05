@@ -10,11 +10,14 @@ const worldgen = @import("worldgen.zig");
 const registry = @import("registry.zig");
 const ids = @import("ids.zig");
 const simulation = @import("simulation.zig");
+const player = @import("player.zig");
 
 const State = struct {
     pass_action: sg.PassAction = .{},
     sim: ?simulation.Simulation = null,
     ui_scale: f32 = 1.0,
+    // optional local test client id
+    local_player_id: ?player.PlayerId = null,
 };
 
 var state: State = .{};
@@ -76,6 +79,11 @@ export fn init() void {
 
     // start simulation thread (decoupled from rendering)
     state.sim.?.start() catch return;
+
+    // TEMP: instantiate a local test client and connect to the SIM
+    const pid = player.genUuidV4();
+    state.local_player_id = pid;
+    state.sim.?.connectPlayer(pid, "Exa Stencil") catch return;
 }
 
 export fn frame() void {
