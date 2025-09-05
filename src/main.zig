@@ -109,9 +109,18 @@ export fn frame() void {
     var i: usize = 0;
     while (i < font_names.len) : (i += 1) {
         sdtx.font(@intCast(i));
-        const row: f32 = 2.0 + @as(f32, @floatFromInt(i));
-        sdtx.pos(0, row);
+        const row_base: f32 = 2.0 + @as(f32, @floatFromInt(i)) * 2.0;
+        // line 1: font name
+        sdtx.pos(0, row_base);
         sdtx.puts(font_names[i]);
+        // line 2: sample text
+        const sample_src = "The quick brown fox jumps over the lazy dog 0123456789";
+        var sbuf: [96:0]u8 = undefined;
+        @memcpy(sbuf[0..sample_src.len], sample_src);
+        sbuf[sample_src.len] = 0;
+        const sample: [:0]const u8 = sbuf[0..sample_src.len :0];
+        sdtx.pos(0, row_base + 1.0);
+        sdtx.puts(sample);
     }
 
     sdtx.draw();
