@@ -57,6 +57,8 @@ export fn init() void {
         .{},
         .{},
     } });
+    // Use C64 font by default (index 4 in the array above)
+    sdtx.font(4);
 
     // UI scale (higher -> larger text). On hi-dpi monitors, 2.0 is a good start.
     state.ui_scale = 2.0;
@@ -81,13 +83,15 @@ export fn frame() void {
 
     sg.beginPass(.{ .action = state.pass_action, .swapchain = sglue.swapchain() });
 
-    // draw tick counter in upper-right and list available fonts on the left
+    // draw tick counter in upper-right only
     // Scale the virtual canvas to enlarge text: canvas = window_size / ui_scale
     const scale: f32 = state.ui_scale;
     const w_px: f32 = @floatFromInt(sapp.width());
     const h_px: f32 = @floatFromInt(sapp.height());
     sdtx.canvas(w_px / scale, h_px / scale);
     sdtx.origin(0, 0);
+    // ensure C64 font in case other code changes it later
+    sdtx.font(4);
 
     // Right-aligned tick text (row 1)
     if (state.sim) |s| {
@@ -101,26 +105,6 @@ export fn frame() void {
         sdtx.pos(col_start_f, 1.0);
         sdtx.color3b(255, 255, 255);
         sdtx.puts(text);
-    }
-
-    // Font showcase on left side under the first row
-    sdtx.color3b(255, 255, 255);
-    const font_names: [6][:0]const u8 = .{ "kc853", "kc854", "z1013", "cpc", "c64", "oric" };
-    var i: usize = 0;
-    while (i < font_names.len) : (i += 1) {
-        sdtx.font(@intCast(i));
-        const row_base: f32 = 2.0 + @as(f32, @floatFromInt(i)) * 2.0;
-        // line 1: font name
-        sdtx.pos(0, row_base);
-        sdtx.puts(font_names[i]);
-        // line 2: sample text
-        const sample_src = "The quick brown fox jumps over the lazy dog 0123456789";
-        var sbuf: [96:0]u8 = undefined;
-        @memcpy(sbuf[0..sample_src.len], sample_src);
-        sbuf[sample_src.len] = 0;
-        const sample: [:0]const u8 = sbuf[0..sample_src.len :0];
-        sdtx.pos(0, row_base + 1.0);
-        sdtx.puts(sample);
     }
 
     sdtx.draw();
