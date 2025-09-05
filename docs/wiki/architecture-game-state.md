@@ -83,7 +83,12 @@ Note: Simulation distance/config belongs to SIM, not GS. GS only stores the stat
 
 - block_id: stable numeric ID from registry (namespace:name → u32 ID).
 - state encoding: properties packed into a state_id or mapped via palette to minimize storage.
-- geometry: Engine supports partial-blocks. Vox Aetatum will internally support subdividing a block into eighths to represent slabs and small shapes more consistently. Geometry and collision come from the block registry definition, not per-voxel data.
+- geometry: Engine supports partial-blocks. Vox Aetatum uses an eighth-subdivision occupancy mask per block:
+  - sub_mask: u8 where each bit represents one octant (eighth) of the block.
+  - Bit index mapping (xyz → bit): i = (x_bit << 0) | (y_bit << 1) | (z_bit << 2),
+    where x_bit,y_bit,z_bit ∈ {0,1} with 0 = negative half, 1 = positive half along the axis.
+  - Example masks: bottom slab (y=0): 0b00110011; top slab (y=1): 0b11001100; neg-x half: 0b01010101; pos-x half: 0b10101010.
+  - Geometry and collision are derived from the block registry definition (shape assembled from occupied octants).
 - light emission: per-state property contributing to blocklight.
 - tags: functional grouping (e.g., logs, planks, mineable/axe) for recipes and behaviors.
 
@@ -140,7 +145,7 @@ Note: Simulation distance/config belongs to SIM, not GS. GS only stores the stat
 
 ## Open Decisions
 
-- Exact representation for eighth-subdivision geometry in the block registry (bitmask vs shape ID).
+- Eighth-subdivision representation: fixed as an 8-bit occupancy mask with xyz bit mapping (i = x | y<<1 | z<<2).
 - Whether to store per-voxel metadata channels beyond lighting (e.g., biome ID per column/voxel).
 - Entity storage co-location with chunks vs global entity graph with spatial indexing.
 - None for section height: it is fixed at 32 (constant).
