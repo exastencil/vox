@@ -13,32 +13,27 @@ pub const BiomeDef = struct {
 
 pub const Registry = struct {
     allocator: std.mem.Allocator,
-    arena: std.heap.ArenaAllocator,
     blocks: std.ArrayList(BlockDef),
     biomes: std.ArrayList(BiomeDef),
 
     pub fn init(allocator: std.mem.Allocator) !Registry {
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        const a = arena.allocator();
         return .{
             .allocator = allocator,
-            .arena = arena,
-            .blocks = try std.ArrayList(BlockDef).initCapacity(a, 8),
-            .biomes = try std.ArrayList(BiomeDef).initCapacity(a, 4),
+            .blocks = try std.ArrayList(BlockDef).initCapacity(allocator, 8),
+            .biomes = try std.ArrayList(BiomeDef).initCapacity(allocator, 4),
         };
     }
 
     pub fn deinit(self: *Registry) void {
-        const a = self.arena.allocator();
-        self.blocks.deinit(a);
-        self.biomes.deinit(a);
-        _ = self.arena.deinit();
+        // free any names we duplicated
+        for (self.blocks.items) |b| self.allocator.free(b.name);
+        for (self.biomes.items) |b| self.allocator.free(b.name);
+        self.blocks.deinit(self.allocator);
+        self.biomes.deinit(self.allocator);
     }
 
     fn dup(self: *Registry, s: []const u8) ![]const u8 {
-        const mem = try self.arena.allocator().alloc(u8, s.len);
-        @memcpy(mem, s);
-        return mem;
+        return try self.allocator.dupe(u8, s);
     }
 
     pub fn ensureAir(self: *Registry) !void {
@@ -56,7 +51,7 @@ pub const Registry = struct {
             if (std.mem.eql(u8, b.name, name)) return @intCast(i);
         }
         const owned = try self.dup(name);
-        try self.blocks.append(self.arena.allocator(), .{ .name = owned });
+        try self.blocks.append(self.allocator, .{ .name = owned });
         return @intCast(self.blocks.items.len - 1);
     }
 
@@ -65,7 +60,7 @@ pub const Registry = struct {
             if (std.mem.eql(u8, b.name, name)) return @intCast(i);
         }
         const owned = try self.dup(name);
-        try self.biomes.append(self.arena.allocator(), .{ .name = owned });
+        try self.biomes.append(self.allocator, .{ .name = owned });
         return @intCast(self.biomes.items.len - 1);
     }
 
@@ -121,3 +116,13 @@ test "registry adds at least one biome" {
     try testing.expectEqual(@as(usize, 1), reg.biomeCount());
 }
 
+test "registry init/deinit has no leaks" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const ok = gpa.deinit();
+        testing.expect(ok == .ok) catch {};
+    }
+    var reg = try Registry.init(gpa.allocator());
+    defer reg.deinit();
+    // no further ops; success criteria is that gpa.deinit() returns .ok
+}

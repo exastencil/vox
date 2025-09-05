@@ -13,7 +13,7 @@ pub fn build(b: *Build) !void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{ .{ .name = "sokol", .module = dep_sokol.module("sokol") } },
+            .imports = &.{.{ .name = "sokol", .module = dep_sokol.module("sokol") }},
         }),
     });
 
@@ -44,4 +44,3 @@ pub fn build(b: *Build) !void {
     });
     test_step.dependOn(&tests_reg.step);
 }
-

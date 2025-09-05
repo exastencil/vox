@@ -8,7 +8,7 @@ pub const ChunkGenConfig = struct {
     ground: ids.BlockStateId,
 };
 
-pub const Error = error{ EmptyBiomeList } || std.mem.Allocator.Error;
+pub const Error = error{EmptyBiomeList} || std.mem.Allocator.Error;
 
 fn splitmix64(x_in: u64) u64 {
     var z: u64 = x_in + 0x9E3779B97F4A7C15;
@@ -191,7 +191,7 @@ test "generateChunk determinism and basic structure" {
     const section_count_y: u16 = 4; // 4*32 = 128 world height
     const pos = gs.ChunkPos{ .x = 0, .z = 0 };
     const cfg = ChunkGenConfig{ .air = 0, .ground = 1 };
-    const biomes = [_]ids.BiomeId{ 7 };
+    const biomes = [_]ids.BiomeId{7};
 
     var chunk1 = try generateChunk(allocator, seed, section_count_y, pos, cfg, &biomes);
     defer deinitChunk(allocator, &chunk1);

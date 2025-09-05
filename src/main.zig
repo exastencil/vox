@@ -24,9 +24,16 @@ export fn init() void {
     // initialize registry with Air and a default biome
     const allocator = gpa.allocator();
     var r = registry.Registry.init(allocator) catch return;
-    r.ensureAir() catch return;
+    // If any of the following steps fail, make sure to deinit the partially-initialized registry
+    r.ensureAir() catch {
+        r.deinit();
+        return;
+    };
     // ensure there's at least one biome
-    _ = r.addBiome("core:default") catch return;
+    _ = r.addBiome("core:default") catch {
+        r.deinit();
+        return;
+    };
     reg = r;
 
     sg.setup(.{
