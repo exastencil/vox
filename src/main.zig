@@ -14,6 +14,7 @@ const simulation = @import("simulation.zig");
 const State = struct {
     pass_action: sg.PassAction = .{},
     sim: ?simulation.Simulation = null,
+    ui_scale: f32 = 1.0,
 };
 
 var state: State = .{};
@@ -45,8 +46,20 @@ export fn init() void {
         .environment = sglue.environment(),
         .logger = .{ .func = slog.func },
     });
-    // debug text setup
-    sdtx.setup(.{});
+    // debug text setup with builtin fonts
+    sdtx.setup(.{ .fonts = .{
+        sdtx.fontKc853(),
+        sdtx.fontKc854(),
+        sdtx.fontZ1013(),
+        sdtx.fontCpc(),
+        sdtx.fontC64(),
+        sdtx.fontOric(),
+        .{},
+        .{},
+    } });
+
+    // UI scale (higher -> larger text). On hi-dpi monitors, 2.0 is a good start.
+    state.ui_scale = 2.0;
     // Clear to solid black (default is zero-initialized, but set explicitly for clarity)
     state.pass_action.colors[0] = .{
         .load_action = .CLEAR,
@@ -74,12 +87,17 @@ export fn frame() void {
         const text_slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "tick: {d}", .{s.tick_counter}) catch "tick: ?";
         buf[text_slice.len] = 0; // ensure 0-terminated for sdtx
         const text: [:0]const u8 = buf[0..text_slice.len :0];
-        const w: i32 = sapp.width();
-        const cols: i32 = @divTrunc(w, 8); // assume 8px cell width for debugtext
-        const col_start: i32 = @max(0, cols - @as(i32, @intCast(text.len)));
-        sdtx.canvas(@floatFromInt(sapp.width()), @floatFromInt(sapp.height()));
+        // Scale the virtual canvas to enlarge text: canvas = window_size / ui_scale
+        const scale: f32 = state.ui_scale;
+        const w_px: f32 = @floatFromInt(sapp.width());
+        const h_px: f32 = @floatFromInt(sapp.height());
+        sdtx.canvas(w_px / scale, h_px / scale);
         sdtx.origin(0, 0);
-        sdtx.move(@floatFromInt(col_start), 0);
+        // compute right-aligned column based on the scaled canvas width
+        const cols_f: f32 = (w_px / scale) / 8.0;
+        const text_cols_f: f32 = @floatFromInt(text.len);
+        const col_start_f: f32 = @max(0.0, cols_f - text_cols_f - 1.0);
+        sdtx.pos(col_start_f, 1.0);
         sdtx.color3b(255, 255, 255);
         sdtx.puts(text);
         sdtx.draw();
