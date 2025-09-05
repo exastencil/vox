@@ -42,7 +42,7 @@ Configurable per-world. Key fields:
   - world_seed: 64-bit seed used for deterministic worldgen and random ticks.
 - dimensions/config:
   - section_height_blocks: 32 (constant). Fixed height per Section.
-  - section_count_y: number of Sections stacked vertically. World build height = 32 * section_count_y.
+  - section_count_y: number of Sections stacked vertically. World build height = 32 \* section_count_y.
   - chunk_size_blocks_xz: always 16 for now (consistent with Minecraft’s 16×16 horizontal chunk size).
   - environment: skybox_id, ambient_light, time_scale, weather_rules, gravity, fluid rules.
 - runtime state:
@@ -58,7 +58,7 @@ Note: Simulation distance/config belongs to SIM, not GS. GS only stores the stat
 ## Chunk
 
 - key: (chunk_x, chunk_z)
-- geometry: 16 × (32 * section_count_y) × 16 blocks.
+- geometry: 16 × (32 \* section_count_y) × 16 blocks.
 - sections: contiguous array sections[section_count_y] ordered bottom to top (section_y increasing with y).
 - heightmaps: precomputed per-column values for terrain, motion blocking, and skylight heuristics.
 - entities: list of Entity IDs within or intersecting this chunk (spatial index may live alongside GS for fast queries).
@@ -73,6 +73,9 @@ Note: Simulation distance/config belongs to SIM, not GS. GS only stores the stat
 - lighting:
   - skylight: 4-bit per-voxel values (0–15) if applicable for the dimension.
   - blocklight: 4-bit per-voxel values (0–15).
+- biomes:
+  - per-voxel biome IDs using a section-level palette + bit-packed per-voxel indices (3D biomes).
+  - palette entries reference the global biome registry; single-biome sections compress to palette size 1.
 - metadata:
   - random_tick_mask (optional): hints for which positions may receive random ticks.
   - occupancy/hollow flags for meshing and culling.
@@ -126,6 +129,7 @@ Note: Simulation distance/config belongs to SIM, not GS. GS only stores the stat
 - Regions group chunks (e.g., 32×32 chunks per region file). Each chunk stores:
   - section array with palette+bits data
   - lighting arrays
+  - biome arrays (section-level palette + per-voxel indices)
   - block entities
   - entities (or entity references if stored separately)
   - heightmaps and chunk metadata
@@ -146,6 +150,6 @@ Note: Simulation distance/config belongs to SIM, not GS. GS only stores the stat
 ## Open Decisions
 
 - Eighth-subdivision representation: fixed as an 8-bit occupancy mask with xyz bit mapping (i = x | y<<1 | z<<2).
-- Whether to store per-voxel metadata channels beyond lighting (e.g., biome ID per column/voxel).
+- 3D biomes: store biome IDs per voxel using section-level palette + per-voxel indices (decided).
 - Entity storage co-location with chunks vs global entity graph with spatial indexing.
 - None for section height: it is fixed at 32 (constant).
