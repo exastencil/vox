@@ -31,6 +31,17 @@ pub fn build(b: *Build) !void {
             .optimize = optimize,
         }),
     });
-    b.step("test", "Run unit tests").dependOn(&tests.step);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&tests.step);
+
+    // Registry tests
+    const tests_reg = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/registry.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&tests_reg.step);
 }
 
