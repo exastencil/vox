@@ -81,27 +81,40 @@ export fn frame() void {
 
     sg.beginPass(.{ .action = state.pass_action, .swapchain = sglue.swapchain() });
 
-    // draw tick counter in upper-right
+    // draw tick counter in upper-right and list available fonts on the left
+    // Scale the virtual canvas to enlarge text: canvas = window_size / ui_scale
+    const scale: f32 = state.ui_scale;
+    const w_px: f32 = @floatFromInt(sapp.width());
+    const h_px: f32 = @floatFromInt(sapp.height());
+    sdtx.canvas(w_px / scale, h_px / scale);
+    sdtx.origin(0, 0);
+
+    // Right-aligned tick text (row 1)
     if (state.sim) |s| {
         var buf: [64:0]u8 = undefined;
         const text_slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "tick: {d}", .{s.tick_counter}) catch "tick: ?";
         buf[text_slice.len] = 0; // ensure 0-terminated for sdtx
         const text: [:0]const u8 = buf[0..text_slice.len :0];
-        // Scale the virtual canvas to enlarge text: canvas = window_size / ui_scale
-        const scale: f32 = state.ui_scale;
-        const w_px: f32 = @floatFromInt(sapp.width());
-        const h_px: f32 = @floatFromInt(sapp.height());
-        sdtx.canvas(w_px / scale, h_px / scale);
-        sdtx.origin(0, 0);
-        // compute right-aligned column based on the scaled canvas width
         const cols_f: f32 = (w_px / scale) / 8.0;
         const text_cols_f: f32 = @floatFromInt(text.len);
         const col_start_f: f32 = @max(0.0, cols_f - text_cols_f - 1.0);
         sdtx.pos(col_start_f, 1.0);
         sdtx.color3b(255, 255, 255);
         sdtx.puts(text);
-        sdtx.draw();
     }
+
+    // Font showcase on left side under the first row
+    sdtx.color3b(255, 255, 255);
+    const font_names: [6][:0]const u8 = .{ "kc853", "kc854", "z1013", "cpc", "c64", "oric" };
+    var i: usize = 0;
+    while (i < font_names.len) : (i += 1) {
+        sdtx.font(@intCast(i));
+        const row: f32 = 2.0 + @as(f32, @floatFromInt(i));
+        sdtx.pos(0, row);
+        sdtx.puts(font_names[i]);
+    }
+
+    sdtx.draw();
 
     sg.endPass();
     sg.commit();
