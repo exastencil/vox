@@ -15,7 +15,7 @@ Later extensions (reserved, not implemented yet):
 
 ## Authoring API (Zig)
 
-The core engine exposes the API in `src/world_registry.zig`:
+The core engine exposes the API in `src/registry/world.zig`:
 
 - WorldDef: the definition record
 - WorldRegistry:

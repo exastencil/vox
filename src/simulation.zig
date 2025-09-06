@@ -5,7 +5,6 @@ const registry = @import("registry.zig");
 const worldgen = @import("worldgen.zig");
 const constants = @import("constants.zig");
 const player = @import("player.zig");
-const wreg = @import("world_registry.zig");
 
 pub const StorageMode = union(enum) {
     memory,

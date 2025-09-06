@@ -1,29 +1,21 @@
 const std = @import("std");
 const ids = @import("ids.zig");
-const wreg = @import("world_registry.zig");
-
-pub const BlockDef = struct {
-    name: []const u8, // namespace:name
-    // TODO: properties (geometry mask, light emission, tags, etc.)
-};
-
-pub const BiomeDef = struct {
-    name: []const u8, // namespace:name
-    // TODO: climate params, colors, generation hints
-};
+pub const Block = @import("registry/block.zig");
+pub const Biome = @import("registry/biome.zig");
+pub const World = @import("registry/world.zig");
 
 pub const Registry = struct {
     allocator: std.mem.Allocator,
-    blocks: std.ArrayList(BlockDef),
-    biomes: std.ArrayList(BiomeDef),
-    worlds: wreg.WorldRegistry,
+    blocks: std.ArrayList(Block.Def),
+    biomes: std.ArrayList(Biome.Def),
+    worlds: World.Registry,
 
     pub fn init(allocator: std.mem.Allocator) !Registry {
         return .{
             .allocator = allocator,
-            .blocks = try std.ArrayList(BlockDef).initCapacity(allocator, 8),
-            .biomes = try std.ArrayList(BiomeDef).initCapacity(allocator, 4),
-            .worlds = wreg.WorldRegistry.init(allocator),
+            .blocks = try std.ArrayList(Block.Def).initCapacity(allocator, 8),
+            .biomes = try std.ArrayList(Biome.Def).initCapacity(allocator, 4),
+            .worlds = World.Registry.init(allocator),
         };
     }
 
