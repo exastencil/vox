@@ -5,6 +5,84 @@ const sg = sokol.gfx;
 const sapp = sokol.app;
 const sglue = sokol.glue;
 const sdtx = sokol.debugtext;
+
+fn loadOrFallback(allocator: std.mem.Allocator, path: []const u8) sg.Image {
+    const png = @import("assets/png.zig");
+    const loaded = png.loadFileRGBA8(allocator, path) catch null;
+    if (loaded) |img| {
+        defer allocator.free(img.pixels);
+        return sg.makeImage(.{
+            .width = @intCast(img.width),
+            .height = @intCast(img.height),
+            .pixel_format = .RGBA8,
+            .data = .{ .subimage = .{
+                .{ sg.asRange(img.pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+            } },
+        });
+    } else {
+        // Generate a magenta/black checkerboard as a visible missing-texture fallback
+        const w: usize = 128;
+        const h: usize = 128;
+        const tile: usize = 16; // 8x8 tiles across
+        var pixels = allocator.alloc(u8, w * h * 4) catch {
+            // As a last resort, create a 1x1 magenta pixel
+            var one = [_]u8{ 255, 0, 255, 255 };
+            return sg.makeImage(.{
+                .width = 1,
+                .height = 1,
+                .pixel_format = .RGBA8,
+                .data = .{ .subimage = .{
+                    .{ sg.asRange(one[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                } },
+            });
+        };
+        defer allocator.free(pixels);
+        var y: usize = 0;
+        while (y < h) : (y += 1) {
+            var x: usize = 0;
+            while (x < w) : (x += 1) {
+                const cx = (x / tile) & 1;
+                const cy = (y / tile) & 1;
+                const is_magenta = (cx ^ cy) == 0;
+                const idx = (y * w + x) * 4;
+                if (is_magenta) {
+                    pixels[idx + 0] = 255;
+                    pixels[idx + 1] = 0;
+                    pixels[idx + 2] = 255;
+                    pixels[idx + 3] = 255;
+                } else {
+                    pixels[idx + 0] = 0;
+                    pixels[idx + 1] = 0;
+                    pixels[idx + 2] = 0;
+                    pixels[idx + 3] = 255;
+                }
+            }
+        }
+        return sg.makeImage(.{
+            .width = @intCast(w),
+            .height = @intCast(h),
+            .pixel_format = .RGBA8,
+            .data = .{ .subimage = .{
+                .{ sg.asRange(pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+            } },
+        });
+    }
+}
 const gs = @import("gs.zig");
 const worldgen = @import("worldgen.zig");
 const registry = @import("registry.zig");
@@ -13,7 +91,6 @@ const simulation = @import("simulation.zig");
 const player = @import("player.zig");
 const client_mod = @import("client.zig");
 const builtin = @import("builtin");
-const mc = @import("assets/mc_textures_1_18.zig");
 
 const State = struct {
     pass_action: sg.PassAction = .{},
@@ -84,47 +161,21 @@ export fn init() void {
         .logger = .{ .func = slog.func },
     });
 
-    // Build textures from embedded Minecraft 1.18 assets (testing-only, not for distribution)
+    // Build textures: prefer PNGs under resources/, fallback to embedded data
     if (reg) |*rp| {
-        const dirt_tex = sg.makeImage(.{
-            .width = @intCast(mc.dirt_width),
-            .height = @intCast(mc.dirt_height),
-            .pixel_format = .RGBA8,
-            .data = .{ .subimage = .{
-                .{ sg.asRange(mc.dirt_pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-            } },
-        });
-        const grass_top_tex = sg.makeImage(.{
-            .width = @intCast(mc.grass_top_width),
-            .height = @intCast(mc.grass_top_height),
-            .pixel_format = .RGBA8,
-            .data = .{ .subimage = .{
-                .{ sg.asRange(mc.grass_top_pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-            } },
-        });
-        const grass_side_tex = sg.makeImage(.{
-            .width = @intCast(mc.grass_side_width),
-            .height = @intCast(mc.grass_side_height),
-            .pixel_format = .RGBA8,
-            .data = .{ .subimage = .{
-                .{ sg.asRange(mc.grass_side_pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-            } },
-        });
+        const dirt_tex = loadOrFallback(
+            gpa.allocator(),
+            "resources/textures/blocks/vox/dirt.png",
+        );
+        const grass_top_tex = loadOrFallback(
+            gpa.allocator(),
+            "resources/textures/blocks/vox/grass/face.png",
+        );
+        const grass_side_tex = loadOrFallback(
+            gpa.allocator(),
+            "resources/textures/blocks/vox/grass/other.png",
+        );
+
         rp.resources.setUniform("vox:dirt", dirt_tex) catch {};
         rp.resources.setFacing("vox:grass", grass_top_tex, grass_side_tex) catch {};
     }

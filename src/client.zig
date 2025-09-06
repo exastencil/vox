@@ -9,6 +9,19 @@ const sdtx = sokol.debugtext;
 
 const Vertex = struct { pos: [2]f32, uv: [2]f32 };
 
+fn buildQuadVerts(out: []Vertex, x0: f32, y0: f32, size: f32) usize {
+    if (out.len < 6) return 0;
+    const x1: f32 = x0 + size;
+    const y1: f32 = y0 + size;
+    out[0] = .{ .pos = .{ x0, y0 }, .uv = .{ 0, 0 } };
+    out[1] = .{ .pos = .{ x1, y0 }, .uv = .{ 1, 0 } };
+    out[2] = .{ .pos = .{ x1, y1 }, .uv = .{ 1, 1 } };
+    out[3] = .{ .pos = .{ x0, y0 }, .uv = .{ 0, 0 } };
+    out[4] = .{ .pos = .{ x1, y1 }, .uv = .{ 1, 1 } };
+    out[5] = .{ .pos = .{ x0, y1 }, .uv = .{ 0, 1 } };
+    return 6;
+}
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     sim: *simulation.Simulation,
@@ -79,14 +92,19 @@ pub const Client = struct {
         self.show_debug = true;
 
         // shader (Metal only for now)
-        const vs_src = "#include <metal_stdlib>\nusing namespace metal;\nstruct VSIn { float2 pos [[attribute(0)]]; float2 uv [[attribute(1)]]; };\nstruct VSOut { float4 pos [[position]]; float2 uv; };\nvertex VSOut vs_main(VSIn in [[stage_in]]) { VSOut o; o.pos = float4(in.pos, 0.0, 1.0); o.uv = in.uv; return o; }\n";
-        const fs_src = "#include <metal_stdlib>\nusing namespace metal;\nstruct VSOut { float4 pos [[position]]; float2 uv; };\nfragment float4 fs_main(VSOut in [[stage_in]], texture2d<float> tex0 [[texture(0)]], sampler smp [[sampler(0)]]) {\n    constexpr sampler s(address::repeat, filter::nearest);\n    return tex0.sample(s, in.uv);\n}\n";
+        const vs_src = "#include <metal_stdlib>\nusing namespace metal;\nstruct VSIn { float2 pos [[attribute(0)]]; float2 uv [[attribute(1)]]; };\nstruct VSOut { float4 pos [[position]]; float2 uv; };\nstruct VSParams { float2 aspect; };\nvertex VSOut vs_main(VSIn in [[stage_in]], constant VSParams& params [[buffer(0)]]) { VSOut o; float2 p = in.pos; p.x *= params.aspect.x; p.y *= params.aspect.y; o.pos = float4(p, 0.0, 1.0); o.uv = in.uv; return o; }\n";
+        const fs_src = "#include <metal_stdlib>\nusing namespace metal;\nstruct VSOut { float4 pos [[position]]; float2 uv; };\nfragment float4 fs_main(VSOut in [[stage_in]], texture2d<float, access::sample> tex0 [[texture(0)]], sampler smp [[sampler(0)]]) {\n    float3 c = tex0.sample(smp, in.uv).rgb;\n    return float4(c, 1.0);\n}\n";
         var sdesc: sg.ShaderDesc = .{};
         sdesc.label = "chunk-shader";
         sdesc.vertex_func.source = vs_src;
         sdesc.vertex_func.entry = "vs_main";
         sdesc.fragment_func.source = fs_src;
         sdesc.fragment_func.entry = "fs_main";
+        // VS uniform block for aspect correction
+        sdesc.uniform_blocks[0].stage = .VERTEX;
+        sdesc.uniform_blocks[0].size = 8; // float2
+        sdesc.uniform_blocks[0].msl_buffer_n = 0;
+        // No fragment uniforms needed now that masks are removed
         // reflection for texture/sampler
         sdesc.views[0].texture.stage = .FRAGMENT;
         sdesc.views[0].texture.image_type = ._2D;
@@ -106,9 +124,13 @@ pub const Client = struct {
         pdesc.layout.attrs[0].format = .FLOAT2;
         pdesc.layout.attrs[1].format = .FLOAT2;
         pdesc.primitive_type = .TRIANGLES;
+        // ensure pipeline color target matches swapchain format
+        const desc = sg.queryDesc();
+        pdesc.color_count = 1;
+        pdesc.colors[0].pixel_format = desc.environment.defaults.color_format;
         self.pip = sg.makePipeline(pdesc);
         // dynamic vertex buffer for a single chunk top surface (16*16 quads * 6 verts)
-        const vcount_max: usize = 16 * 16 * 6;
+        const vcount_max: usize = (16 * 16 * 6);
         self.vbuf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true, .stream_update = true }, .size = @intCast(vcount_max * @sizeOf(Vertex)) });
         self.bind.vertex_buffers[0] = self.vbuf;
 
@@ -166,20 +188,34 @@ pub const Client = struct {
         sg.beginPass(.{ .action = self.pass_action, .swapchain = sglue.swapchain() });
 
         // draw minimal top-surface for chunk (0,0)
+        // Reserve space for 16*16*6 main verts
         var verts: [16 * 16 * 6]Vertex = undefined;
+        // aspect-correction uniforms
+        const w_px: f32 = @floatFromInt(sapp.width());
+        const h_px: f32 = @floatFromInt(sapp.height());
+        const aspect: f32 = h_px / w_px; // scale x by h/w to keep squares square
+        const vs_params = struct { aspect: [2]f32 }{ .aspect = .{ aspect, 1.0 } };
+
+        // Build main top-surface verts
         const vcount = self.buildTopSurfaceVerts(verts[0..]);
+
         if (vcount > 0 and self.grass_img.id != 0) {
             sg.applyPipeline(self.pip);
             sg.applyBindings(self.bind);
+            sg.applyUniforms(0, sg.asRange(&vs_params));
+
+            // Single buffer update per frame containing main surface
             sg.updateBuffer(self.vbuf, sg.asRange(verts[0..vcount]));
+
+            // Draw main surface
             sg.draw(0, @intCast(vcount), 1);
         }
 
         if (self.show_debug) {
             const scale: f32 = self.ui_scale;
-            const w_px: f32 = @floatFromInt(sapp.width());
-            const h_px: f32 = @floatFromInt(sapp.height());
-            sdtx.canvas(w_px / scale, h_px / scale);
+            const w_px_dbg: f32 = @floatFromInt(sapp.width());
+            const h_px_dbg: f32 = @floatFromInt(sapp.height());
+            sdtx.canvas(w_px_dbg / scale, h_px_dbg / scale);
             sdtx.origin(0, 0);
             sdtx.font(4);
 
