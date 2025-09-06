@@ -50,6 +50,18 @@ export fn init() void {
         r.deinit();
         return;
     };
+    // register built-in worldgen types
+    r.worldgen.add("core:void", "Void", registry.WorldGen.selectVoid) catch {
+        r.deinit();
+        return;
+    };
+    r.worldgen.add("core:superflat", "Superflat", registry.WorldGen.selectSuperflat) catch {
+        r.deinit();
+        return;
+    };
+    // ensure common biomes used by builtin gens
+    _ = r.addBiome("core:plains") catch {};
+
     reg = r;
 
     // graphics setup
