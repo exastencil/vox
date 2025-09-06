@@ -6,6 +6,7 @@ const sg = sokol.gfx;
 const sapp = sokol.app;
 const sglue = sokol.glue;
 const sdtx = sokol.debugtext;
+const build_options = @import("build_options");
 
 const Vertex = struct { pos: [2]f32, uv: [2]f32 };
 
@@ -91,32 +92,67 @@ pub const Client = struct {
         self.pass_action.colors[0] = .{ .load_action = .CLEAR, .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 1 } };
         self.show_debug = true;
 
-        // shader (Metal only for now)
-        const vs_src = "#include <metal_stdlib>\nusing namespace metal;\nstruct VSIn { float2 pos [[attribute(0)]]; float2 uv [[attribute(1)]]; };\nstruct VSOut { float4 pos [[position]]; float2 uv; };\nstruct VSParams { float2 aspect; };\nvertex VSOut vs_main(VSIn in [[stage_in]], constant VSParams& params [[buffer(0)]]) { VSOut o; float2 p = in.pos; p.x *= params.aspect.x; p.y *= params.aspect.y; o.pos = float4(p, 0.0, 1.0); o.uv = in.uv; return o; }\n";
-        const fs_src = "#include <metal_stdlib>\nusing namespace metal;\nstruct VSOut { float4 pos [[position]]; float2 uv; };\nfragment float4 fs_main(VSOut in [[stage_in]], texture2d<float, access::sample> tex0 [[texture(0)]], sampler smp [[sampler(0)]]) {\n    float3 c = tex0.sample(smp, in.uv).rgb;\n    return float4(c, 1.0);\n}\n";
-        var sdesc: sg.ShaderDesc = .{};
-        sdesc.label = "chunk-shader";
-        sdesc.vertex_func.source = vs_src;
-        sdesc.vertex_func.entry = "vs_main";
-        sdesc.fragment_func.source = fs_src;
-        sdesc.fragment_func.entry = "fs_main";
-        // VS uniform block for aspect correction
-        sdesc.uniform_blocks[0].stage = .VERTEX;
-        sdesc.uniform_blocks[0].size = 8; // float2
-        sdesc.uniform_blocks[0].msl_buffer_n = 0;
-        // No fragment uniforms needed now that masks are removed
-        // reflection for texture/sampler
-        sdesc.views[0].texture.stage = .FRAGMENT;
-        sdesc.views[0].texture.image_type = ._2D;
-        sdesc.views[0].texture.sample_type = .FLOAT;
-        sdesc.views[0].texture.msl_texture_n = 0;
-        sdesc.samplers[0].stage = .FRAGMENT;
-        sdesc.samplers[0].sampler_type = .FILTERING;
-        sdesc.samplers[0].msl_sampler_n = 0;
-        sdesc.texture_sampler_pairs[0].stage = .FRAGMENT;
-        sdesc.texture_sampler_pairs[0].view_slot = 0;
-        sdesc.texture_sampler_pairs[0].sampler_slot = 0;
-        self.shd = sg.makeShader(sdesc);
+        // shader: prefer shdc-generated cross-platform shader, fall back to runtime Metal source
+        if (build_options.use_shdc) {
+            const shd_mod = @import("shaders/chunk_shd.zig");
+            const backend = sg.queryBackend();
+            if (@hasDecl(shd_mod, "shaderDesc")) {
+                self.shd = sg.makeShader(shd_mod.shaderDesc(backend));
+            } else if (@hasDecl(shd_mod, "shader_desc")) {
+                self.shd = sg.makeShader(shd_mod.shader_desc(backend));
+            } else if (@hasDecl(shd_mod, "chunkShaderDesc")) {
+                self.shd = sg.makeShader(shd_mod.chunkShaderDesc(backend));
+            } else if (@hasDecl(shd_mod, "chunk_shader_desc")) {
+                self.shd = sg.makeShader(shd_mod.chunk_shader_desc(backend));
+            } else {
+                // fallback if unexpected symbol names
+                var sdesc: sg.ShaderDesc = .{};
+                sdesc.label = "chunk-shader";
+                sdesc.vertex_func.source = "#include <metal_stdlib>\nusing namespace metal;\nstruct VSIn { float2 pos [[attribute(0)]]; float2 uv [[attribute(1)]]; };\nstruct VSOut { float4 pos [[position]]; float2 uv; };\nstruct VSParams { float2 aspect; };\nvertex VSOut vs_main(VSIn in [[stage_in]], constant VSParams& params [[buffer(0)]]) { VSOut o; float2 p = in.pos; p.x *= params.aspect.x; p.y *= params.aspect.y; o.pos = float4(p, 0.0, 1.0); o.uv = in.uv; return o; }\n";
+                sdesc.vertex_func.entry = "vs_main";
+                sdesc.fragment_func.source = "#include <metal_stdlib>\nusing namespace metal;\nstruct VSOut { float4 pos [[position]]; float2 uv; };\nfragment float4 fs_main(VSOut in [[stage_in]], texture2d<float, access::sample> tex0 [[texture(0)]], sampler smp [[sampler(0)]]) {\n    float3 c = tex0.sample(smp, in.uv).rgb;\n    return float4(c, 1.0);\n}\n";
+                sdesc.fragment_func.entry = "fs_main";
+                sdesc.uniform_blocks[0].stage = .VERTEX;
+                sdesc.uniform_blocks[0].size = 8; // float2
+                sdesc.uniform_blocks[0].msl_buffer_n = 0;
+                sdesc.views[0].texture.stage = .FRAGMENT;
+                sdesc.views[0].texture.image_type = ._2D;
+                sdesc.views[0].texture.sample_type = .FLOAT;
+                sdesc.views[0].texture.msl_texture_n = 0;
+                sdesc.samplers[0].stage = .FRAGMENT;
+                sdesc.samplers[0].sampler_type = .FILTERING;
+                sdesc.samplers[0].msl_sampler_n = 0;
+                sdesc.texture_sampler_pairs[0].stage = .FRAGMENT;
+                sdesc.texture_sampler_pairs[0].view_slot = 0;
+                sdesc.texture_sampler_pairs[0].sampler_slot = 0;
+                self.shd = sg.makeShader(sdesc);
+            }
+        } else {
+            const vs_src = "#include <metal_stdlib>\nusing namespace metal;\nstruct VSIn { float2 pos [[attribute(0)]]; float2 uv [[attribute(1)]]; };\nstruct VSOut { float4 pos [[position]]; float2 uv; };\nstruct VSParams { float2 aspect; };\nvertex VSOut vs_main(VSIn in [[stage_in]], constant VSParams& params [[buffer(0)]]) { VSOut o; float2 p = in.pos; p.x *= params.aspect.x; p.y *= params.aspect.y; o.pos = float4(p, 0.0, 1.0); o.uv = in.uv; return o; }\n";
+            const fs_src = "#include <metal_stdlib>\nusing namespace metal;\nstruct VSOut { float4 pos [[position]]; float2 uv; };\nfragment float4 fs_main(VSOut in [[stage_in]], texture2d<float, access::sample> tex0 [[texture(0)]], sampler smp [[sampler(0)]]) {\n    float3 c = tex0.sample(smp, in.uv).rgb;\n    return float4(c, 1.0);\n}\n";
+            var sdesc: sg.ShaderDesc = .{};
+            sdesc.label = "chunk-shader";
+            sdesc.vertex_func.source = vs_src;
+            sdesc.vertex_func.entry = "vs_main";
+            sdesc.fragment_func.source = fs_src;
+            sdesc.fragment_func.entry = "fs_main";
+            // VS uniform block for aspect correction
+            sdesc.uniform_blocks[0].stage = .VERTEX;
+            sdesc.uniform_blocks[0].size = 8; // float2
+            sdesc.uniform_blocks[0].msl_buffer_n = 0;
+            // No fragment uniforms needed now that masks are removed
+            sdesc.views[0].texture.stage = .FRAGMENT;
+            sdesc.views[0].texture.image_type = ._2D;
+            sdesc.views[0].texture.sample_type = .FLOAT;
+            sdesc.views[0].texture.msl_texture_n = 0;
+            sdesc.samplers[0].stage = .FRAGMENT;
+            sdesc.samplers[0].sampler_type = .FILTERING;
+            sdesc.samplers[0].msl_sampler_n = 0;
+            sdesc.texture_sampler_pairs[0].stage = .FRAGMENT;
+            sdesc.texture_sampler_pairs[0].view_slot = 0;
+            sdesc.texture_sampler_pairs[0].sampler_slot = 0;
+            self.shd = sg.makeShader(sdesc);
+        }
 
         var pdesc: sg.PipelineDesc = .{};
         pdesc.label = "chunk-pipeline";
