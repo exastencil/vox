@@ -65,7 +65,15 @@ pub const Simulation = struct {
     entity_by_player: std.AutoHashMap(player.PlayerId, usize),
     connections_mutex: std.Thread.Mutex = .{},
 
+    // chunk systems
     chunks: std.ArrayList(gs.Chunk),
+    chunk_index: std.AutoHashMap(gs.ChunkPos, usize),
+    chunk_mutex: std.Thread.Mutex = .{},
+
+    // worldgen config and threads
+    worldgen_threads: u32 = 1,
+    gen_radius_chunks: i32 = 8,
+    wg_threads: std.ArrayList(std.Thread),
 
     pub fn init(opts: SimulationOptions) !Simulation {
         var seed_bytes: [8]u8 = undefined;
@@ -93,33 +101,15 @@ pub const Simulation = struct {
             .dynamic_entities = undefined,
             .entity_by_player = std.AutoHashMap(player.PlayerId, usize).init(opts.allocator),
             .chunks = undefined,
+            .chunk_index = std.AutoHashMap(gs.ChunkPos, usize).init(opts.allocator),
+            .wg_threads = undefined,
         };
         // initialize snapshot buffers
         sim.publishSnapshot();
-        // initialize dynamic entities list
+        // initialize lists
         sim.dynamic_entities = try std.ArrayList(gs.EntityRecord).initCapacity(opts.allocator, 0);
-
-        // Bootstrap vox:default: only core:void biome. Generate an 8x8 around origin.
-        // For symmetry around origin, generate ranges [-4..3] inclusive on both axes.
-        const half: i32 = 4; // 8-wide dimension
-        const total: usize = @intCast((half * 2) * (half * 2));
-        sim.chunks = try std.ArrayList(gs.Chunk).initCapacity(opts.allocator, total);
-
-        // Ensure prereqs exist in registry: air and core:void
-        try sim.reg.ensureAir();
-        const maybe_void = sim.reg.findBiome("core:void");
-        const void_biome_id: ids.BiomeId = maybe_void orelse try sim.reg.addBiome("core:void");
-        const air_id: ids.BlockStateId = 0; // by convention from ensureAir()
-
-        var z: i32 = -half;
-        while (z < half) : (z += 1) {
-            var x: i32 = -half;
-            while (x < half) : (x += 1) {
-                const pos = gs.ChunkPos{ .x = x, .z = z };
-                const chunk = try worldgen.generateVoidChunk(opts.allocator, sim.section_count_y, pos, air_id, void_biome_id);
-                sim.chunks.appendAssumeCapacity(chunk);
-            }
-        }
+        sim.chunks = try std.ArrayList(gs.Chunk).initCapacity(opts.allocator, 0);
+        sim.wg_threads = try std.ArrayList(std.Thread).initCapacity(opts.allocator, 0);
 
         return sim;
     }
@@ -131,9 +121,11 @@ pub const Simulation = struct {
     pub fn deinit(self: *Simulation) void {
         for (self.chunks.items) |*c| worldgen.deinitChunk(self.allocator, c);
         self.chunks.deinit(self.allocator);
+        self.chunk_index.deinit();
         self.dynamic_entities.deinit(self.allocator);
         self.entity_by_player.deinit();
         self.players.deinit();
+        self.wg_threads.deinit(self.allocator);
     }
 
     pub fn tick(self: *Simulation) void {
@@ -228,6 +220,77 @@ pub const Simulation = struct {
     fn tickThreadMain(self_ptr: *Simulation) void {
         while (self_ptr.running.load(.acquire)) {
             self_ptr.tick();
+        }
+    }
+
+    fn worldgenThreadMain(self_ptr: *Simulation) void {
+        const alloc = self_ptr.allocator;
+        var desired: std.AutoHashMap(gs.ChunkPos, void) = std.AutoHashMap(gs.ChunkPos, void).init(alloc);
+        defer desired.deinit();
+        while (self_ptr.running.load(.acquire)) {
+            desired.clearRetainingCapacity();
+            // Snapshot connected players and desired chunk positions
+            self_ptr.connections_mutex.lock();
+            {
+                var it = self_ptr.players.by_id.valueIterator();
+                while (it.next()) |pd| {
+                    if (!pd.connected) continue;
+                    if (self_ptr.entity_by_player.get(pd.id)) |idx| {
+                        if (idx < self_ptr.dynamic_entities.items.len) {
+                            const e = self_ptr.dynamic_entities.items[idx];
+                            const cx: i32 = @divTrunc(@as(i32, @intFromFloat(e.pos[0])), @as(i32, constants.chunk_size_x));
+                            const cz: i32 = @divTrunc(@as(i32, @intFromFloat(e.pos[2])), @as(i32, constants.chunk_size_z));
+                            const r = self_ptr.gen_radius_chunks;
+                            var dz: i32 = -r;
+                            while (dz <= r) : (dz += 1) {
+                                var dx: i32 = -r;
+                                while (dx <= r) : (dx += 1) {
+                                    const pos = gs.ChunkPos{ .x = cx + dx, .z = cz + dz };
+                                    _ = desired.put(pos, {}) catch {};
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            self_ptr.connections_mutex.unlock();
+
+            // Generate up to a few missing chunks per pass
+            var generated: u32 = 0;
+            var it2 = desired.keyIterator();
+            while (it2.next()) |pos_ptr| {
+                const pos = pos_ptr.*;
+                // check if chunk exists
+                var missing = false;
+                self_ptr.chunk_mutex.lock();
+                missing = (self_ptr.chunk_index.get(pos) == null);
+                self_ptr.chunk_mutex.unlock();
+                if (!missing) continue;
+
+                // generate void chunk for now
+                const maybe_void = self_ptr.reg.findBiome("core:void");
+                const void_biome_id: ids.BiomeId = maybe_void orelse self_ptr.reg.addBiome("core:void") catch 0;
+                const air_id: ids.BlockStateId = 0;
+                const chunk = worldgen.generateVoidChunk(alloc, self_ptr.section_count_y, pos, air_id, void_biome_id) catch continue;
+
+                // fold into simulation
+                self_ptr.chunk_mutex.lock();
+                if (self_ptr.chunk_index.get(pos) == null) {
+                    self_ptr.chunks.append(self_ptr.allocator, chunk) catch unreachable;
+                    const idx = self_ptr.chunks.items.len - 1;
+                    self_ptr.chunk_index.put(pos, idx) catch {};
+                } else {
+                    // already added by another thread
+                    worldgen.deinitChunk(alloc, &chunk);
+                }
+                self_ptr.chunk_mutex.unlock();
+
+                generated += 1;
+                if (generated >= 4) break; // limit per pass
+            }
+
+            // small sleep to avoid busy-loop
+            std.Thread.sleep(5_000_000); // 5ms
         }
     }
 
@@ -357,6 +420,14 @@ pub const Simulation = struct {
         if (self.running.swap(true, .acquire)) return; // already running
         self.last_tick_ns = std.time.nanoTimestamp();
         self.thread = try std.Thread.spawn(.{}, tickThreadMain, .{self});
+        // start worldgen threads
+        const count: usize = if (self.worldgen_threads == 0) 1 else @intCast(self.worldgen_threads);
+        try self.wg_threads.ensureTotalCapacity(self.allocator, count);
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const th = try std.Thread.spawn(.{}, worldgenThreadMain, .{self});
+            self.wg_threads.appendAssumeCapacity(th);
+        }
     }
 
     pub fn stop(self: *Simulation) void {
@@ -365,5 +436,11 @@ pub const Simulation = struct {
             t.join();
             self.thread = null;
         }
+        // join worldgen threads
+        var i: usize = 0;
+        while (i < self.wg_threads.items.len) : (i += 1) {
+            self.wg_threads.items[i].join();
+        }
+        self.wg_threads.clearRetainingCapacity();
     }
 };
