@@ -6,7 +6,7 @@
 in vec2 pos;
 in vec2 uv0;
 
-uniform vs_params {
+layout(binding=0) uniform vs_params {
     vec2 aspect;
 };
 
@@ -24,12 +24,13 @@ void main() {
 @fs fs
 in vec2 uv;
 
-uniform sampler2D tex;
+layout(binding=1) uniform texture2D tex_texture;
+layout(binding=2) uniform sampler tex_sampler;
 
 out vec4 frag_color;
 
 void main() {
-    vec3 c = texture(tex, uv).rgb;
+    vec3 c = texture(sampler2D(tex_texture, tex_sampler), uv).rgb;
     frag_color = vec4(c, 1.0);
 }
 @end

@@ -6,6 +6,7 @@ const sg = sokol.gfx;
 const sapp = sokol.app;
 const sglue = sokol.glue;
 const sdtx = sokol.debugtext;
+const shd_mod = @import("shaders/chunk_shd.zig");
 
 const Vertex = struct { pos: [2]f32, uv: [2]f32 };
 
@@ -92,7 +93,6 @@ pub const Client = struct {
         self.show_debug = true;
 
         // shader: use shdc-generated cross-platform shader
-        const shd_mod = @import("shaders/chunk_shd.zig");
         const backend = sg.queryBackend();
         if (@hasDecl(shd_mod, "shaderDesc")) {
             self.shd = sg.makeShader(shd_mod.shaderDesc(backend));
@@ -133,8 +133,9 @@ pub const Client = struct {
         // create a view and sampler for the texture
         self.grass_view = sg.makeView(.{ .texture = .{ .image = self.grass_img } });
         self.sampler = sg.makeSampler(.{ .min_filter = .NEAREST, .mag_filter = .NEAREST, .mipmap_filter = .NEAREST, .wrap_u = .REPEAT, .wrap_v = .REPEAT });
-        self.bind.views[0] = self.grass_view;
-        self.bind.samplers[0] = self.sampler;
+        // shader expects VIEW_tex_texture at slot 1 and SMP_tex_sampler at slot 2
+        self.bind.views[1] = self.grass_view;
+        self.bind.samplers[2] = self.sampler;
     }
 
     fn buildTopSurfaceVerts(self: *Client, out: []Vertex) usize {
@@ -182,7 +183,7 @@ pub const Client = struct {
         const w_px: f32 = @floatFromInt(sapp.width());
         const h_px: f32 = @floatFromInt(sapp.height());
         const aspect: f32 = h_px / w_px; // scale x by h/w to keep squares square
-        const vs_params = struct { aspect: [2]f32 }{ .aspect = .{ aspect, 1.0 } };
+        var vs_params: shd_mod.VsParams = .{ .aspect = .{ aspect, 1.0 } };
 
         // Build main top-surface verts
         const vcount = self.buildTopSurfaceVerts(verts[0..]);

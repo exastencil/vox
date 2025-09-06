@@ -36,13 +36,11 @@ pub fn build(b: *Build) !void {
         else => "bin/linux/sokol-shdc",
     };
     const shdc_path = dep_tools.path(tool_rel_path);
-    const shdc = b.addSystemCommand(&.{});
-    shdc.addArg(shdc_path.getPath(b));
+    const shdc = b.addSystemCommand(&.{shdc_path.getPath(b)});
     shdc.addArgs(&.{
-        "--input", b.path("shaders/chunk.glsl").getPath(b),
-        "--output", b.path("src/shaders/chunk_shd.zig").getPath(b),
-        "--slang=glsl330:glsl100:hlsl5:metal_macos:metal_ios:wgsl",
-        "--format=sokol_zig",
+        "--input",                                b.path("shaders/chunk.glsl").getPath(b),
+        "--output",                               b.path("src/shaders/chunk_shd.zig").getPath(b),
+        "--slang=glsl430:hlsl5:metal_macos:wgsl", "--format=sokol_zig",
         "--bytecode",
     });
     // Ensure shader gets generated before compiling the exe

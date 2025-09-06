@@ -7,16 +7,16 @@
         "build.zig",
         "build.zig.zon",
     },
-.dependencies = .{
+    .dependencies = .{
         .sokol = .{
             .url = "git+https://github.com/floooh/sokol-zig.git#4b8c06c546ad503d4c765ba5cd9fe8ee3afe3f5b",
             .hash = "sokol-0.1.0-pb1HK0YZLgBxZgCUlZs-sEZwIgtqS2NbMByXA9d04Spd",
         },
         // Note: pin a specific commit and hash for sokol-tools-bin. The hash below is a placeholder
         // and will need to be updated by running `zig fetch` or by replacing with the correct value.
-.@"sokol-tools-bin" = .{
+        .@"sokol-tools-bin" = .{
             .url = "git+https://github.com/floooh/sokol-tools-bin.git#master",
-            .hash = "", // TODO: replace with the correct content hash for reproducible builds
+            .hash = "sokolshdc-0.1.0-r2KZDtYXlQS2C2CNekXgsRqhyKk5JtGzBlFBTMX27o0f",
         },
     },
 }
