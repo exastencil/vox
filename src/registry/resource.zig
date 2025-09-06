@@ -1,4 +1,6 @@
 const std = @import("std");
+const sokol = @import("sokol");
+const sg = sokol.gfx;
 
 // A very small resource registry focused on block rendering resources.
 // Blocks can be assigned one of three resource styles:
@@ -22,12 +24,12 @@ pub const Face = enum {
 pub const BlockRes = union(enum) {
     Void: void,
     Uniform: struct {
-        all: []const u8, // texture key for all faces
+        all: sg.Image, // texture for all faces
     },
     Facing: struct {
-        face: Face,
-        face_tex: []const u8,
-        other_tex: []const u8,
+        // one face has a different texture, face selection is handled elsewhere
+        face_tex: sg.Image,
+        other_tex: sg.Image,
     },
 };
 
@@ -41,21 +43,9 @@ pub const Registry = struct {
     }
 
     pub fn deinit(self: *Registry) void {
-        // Free any duplicated strings inside BlockRes values and keys
-        var it = self.by_block.iterator();
-        while (it.next()) |entry| {
-            const key_owned = entry.key_ptr.*; // owned key
-            self.allocator.free(key_owned);
-            const res = entry.value_ptr.*;
-            switch (res) {
-                .Void => {},
-                .Uniform => |u| self.allocator.free(u.all),
-                .Facing => |f| {
-                    self.allocator.free(f.face_tex);
-                    self.allocator.free(f.other_tex);
-                },
-            }
-        }
+        // Free owned keys; textures are external handles managed by the renderer
+        var it = self.by_block.keyIterator();
+        while (it.next()) |kptr| self.allocator.free(kptr.*);
         self.by_block.deinit();
     }
 
@@ -65,16 +55,13 @@ pub const Registry = struct {
         try self.replace(block_key, .{ .Void = {} });
     }
 
-    pub fn setUniform(self: *Registry, block_key: []const u8, all_tex: []const u8) !void {
-        const all_owned = try self.allocator.dupe(u8, all_tex);
-        const res = BlockRes{ .Uniform = .{ .all = all_owned } };
+    pub fn setUniform(self: *Registry, block_key: []const u8, all_tex: sg.Image) !void {
+        const res = BlockRes{ .Uniform = .{ .all = all_tex } };
         try self.replace(block_key, res);
     }
 
-    pub fn setFacing(self: *Registry, block_key: []const u8, face: Face, face_tex: []const u8, other_tex: []const u8) !void {
-        const f_owned = try self.allocator.dupe(u8, face_tex);
-        const o_owned = try self.allocator.dupe(u8, other_tex);
-        const res = BlockRes{ .Facing = .{ .face = face, .face_tex = f_owned, .other_tex = o_owned } };
+    pub fn setFacing(self: *Registry, block_key: []const u8, face_tex: sg.Image, other_tex: sg.Image) !void {
+        const res = BlockRes{ .Facing = .{ .face_tex = face_tex, .other_tex = other_tex } };
         try self.replace(block_key, res);
     }
 
@@ -84,16 +71,8 @@ pub const Registry = struct {
     }
 
     fn replace(self: *Registry, block_key: []const u8, res: BlockRes) !void {
-        // If entry exists, replace value in-place and free old inner strings
+        // If entry exists, replace value in-place
         if (self.by_block.getPtr(block_key)) |p| {
-            switch (p.*) {
-                .Void => {},
-                .Uniform => |u| self.allocator.free(u.all),
-                .Facing => |f| {
-                    self.allocator.free(f.face_tex);
-                    self.allocator.free(f.other_tex);
-                },
-            }
             p.* = res;
             return;
         }
@@ -117,8 +96,13 @@ test "resource: register void, uniform, facing and retrieve" {
     defer reg.deinit();
 
     try reg.setVoid("core:air");
-    try reg.setUniform("core:stone", "tex:stone");
-    try reg.setFacing("core:grass", .up, "tex:grass_top", "tex:grass_side");
+    // Mock image handles (no real gfx setup needed for registry tests)
+    const tex_stone: sg.Image = .{};
+    const tex_grass_top: sg.Image = .{};
+    const tex_grass_side: sg.Image = .{};
+
+    try reg.setUniform("core:stone", tex_stone);
+    try reg.setFacing("core:grass", tex_grass_top, tex_grass_side);
 
     const air = reg.get("core:air") orelse return error.UnexpectedNull;
     switch (air) {
@@ -128,16 +112,18 @@ test "resource: register void, uniform, facing and retrieve" {
 
     const stone = reg.get("core:stone") orelse return error.UnexpectedNull;
     switch (stone) {
-        .Uniform => |u| try testing.expectEqualStrings("tex:stone", u.all),
+        .Uniform => |u| {
+            // Just check it's the same handle value we set
+            try testing.expectEqual(tex_stone, u.all);
+        },
         else => return error.Invalid,
     }
 
     const grass = reg.get("core:grass") orelse return error.UnexpectedNull;
     switch (grass) {
         .Facing => |f| {
-            try testing.expectEqual(Face.up, f.face);
-            try testing.expectEqualStrings("tex:grass_top", f.face_tex);
-            try testing.expectEqualStrings("tex:grass_side", f.other_tex);
+            try testing.expectEqual(tex_grass_top, f.face_tex);
+            try testing.expectEqual(tex_grass_side, f.other_tex);
         },
         else => return error.Invalid,
     }

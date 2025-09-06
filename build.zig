@@ -40,6 +40,7 @@ pub fn build(b: *Build) !void {
             .root_source_file = b.path("src/registry.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{.{ .name = "sokol", .module = dep_sokol.module("sokol") }},
         }),
     });
     test_step.dependOn(&tests_reg.step);
@@ -50,6 +51,7 @@ pub fn build(b: *Build) !void {
             .root_source_file = b.path("src/registry/resource.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{.{ .name = "sokol", .module = dep_sokol.module("sokol") }},
         }),
     });
     test_step.dependOn(&tests_res.step);
