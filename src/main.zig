@@ -12,6 +12,7 @@ const ids = @import("ids.zig");
 const simulation = @import("simulation.zig");
 const player = @import("player.zig");
 const builtin = @import("builtin");
+const mc = @import("assets/mc_textures_1_18.zig");
 
 const State = struct {
     pass_action: sg.PassAction = .{},
@@ -102,12 +103,47 @@ export fn init() void {
         .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 1 },
     };
 
-    // Register placeholder textures for dirt and grass in the resource registry.
-    // These are temporary solid-color textures; replace with CC0 textures later.
+    // Build textures from embedded Minecraft 1.18 assets (testing-only, not for distribution)
     if (reg) |*rp| {
-        const dirt_tex: sg.Image = .{}; // TODO: load actual texture
-        const grass_top_tex: sg.Image = .{}; // TODO: load actual texture
-        const grass_side_tex: sg.Image = .{}; // TODO: load actual texture
+        const dirt_tex = sg.makeImage(.{
+            .width = @intCast(mc.dirt_width),
+            .height = @intCast(mc.dirt_height),
+            .pixel_format = .RGBA8,
+            .data = .{ .subimage = .{
+                .{ sg.asRange(mc.dirt_pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+            } },
+        });
+        const grass_top_tex = sg.makeImage(.{
+            .width = @intCast(mc.grass_top_width),
+            .height = @intCast(mc.grass_top_height),
+            .pixel_format = .RGBA8,
+            .data = .{ .subimage = .{
+                .{ sg.asRange(mc.grass_top_pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+            } },
+        });
+        const grass_side_tex = sg.makeImage(.{
+            .width = @intCast(mc.grass_side_width),
+            .height = @intCast(mc.grass_side_height),
+            .pixel_format = .RGBA8,
+            .data = .{ .subimage = .{
+                .{ sg.asRange(mc.grass_side_pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+            } },
+        });
         rp.resources.setUniform("vox:dirt", dirt_tex) catch {};
         rp.resources.setFacing("vox:grass", grass_top_tex, grass_side_tex) catch {};
     }
