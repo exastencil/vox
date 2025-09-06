@@ -51,16 +51,17 @@ export fn init() void {
         return;
     };
     // register built-in worldgen types
-    r.worldgen.add("core:void", "Void", registry.WorldGen.selectVoid) catch {
+    r.worldgen.add("core:void", "Void", registry.WorldGen.selectVoid, registry.WorldGen.selectBlockVoid) catch {
         r.deinit();
         return;
     };
-    r.worldgen.add("core:superflat", "Superflat", registry.WorldGen.selectSuperflat) catch {
+    r.worldgen.add("core:superflat", "Superflat", registry.WorldGen.selectSuperflat, registry.WorldGen.selectBlockSuperflat) catch {
         r.deinit();
         return;
     };
-    // ensure common biomes used by builtin gens
+    // ensure common biomes/blocks used by builtin gens
     _ = r.addBiome("core:plains") catch {};
+    _ = r.addBlock("core:stone") catch {};
 
     reg = r;
 
