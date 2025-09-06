@@ -41,6 +41,7 @@ pub const WorldState = struct {
     key: []const u8,
     section_count_y: u16,
     regions: std.AutoHashMap(RegionPos, RegionState),
+    spawn_point: gs.BlockPos,
 };
 
 pub const Simulation = struct {
@@ -469,16 +470,25 @@ pub const Simulation = struct {
 
     fn ensurePlayerEntityLocked(self: *Simulation, pid: player.PlayerId) !usize {
         if (self.entity_by_player.get(pid)) |idx| return idx;
-        // spawn at origin for now
+        // Determine player's world and spawn at world spawn (adjusted to positive Y)
+        const wk = self.player_world.get(pid) orelse "vox:overworld";
+        const ws = try self.ensureWorldState(wk);
+        var sp = ws.spawn_point;
+        if (sp.y < 1) sp.y = 1; // ensure positive Y to avoid caves
+        const center_x: f32 = @as(f32, @floatFromInt(sp.x)) + 0.5;
+        const center_z: f32 = @as(f32, @floatFromInt(sp.z)) + 0.5;
+        const half_height: f32 = 0.9;
+        const center_y: f32 = @as(f32, @floatFromInt(sp.y)) + half_height + 0.1; // keep feet above ground
+
         const eid = self.next_eid;
         self.next_eid += 1;
         const rec: gs.EntityRecord = .{
             .eid = eid,
             .kind = 0, // 0 reserved for player entity kind for now
-            .pos = .{ 0, 0, 0 },
+            .pos = .{ center_x, center_y, center_z },
             .vel = .{ 0, 0, 0 },
             .yaw_pitch_roll = .{ 0, 0, 0 },
-            .aabb_half_extents = .{ 0.5, 0.9, 0.5 },
+            .aabb_half_extents = .{ 0.5, half_height, 0.5 },
             .flags = .{},
         };
         try self.dynamic_entities.append(self.allocator, rec);
@@ -497,13 +507,40 @@ pub const Simulation = struct {
         if (self.worlds_state.getPtr(world_key)) |ws| return ws;
         const wd = self.reg.worlds.get(world_key) orelse return error.WorldNotRegistered;
         const key_copy = try self.allocator.dupe(u8, world_key);
+        const spawn = self.computeSpawnAtColumn(wd, 0, 0);
         const ws = WorldState{
             .key = key_copy,
             .section_count_y = wd.section_count_y,
             .regions = std.AutoHashMap(RegionPos, RegionState).init(self.allocator),
+            .spawn_point = spawn,
         };
         try self.worlds_state.put(key_copy, ws);
         return self.worlds_state.getPtr(key_copy).?;
+    }
+
+    fn computeSpawnAtColumn(self: *Simulation, wd: registry.World.Def, x: i32, z: i32) gs.BlockPos {
+        // Determine the lowest Y where two consecutive air blocks occur at (x, z)
+        const air_id: ids.BlockStateId = 0;
+        const wg_def = self.reg.worldgen.get(wd.gen_key) orelse return .{ .x = x, .y = 0, .z = z };
+        const params: registry.WorldGen.Params = .{ .blocks = wd.gen_blocks, .biomes = wd.gen_biomes };
+        const lookup: registry.WorldGen.BlockLookup = .{ .ctx = self.reg, .call = blockLookupCall };
+        const half_height: i32 = @as(i32, @intCast(wd.section_count_y)) * @as(i32, @intCast(constants.section_height));
+        const y_min: i32 = -half_height;
+        const y_max: i32 = half_height; // exclusive upper bound for scan
+        var y: i32 = y_min;
+        while (y < y_max - 1) : (y += 1) {
+            const pos0 = gs.BlockPos{ .x = x, .y = y, .z = z };
+            const biome0 = wg_def.select_biome(self.world_seed, pos0, params);
+            const b0 = wg_def.select_block(self.world_seed, biome0, pos0, params, lookup);
+            const pos1 = gs.BlockPos{ .x = x, .y = y + 1, .z = z };
+            const biome1 = wg_def.select_biome(self.world_seed, pos1, params);
+            const b1 = wg_def.select_block(self.world_seed, biome1, pos1, params, lookup);
+            if (b0 == air_id and b1 == air_id) {
+                return .{ .x = x, .y = y, .z = z };
+            }
+        }
+        // Fallback if not found in scan range
+        return .{ .x = x, .y = 0, .z = z };
     }
 
     fn ensureRegionState(self: *Simulation, ws: *WorldState, rp: RegionPos) !*RegionState {

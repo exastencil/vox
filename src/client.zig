@@ -144,6 +144,8 @@ pub const Client = struct {
         pdesc.layout.attrs[1].format = .FLOAT2;
         pdesc.primitive_type = .TRIANGLES;
         pdesc.cull_mode = .BACK;
+        // Ensure we define a consistent front-face winding across backends
+        pdesc.face_winding = .CCW;
         pdesc.depth = .{ .compare = .LESS_EQUAL, .write_enabled = true };
         // ensure pipeline color/depth target matches swapchain format
         const desc = sg.queryDesc();
@@ -178,18 +180,11 @@ pub const Client = struct {
     }
 
     fn buildChunkSurfaceMesh(self: *Client, out: *std.ArrayList(Vertex)) usize {
-        // render chunk (0,0) from world "vox:overworld" if present
+        // Render all loaded chunks in the overworld
         const wk = "vox:overworld";
         self.sim.worlds_mutex.lock();
         defer self.sim.worlds_mutex.unlock();
         const ws = self.sim.worlds_state.getPtr(wk) orelse return 0;
-        const rp = simulation.RegionPos{ .x = 0, .z = 0 };
-        const rs = ws.regions.getPtr(rp) orelse return 0;
-        const idx = rs.chunk_index.get(.{ .x = 0, .z = 0 }) orelse return 0;
-        const ch = rs.chunks.items[idx];
-
-        const base_x: f32 = @floatFromInt(ch.pos.x * 16);
-        const base_z: f32 = @floatFromInt(ch.pos.z * 16);
 
         // Helpers to append a quad (two triangles) with CCW winding
         const addQuad = struct {
@@ -212,58 +207,107 @@ pub const Client = struct {
         }.call;
 
         const verts_before: usize = out.items.len;
-        out.ensureTotalCapacity(self.allocator, verts_before + 16 * 16 * 6 * 6) catch {};
 
-        // Build top faces and simple side faces from heightmap
-        const hm = ch.heightmaps.world_surface;
-        for (0..16) |z| {
-            for (0..16) |x| {
-                const xi: i32 = @intCast(x);
-                const zi: i32 = @intCast(z);
-                const h = hm[z * 16 + x];
-                if (h < 0) continue; // empty column
-                const y_top: f32 = @floatFromInt(h + 1);
-                const x0: f32 = base_x + @as(f32, @floatFromInt(x));
-                const x1: f32 = x0 + 1.0;
-                const z0: f32 = base_z + @as(f32, @floatFromInt(z));
-                const z1: f32 = z0 + 1.0;
-                // Top face (upward normal), CCW seen from +Y
-                addQuad(out,
-                    .{ x0, y_top, z0 }, .{ x1, y_top, z0 }, .{ x1, y_top, z1 }, .{ x0, y_top, z1 },
-                    .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 },
-                );
-                // Sides if neighbor lower
-                const h_w = getH(&hm, xi - 1, zi);
-                if (h_w < h) {
-                    const y0: f32 = @floatFromInt(h_w + 1);
-                    addQuad(out,
-                        .{ x0, y0, z1 }, .{ x0, y_top, z1 }, .{ x0, y_top, z0 }, .{ x0, y0, z0 }, // -X face
-                        .{ 0, 0 }, .{ 0, (y_top - y0) }, .{ 1, (y_top - y0) }, .{ 1, 0 },
-                    );
-                }
-                const h_e = getH(&hm, xi + 1, zi);
-                if (h_e < h) {
-                    const y0: f32 = @floatFromInt(h_e + 1);
-                    addQuad(out,
-                        .{ x1, y0, z0 }, .{ x1, y_top, z0 }, .{ x1, y_top, z1 }, .{ x1, y0, z1 }, // +X face
-                        .{ 0, 0 }, .{ 0, (y_top - y0) }, .{ 1, (y_top - y0) }, .{ 1, 0 },
-                    );
-                }
-                const h_n = getH(&hm, xi, zi - 1);
-                if (h_n < h) {
-                    const y0: f32 = @floatFromInt(h_n + 1);
-                    addQuad(out,
-                        .{ x1, y0, z0 }, .{ x1, y_top, z0 }, .{ x0, y_top, z0 }, .{ x0, y0, z0 }, // -Z face
-                        .{ 0, 0 }, .{ 0, (y_top - y0) }, .{ 1, (y_top - y0) }, .{ 1, 0 },
-                    );
-                }
-                const h_s = getH(&hm, xi, zi + 1);
-                if (h_s < h) {
-                    const y0: f32 = @floatFromInt(h_s + 1);
-                    addQuad(out,
-                        .{ x0, y0, z1 }, .{ x0, y_top, z1 }, .{ x1, y_top, z1 }, .{ x1, y0, z1 }, // +Z face
-                        .{ 0, 0 }, .{ 0, (y_top - y0) }, .{ 1, (y_top - y0) }, .{ 1, 0 },
-                    );
+        // Iterate all regions and their chunks
+        var reg_it = ws.regions.iterator();
+        while (reg_it.next()) |rentry| {
+            const rs_val = rentry.value_ptr.*; // copy for read-only access
+            for (rs_val.chunks.items) |ch| {
+                const base_x: f32 = @floatFromInt(ch.pos.x * 16);
+                const base_z: f32 = @floatFromInt(ch.pos.z * 16);
+
+                // Upper bound capacity per chunk (36 verts per column)
+                const cur_len: usize = out.items.len;
+                out.ensureTotalCapacity(self.allocator, cur_len + 16 * 16 * 6 * 6) catch {};
+
+                // Build top faces and simple side faces from heightmap
+                const hm = ch.heightmaps.world_surface;
+                for (0..16) |z| {
+                    for (0..16) |x| {
+                        const xi: i32 = @intCast(x);
+                        const zi: i32 = @intCast(z);
+                        const h = hm[z * 16 + x];
+                        if (h < 0) continue; // empty column
+                        const y_top: f32 = @floatFromInt(h + 1);
+                        const x0: f32 = base_x + @as(f32, @floatFromInt(x));
+                        const x1: f32 = x0 + 1.0;
+                        const z0: f32 = base_z + @as(f32, @floatFromInt(z));
+                        const z1: f32 = z0 + 1.0;
+                        // Top face (upward normal), CCW seen from +Y
+                        addQuad(
+                            out,
+                            .{ x0, y_top, z0 },
+                            .{ x0, y_top, z1 },
+                            .{ x1, y_top, z1 },
+                            .{ x1, y_top, z0 },
+                            .{ 0, 0 },
+                            .{ 0, 1 },
+                            .{ 1, 1 },
+                            .{ 1, 0 },
+                        );
+                        // Sides if neighbor lower (within the same chunk). For inter-chunk gaps, we'll
+                        // handle neighbors later — this renders a simple "wall" at chunk borders for now.
+                        const h_w = getH(&hm, xi - 1, zi);
+                        if (h_w < h) {
+                            const y0: f32 = @floatFromInt(h_w + 1);
+                            addQuad(
+                                out,
+                                .{ x0, y0, z1 },
+                                .{ x0, y_top, z1 },
+                                .{ x0, y_top, z0 },
+                                .{ x0, y0, z0 }, // -X face
+                                .{ 0, 0 },
+                                .{ 0, (y_top - y0) },
+                                .{ 1, (y_top - y0) },
+                                .{ 1, 0 },
+                            );
+                        }
+                        const h_e = getH(&hm, xi + 1, zi);
+                        if (h_e < h) {
+                            const y0: f32 = @floatFromInt(h_e + 1);
+                            addQuad(
+                                out,
+                                .{ x1, y0, z0 },
+                                .{ x1, y_top, z0 },
+                                .{ x1, y_top, z1 },
+                                .{ x1, y0, z1 }, // +X face
+                                .{ 0, 0 },
+                                .{ 0, (y_top - y0) },
+                                .{ 1, (y_top - y0) },
+                                .{ 1, 0 },
+                            );
+                        }
+                        const h_n = getH(&hm, xi, zi - 1);
+                        if (h_n < h) {
+                            const y0: f32 = @floatFromInt(h_n + 1);
+                            addQuad(
+                                out,
+                                .{ x0, y0, z0 },
+                                .{ x0, y_top, z0 },
+                                .{ x1, y_top, z0 },
+                                .{ x1, y0, z0 }, // -Z face (outward -Z)
+                                .{ 0, 0 },
+                                .{ 0, (y_top - y0) },
+                                .{ 1, (y_top - y0) },
+                                .{ 1, 0 },
+                            );
+                        }
+                        const h_s = getH(&hm, xi, zi + 1);
+                        if (h_s < h) {
+                            const y0: f32 = @floatFromInt(h_s + 1);
+                            addQuad(
+                                out,
+                                .{ x1, y0, z1 },
+                                .{ x1, y_top, z1 },
+                                .{ x0, y_top, z1 },
+                                .{ x0, y0, z1 }, // +Z face (outward +Z)
+                                .{ 0, 0 },
+                                .{ 0, (y_top - y0) },
+                                .{ 1, (y_top - y0) },
+                                .{ 1, 0 },
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -355,25 +399,20 @@ pub const Client = struct {
                 if (sapp.mouseLocked()) {
                     const sens: f32 = 0.002; // radians per pixel
                     const dx = ev.mouse_dx * sens;
-                    const dy = ev.mouse_dy * sens;
-                    // update player's yaw/pitch directly in simulation
+                    // Only pan left/right: update yaw, leave pitch unchanged
                     self.sim.connections_mutex.lock();
                     const idx_opt = self.sim.entity_by_player.get(self.player_id);
                     if (idx_opt) |idx| {
                         if (idx < self.sim.dynamic_entities.items.len) {
                             var e = &self.sim.dynamic_entities.items[idx];
-                            var yaw = e.yaw_pitch_roll[0] + dx;
-                            var pitch = e.yaw_pitch_roll[1] - dy; // invert so moving mouse up looks up
+                            // Invert sign so dragging right turns right
+                            var yaw = e.yaw_pitch_roll[0] - dx;
                             // wrap yaw to [-pi, pi]
-                            const two_pi: f32 = 6.283185307179586f32;
+                            const two_pi: f32 = 6.283185307179586;
                             if (yaw > std.math.pi) yaw -= two_pi;
                             if (yaw < -std.math.pi) yaw += two_pi;
-                            // clamp pitch to ~+-89 degrees
-                            const max_pitch: f32 = 1.5533430342749532; // 89 deg in radians
-                            if (pitch > max_pitch) pitch = max_pitch;
-                            if (pitch < -max_pitch) pitch = -max_pitch;
                             e.yaw_pitch_roll[0] = yaw;
-                            e.yaw_pitch_roll[1] = pitch;
+                            // e.yaw_pitch_roll[1] unchanged (no pitch)
                         }
                     }
                     self.sim.connections_mutex.unlock();
@@ -468,13 +507,28 @@ pub const Client = struct {
         const uy = sz * fx - sx * fz;
         const uz = sx * fy - sy * fx;
         var m: [16]f32 = undefined;
-        m[0] = sx; m[4] = ux; m[8]  = -fx; m[12] = 0;
-        m[1] = sy; m[5] = uy; m[9]  = -fy; m[13] = 0;
-        m[2] = sz; m[6] = uz; m[10] = -fz; m[14] = 0;
-        m[3] = 0;  m[7] = 0;  m[11] = 0;   m[15] = 1;
+        m[0] = sx;
+        m[4] = ux;
+        m[8] = -fx;
+        m[12] = 0;
+        m[1] = sy;
+        m[5] = uy;
+        m[9] = -fy;
+        m[13] = 0;
+        m[2] = sz;
+        m[6] = uz;
+        m[10] = -fz;
+        m[14] = 0;
+        m[3] = 0;
+        m[7] = 0;
+        m[11] = 0;
+        m[15] = 1;
         // translation
         var t: [16]f32 = [_]f32{0} ** 16;
-        t[0] = 1; t[5] = 1; t[10] = 1; t[15] = 1;
+        t[0] = 1;
+        t[5] = 1;
+        t[10] = 1;
+        t[15] = 1;
         t[12] = -eye[0];
         t[13] = -eye[1];
         t[14] = -eye[2];
