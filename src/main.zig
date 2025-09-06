@@ -11,6 +11,7 @@ const registry = @import("registry.zig");
 const ids = @import("ids.zig");
 const simulation = @import("simulation.zig");
 const player = @import("player.zig");
+const builtin = @import("builtin");
 
 const State = struct {
     pass_action: sg.PassAction = .{},
@@ -18,6 +19,8 @@ const State = struct {
     ui_scale: f32 = 1.0,
     // optional local test client id
     local_player_id: ?player.PlayerId = null,
+    // debug overlay toggle
+    show_debug: bool = builtin.mode == .Debug,
 };
 
 var state: State = .{};
@@ -96,32 +99,33 @@ export fn frame() void {
 
     sg.beginPass(.{ .action = state.pass_action, .swapchain = sglue.swapchain() });
 
-    // draw tick counter in upper-right only
-    // Scale the virtual canvas to enlarge text: canvas = window_size / ui_scale
-    const scale: f32 = state.ui_scale;
-    const w_px: f32 = @floatFromInt(sapp.width());
-    const h_px: f32 = @floatFromInt(sapp.height());
-    sdtx.canvas(w_px / scale, h_px / scale);
-    sdtx.origin(0, 0);
-    // ensure C64 font in case other code changes it later
-    sdtx.font(4);
+    if (state.show_debug) {
+        // draw tick counter in upper-right
+        // Scale the virtual canvas to enlarge text: canvas = window_size / ui_scale
+        const scale: f32 = state.ui_scale;
+        const w_px: f32 = @floatFromInt(sapp.width());
+        const h_px: f32 = @floatFromInt(sapp.height());
+        sdtx.canvas(w_px / scale, h_px / scale);
+        sdtx.origin(0, 0);
+        // ensure C64 font in case other code changes it later
+        sdtx.font(4);
 
-    // Right-aligned tick/TPS text (row 1)
-    if (state.sim) |s| {
-        const snap = s.getSnapshot();
-        var buf: [96:0]u8 = undefined;
-        const text_slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "tick: {d}  tps: {d:.2}  players: {d}", .{ snap.tick, snap.rolling_tps, snap.player_count }) catch "tick: ?";
-        buf[text_slice.len] = 0; // ensure 0-terminated for sdtx
-        const text: [:0]const u8 = buf[0..text_slice.len :0];
-        const cols_f: f32 = (w_px / scale) / 8.0;
-        const text_cols_f: f32 = @floatFromInt(text.len);
-        const col_start_f: f32 = @max(0.0, cols_f - text_cols_f - 1.0);
-        sdtx.pos(col_start_f, 1.0);
-        sdtx.color3b(255, 255, 255);
-        sdtx.puts(text);
+        if (state.sim) |s| {
+            const snap = s.getSnapshot();
+            var buf: [96:0]u8 = undefined;
+            const text_slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "tick: {d}  tps: {d:.2}  players: {d}", .{ snap.tick, snap.rolling_tps, snap.player_count }) catch "tick: ?";
+            buf[text_slice.len] = 0; // ensure 0-terminated for sdtx
+            const text: [:0]const u8 = buf[0..text_slice.len :0];
+            const cols_f: f32 = (w_px / scale) / 8.0;
+            const text_cols_f: f32 = @floatFromInt(text.len);
+            const col_start_f: f32 = @max(0.0, cols_f - text_cols_f - 1.0);
+            sdtx.pos(col_start_f, 1.0);
+            sdtx.color3b(255, 255, 255);
+            sdtx.puts(text);
+        }
+
+        sdtx.draw();
     }
-
-    sdtx.draw();
 
     sg.endPass();
     sg.commit();
@@ -146,11 +150,24 @@ export fn cleanup() void {
     _ = gpa.deinit();
 }
 
+export fn event(e: [*c]const sapp.Event) void {
+    const ev: sapp.Event = e.*;
+    switch (ev.type) {
+        .KEY_UP => {
+            if (ev.key_code == .F3) {
+                state.show_debug = !state.show_debug;
+            }
+        },
+        else => {},
+    }
+}
+
 pub fn main() void {
     sapp.run(.{
         .init_cb = init,
         .frame_cb = frame,
         .cleanup_cb = cleanup,
+        .event_cb = event,
         .width = 1920,
         .height = 1080,
         .icon = .{ .sokol_default = true },
