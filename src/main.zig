@@ -46,7 +46,7 @@ export fn init() void {
         return;
     };
     // ensure common biomes/blocks used by builtin gens
-    _ = r.addBiome("core:plains") catch {};
+    const plains_biome = r.addBiome("vox:plains") catch 0;
     _ = r.addBlock("core:stone") catch {};
     const grass_id = r.addBlock("vox:grass") catch 0;
     const dirt_id = r.addBlock("vox:dirt") catch 0;
@@ -55,7 +55,7 @@ export fn init() void {
     r.worlds.addWorldWithGen("vox:overworld", "The Overworld", 4, .{
         .key = "core:superflat",
         .blocks = &[_]ids.BlockStateId{ grass_id, dirt_id },
-        .biomes = &[_]ids.BiomeId{0}, // default to biome 0
+        .biomes = &[_]ids.BiomeId{plains_biome},
     }) catch {
         r.deinit();
         return;
@@ -70,7 +70,7 @@ export fn init() void {
         return;
     };
     // ensure common biomes/blocks used by builtin gens
-    _ = r.addBiome("core:plains") catch {};
+    _ = r.addBiome("vox:plains") catch {};
     _ = r.addBlock("core:stone") catch {};
 
     reg = r;
@@ -101,6 +101,16 @@ export fn init() void {
         .load_action = .CLEAR,
         .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 1 },
     };
+
+    // Register placeholder textures for dirt and grass in the resource registry.
+    // These are temporary solid-color textures; replace with CC0 textures later.
+    if (reg) |*rp| {
+        const dirt_tex: sg.Image = .{}; // TODO: load actual texture
+        const grass_top_tex: sg.Image = .{}; // TODO: load actual texture
+        const grass_side_tex: sg.Image = .{}; // TODO: load actual texture
+        rp.resources.setUniform("vox:dirt", dirt_tex) catch {};
+        rp.resources.setFacing("vox:grass", grass_top_tex, grass_side_tex) catch {};
+    }
 
     // Create in-memory simulation with a default height of 4 sections (4*32 = 128)
     const sim = simulation.Simulation.initMemory(allocator, &reg.?, 4) catch {
