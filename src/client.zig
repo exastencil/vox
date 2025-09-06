@@ -8,7 +8,32 @@ const sglue = sokol.glue;
 const sdtx = sokol.debugtext;
 const shd_mod = @import("shaders/chunk_shd.zig");
 
-const Vertex = struct { pos: [2]f32, uv: [2]f32 };
+const Camera = struct {
+    pos: [3]f32 = .{ 0, 0, 0 },
+    yaw: f32 = 0.0,
+    pitch: f32 = 0.0,
+    roll: f32 = 0.0,
+    // Derived forward direction from yaw/pitch
+    dir: [3]f32 = .{ 0, 0, -1 },
+
+    fn computeDir(yaw: f32, pitch: f32) [3]f32 {
+        // Assuming yaw around +Y, pitch around +X, radians
+        const cy = @cos(yaw);
+        const sy = @sin(yaw);
+        const cp = @cos(pitch);
+        const sp = @sin(pitch);
+        // Forward in right-handed Y-up: x = cp*cy, y = sp, z = cp*sy
+        return .{ cp * cy, sp, cp * sy };
+    }
+
+    fn setYawPitch(self: *Camera, yaw: f32, pitch: f32) void {
+        self.yaw = yaw;
+        self.pitch = pitch;
+        self.dir = computeDir(yaw, pitch);
+    }
+};
+
+const Vertex = struct { pos: [3]f32, uv: [2]f32 };
 
 fn buildQuadVerts(out: []Vertex, x0: f32, y0: f32, size: f32) usize {
     if (out.len < 6) return 0;
@@ -43,6 +68,12 @@ pub const Client = struct {
     grass_img: sg.Image = .{},
     grass_view: sg.View = .{},
     sampler: sg.Sampler = .{},
+
+    // GPU buffer capacity tracking
+    vbuf_capacity_bytes: usize = 0,
+
+    // Camera mirrored from player entity
+    camera: Camera = .{},
 
     // Snapshot monitoring
     latest_snapshot: simulation.Snapshot = .{
@@ -109,18 +140,23 @@ pub const Client = struct {
         var pdesc: sg.PipelineDesc = .{};
         pdesc.label = "chunk-pipeline";
         pdesc.shader = self.shd;
-        pdesc.layout.attrs[0].format = .FLOAT2;
+        pdesc.layout.attrs[0].format = .FLOAT3;
         pdesc.layout.attrs[1].format = .FLOAT2;
         pdesc.primitive_type = .TRIANGLES;
-        // ensure pipeline color target matches swapchain format
+        pdesc.cull_mode = .BACK;
+        pdesc.depth = .{ .compare = .LESS_EQUAL, .write_enabled = true };
+        // ensure pipeline color/depth target matches swapchain format
         const desc = sg.queryDesc();
         pdesc.color_count = 1;
         pdesc.colors[0].pixel_format = desc.environment.defaults.color_format;
         self.pip = sg.makePipeline(pdesc);
-        // dynamic vertex buffer for a single chunk top surface (16*16 quads * 6 verts)
-        const vcount_max: usize = (16 * 16 * 6);
-        self.vbuf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true, .stream_update = true }, .size = @intCast(vcount_max * @sizeOf(Vertex)) });
+        // dynamic vertex buffer; start with a generous capacity (e.g., 16384 verts)
+        const initial_vcount: usize = 16 * 16 * 16; // plenty for top + sides on flat worlds
+        const initial_bytes: usize = initial_vcount * @sizeOf(Vertex);
+        self.vbuf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true, .stream_update = true }, .size = @intCast(initial_bytes) });
+        self.vbuf_capacity_bytes = initial_bytes;
         self.bind.vertex_buffers[0] = self.vbuf;
+        self.pass_action.depth = .{ .load_action = .CLEAR, .clear_value = 1.0 };
 
         // pick grass top texture from registry
         if (self.sim.reg.resources.get("vox:grass")) |res| {
@@ -136,9 +172,12 @@ pub const Client = struct {
         // shader expects VIEW_tex_texture at slot 1 and SMP_tex_sampler at slot 2
         self.bind.views[1] = self.grass_view;
         self.bind.samplers[2] = self.sampler;
+
+        // Initialize camera from player entity if available
+        self.updateCameraFromPlayer();
     }
 
-    fn buildTopSurfaceVerts(self: *Client, out: []Vertex) usize {
+    fn buildChunkSurfaceMesh(self: *Client, out: *std.ArrayList(Vertex)) usize {
         // render chunk (0,0) from world "vox:overworld" if present
         const wk = "vox:overworld";
         self.sim.worlds_mutex.lock();
@@ -148,56 +187,126 @@ pub const Client = struct {
         const rs = ws.regions.getPtr(rp) orelse return 0;
         const idx = rs.chunk_index.get(.{ .x = 0, .z = 0 }) orelse return 0;
         const ch = rs.chunks.items[idx];
-        // map 16x16 grid to NDC square [-0.8,0.8]
-        const start: f32 = -0.8;
-        const size: f32 = 1.6 / 16.0;
-        var n: usize = 0;
+
+        const base_x: f32 = @floatFromInt(ch.pos.x * 16);
+        const base_z: f32 = @floatFromInt(ch.pos.z * 16);
+
+        // Helpers to append a quad (two triangles) with CCW winding
+        const addQuad = struct {
+            fn call(list: *std.ArrayList(Vertex), v0: [3]f32, v1: [3]f32, v2: [3]f32, v3: [3]f32, uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32) void {
+                list.appendAssumeCapacity(.{ .pos = v0, .uv = uv0 });
+                list.appendAssumeCapacity(.{ .pos = v1, .uv = uv1 });
+                list.appendAssumeCapacity(.{ .pos = v2, .uv = uv2 });
+                list.appendAssumeCapacity(.{ .pos = v0, .uv = uv0 });
+                list.appendAssumeCapacity(.{ .pos = v2, .uv = uv2 });
+                list.appendAssumeCapacity(.{ .pos = v3, .uv = uv3 });
+            }
+        }.call;
+
+        // convenience to get heightmap value with bounds check (outside => -1)
+        const getH = struct {
+            fn call(hm: *const [16 * 16]i32, x: i32, z: i32) i32 {
+                if (x < 0 or x >= 16 or z < 0 or z >= 16) return -1;
+                return hm[@as(usize, @intCast(z)) * 16 + @as(usize, @intCast(x))];
+            }
+        }.call;
+
+        const verts_before: usize = out.items.len;
+        out.ensureTotalCapacity(self.allocator, verts_before + 16 * 16 * 6 * 6) catch {};
+
+        // Build top faces and simple side faces from heightmap
+        const hm = ch.heightmaps.world_surface;
         for (0..16) |z| {
             for (0..16) |x| {
-                const x0: f32 = start + @as(f32, @floatFromInt(x)) * size;
-                const y0: f32 = start + @as(f32, @floatFromInt(z)) * size;
-                const x1: f32 = x0 + size;
-                const y1: f32 = y0 + size;
-                // 2 triangles
-                if (n + 6 > out.len) return n;
-                out[n + 0] = .{ .pos = .{ x0, y0 }, .uv = .{ 0, 0 } };
-                out[n + 1] = .{ .pos = .{ x1, y0 }, .uv = .{ 1, 0 } };
-                out[n + 2] = .{ .pos = .{ x1, y1 }, .uv = .{ 1, 1 } };
-                out[n + 3] = .{ .pos = .{ x0, y0 }, .uv = .{ 0, 0 } };
-                out[n + 4] = .{ .pos = .{ x1, y1 }, .uv = .{ 1, 1 } };
-                out[n + 5] = .{ .pos = .{ x0, y1 }, .uv = .{ 0, 1 } };
-                n += 6;
+                const xi: i32 = @intCast(x);
+                const zi: i32 = @intCast(z);
+                const h = hm[z * 16 + x];
+                if (h < 0) continue; // empty column
+                const y_top: f32 = @floatFromInt(h + 1);
+                const x0: f32 = base_x + @as(f32, @floatFromInt(x));
+                const x1: f32 = x0 + 1.0;
+                const z0: f32 = base_z + @as(f32, @floatFromInt(z));
+                const z1: f32 = z0 + 1.0;
+                // Top face (upward normal), CCW seen from +Y
+                addQuad(out,
+                    .{ x0, y_top, z0 }, .{ x1, y_top, z0 }, .{ x1, y_top, z1 }, .{ x0, y_top, z1 },
+                    .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 },
+                );
+                // Sides if neighbor lower
+                const h_w = getH(&hm, xi - 1, zi);
+                if (h_w < h) {
+                    const y0: f32 = @floatFromInt(h_w + 1);
+                    addQuad(out,
+                        .{ x0, y0, z1 }, .{ x0, y_top, z1 }, .{ x0, y_top, z0 }, .{ x0, y0, z0 }, // -X face
+                        .{ 0, 0 }, .{ 0, (y_top - y0) }, .{ 1, (y_top - y0) }, .{ 1, 0 },
+                    );
+                }
+                const h_e = getH(&hm, xi + 1, zi);
+                if (h_e < h) {
+                    const y0: f32 = @floatFromInt(h_e + 1);
+                    addQuad(out,
+                        .{ x1, y0, z0 }, .{ x1, y_top, z0 }, .{ x1, y_top, z1 }, .{ x1, y0, z1 }, // +X face
+                        .{ 0, 0 }, .{ 0, (y_top - y0) }, .{ 1, (y_top - y0) }, .{ 1, 0 },
+                    );
+                }
+                const h_n = getH(&hm, xi, zi - 1);
+                if (h_n < h) {
+                    const y0: f32 = @floatFromInt(h_n + 1);
+                    addQuad(out,
+                        .{ x1, y0, z0 }, .{ x1, y_top, z0 }, .{ x0, y_top, z0 }, .{ x0, y0, z0 }, // -Z face
+                        .{ 0, 0 }, .{ 0, (y_top - y0) }, .{ 1, (y_top - y0) }, .{ 1, 0 },
+                    );
+                }
+                const h_s = getH(&hm, xi, zi + 1);
+                if (h_s < h) {
+                    const y0: f32 = @floatFromInt(h_s + 1);
+                    addQuad(out,
+                        .{ x0, y0, z1 }, .{ x0, y_top, z1 }, .{ x1, y_top, z1 }, .{ x1, y0, z1 }, // +Z face
+                        .{ 0, 0 }, .{ 0, (y_top - y0) }, .{ 1, (y_top - y0) }, .{ 1, 0 },
+                    );
+                }
             }
         }
-        _ = ch; // currently unused heightmap
-        return n;
+        return out.items.len - verts_before;
     }
 
     pub fn frame(self: *Client) void {
+        // Keep camera mirrored to player each frame for now
+        self.updateCameraFromPlayer();
+
         sg.beginPass(.{ .action = self.pass_action, .swapchain = sglue.swapchain() });
 
-        // draw minimal top-surface for chunk (0,0)
-        // Reserve space for 16*16*6 main verts
-        var verts: [16 * 16 * 6]Vertex = undefined;
-        // aspect-correction uniforms
+        // Build chunk surface mesh into a dynamic list
+        var vert_list = std.ArrayList(Vertex).initCapacity(self.allocator, 0) catch return;
+        defer vert_list.deinit(self.allocator);
+        _ = self.buildChunkSurfaceMesh(&vert_list);
+
+        // Prepare MVP
         const w_px: f32 = @floatFromInt(sapp.width());
         const h_px: f32 = @floatFromInt(sapp.height());
-        const aspect: f32 = h_px / w_px; // scale x by h/w to keep squares square
-        var vs_params: shd_mod.VsParams = .{ .aspect = .{ aspect, 1.0 } };
+        const aspect_wh: f32 = if (h_px > 0) (w_px / h_px) else 1.0;
+        const proj = makePerspective(60.0 * std.math.pi / 180.0, aspect_wh, 0.1, 1000.0);
+        const view = makeView(self.camera.pos, self.camera.dir, .{ 0, 1, 0 });
+        const mvp = matMul(proj, view);
+        var vs_params: shd_mod.VsParams = .{ .mvp = mvp };
 
-        // Build main top-surface verts
-        const vcount = self.buildTopSurfaceVerts(verts[0..]);
-
-        if (vcount > 0 and self.grass_img.id != 0) {
+        if (vert_list.items.len > 0 and self.grass_img.id != 0) {
             sg.applyPipeline(self.pip);
             sg.applyBindings(self.bind);
             sg.applyUniforms(0, sg.asRange(&vs_params));
 
-            // Single buffer update per frame containing main surface
-            sg.updateBuffer(self.vbuf, sg.asRange(verts[0..vcount]));
+            // Ensure vertex buffer capacity
+            const needed_bytes: usize = vert_list.items.len * @sizeOf(Vertex);
+            if (self.vbuf_capacity_bytes < needed_bytes) {
+                if (self.vbuf.id != 0) sg.destroyBuffer(self.vbuf);
+                self.vbuf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true, .stream_update = true }, .size = @intCast(needed_bytes) });
+                self.vbuf_capacity_bytes = needed_bytes;
+                self.bind.vertex_buffers[0] = self.vbuf;
+            }
 
-            // Draw main surface
-            sg.draw(0, @intCast(vcount), 1);
+            // Upload and draw
+            sg.updateBuffer(self.vbuf, sg.asRange(vert_list.items));
+            sg.draw(0, @intCast(vert_list.items.len), 1);
         }
 
         if (self.show_debug) {
@@ -249,5 +358,86 @@ pub const Client = struct {
             self.last_seen_tick = snap.tick;
         }
         return &self.latest_snapshot;
+    }
+
+    // Update camera to mirror the player's entity position and yaw/pitch
+    fn updateCameraFromPlayer(self: *Client) void {
+        // Use simulation's connections mutex to safely inspect player->entity mapping
+        self.sim.connections_mutex.lock();
+        defer self.sim.connections_mutex.unlock();
+
+        const idx_opt = self.sim.entity_by_player.get(self.player_id);
+        if (idx_opt) |idx| {
+            if (idx < self.sim.dynamic_entities.items.len) {
+                const e = self.sim.dynamic_entities.items[idx];
+                self.camera.pos = e.pos;
+                self.camera.setYawPitch(e.yaw_pitch_roll[0], e.yaw_pitch_roll[1]);
+                self.camera.roll = e.yaw_pitch_roll[2];
+            }
+        }
+    }
+
+    // Basic 4x4 column-major matrix helpers
+    fn matMul(a: [16]f32, b: [16]f32) [16]f32 {
+        var r: [16]f32 = undefined;
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
+            var j: usize = 0;
+            while (j < 4) : (j += 1) {
+                // column-major: r[col*4+row]
+                r[i * 4 + j] =
+                    a[0 * 4 + j] * b[i * 4 + 0] +
+                    a[1 * 4 + j] * b[i * 4 + 1] +
+                    a[2 * 4 + j] * b[i * 4 + 2] +
+                    a[3 * 4 + j] * b[i * 4 + 3];
+            }
+        }
+        return r;
+    }
+
+    fn makePerspective(fovy_radians: f32, aspect: f32, znear: f32, zfar: f32) [16]f32 {
+        const f: f32 = 1.0 / @tan(fovy_radians / 2.0);
+        var m: [16]f32 = [_]f32{0} ** 16;
+        m[0] = f / aspect;
+        m[5] = f;
+        m[10] = (zfar + znear) / (znear - zfar);
+        m[11] = -1.0;
+        m[14] = (2.0 * zfar * znear) / (znear - zfar);
+        return m;
+    }
+
+    fn makeView(eye: [3]f32, forward: [3]f32, up_in: [3]f32) [16]f32 {
+        const f0 = forward[0];
+        const f1 = forward[1];
+        const f2 = forward[2];
+        // normalize f
+        const flen: f32 = @sqrt(f0 * f0 + f1 * f1 + f2 * f2);
+        const fx = f0 / flen;
+        const fy = f1 / flen;
+        const fz = f2 / flen;
+        // s = normalize(cross(f, up))
+        const sx0 = fy * up_in[2] - fz * up_in[1];
+        const sy0 = fz * up_in[0] - fx * up_in[2];
+        const sz0 = fx * up_in[1] - fy * up_in[0];
+        const slen: f32 = @sqrt(sx0 * sx0 + sy0 * sy0 + sz0 * sz0);
+        const sx = sx0 / slen;
+        const sy = sy0 / slen;
+        const sz = sz0 / slen;
+        // u = cross(s, f)
+        const ux = sy * fz - sz * fy;
+        const uy = sz * fx - sx * fz;
+        const uz = sx * fy - sy * fx;
+        var m: [16]f32 = undefined;
+        m[0] = sx; m[4] = ux; m[8]  = -fx; m[12] = 0;
+        m[1] = sy; m[5] = uy; m[9]  = -fy; m[13] = 0;
+        m[2] = sz; m[6] = uz; m[10] = -fz; m[14] = 0;
+        m[3] = 0;  m[7] = 0;  m[11] = 0;   m[15] = 1;
+        // translation
+        var t: [16]f32 = [_]f32{0} ** 16;
+        t[0] = 1; t[5] = 1; t[10] = 1; t[15] = 1;
+        t[12] = -eye[0];
+        t[13] = -eye[1];
+        t[14] = -eye[2];
+        return matMul(m, t);
     }
 };
