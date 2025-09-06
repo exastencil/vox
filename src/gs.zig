@@ -53,6 +53,8 @@ pub const EntityRecord = struct {
     pos: [3]f32,
     vel: [3]f32,
     yaw_pitch_roll: [3]f32,
+    // The direction this entity is looking (normalized). Used to drive camera and movement.
+    look_dir: [3]f32 = .{ 1, 0, 0 },
     aabb_half_extents: [3]f32,
     flags: EntityFlags = .{},
     // attributes or component data can be referenced/serialized separately

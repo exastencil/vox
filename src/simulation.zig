@@ -415,7 +415,65 @@ pub const Simulation = struct {
         _ = self;
     }
     fn phasePhysics(self: *Simulation) void {
-        _ = self;
+        // Simple physics: gravity and vertical collision against world surface.
+        const dt: f32 = @floatCast(1.0 / self.target_tps);
+        const g: f32 = 9.80665; // m/s^2 downward
+        const world_key = "vox:overworld"; // single-world prototype
+
+        // Helper to sample top surface (y of top face) from loaded chunks
+        const getTopFaceY = struct {
+            fn call(sim: *Simulation, x: f32, z: f32) ?f32 {
+                const xi: i32 = @intFromFloat(@floor(x));
+                const zi: i32 = @intFromFloat(@floor(z));
+                const cx: i32 = @divTrunc(xi, @as(i32, @intCast(constants.chunk_size_x)));
+                const cz: i32 = @divTrunc(zi, @as(i32, @intCast(constants.chunk_size_z)));
+                const lx: i32 = @mod(xi, @as(i32, @intCast(constants.chunk_size_x)));
+                const lz: i32 = @mod(zi, @as(i32, @intCast(constants.chunk_size_z)));
+
+                sim.worlds_mutex.lock();
+                defer sim.worlds_mutex.unlock();
+                const ws = sim.worlds_state.getPtr(world_key) orelse return null;
+                const rp = RegionPos{ .x = @divTrunc(cx, 32), .z = @divTrunc(cz, 32) };
+                const rs = ws.regions.getPtr(rp) orelse return null;
+                const idx_opt = rs.chunk_index.get(.{ .x = cx, .z = cz });
+                if (idx_opt == null) return null;
+                const ch = rs.chunks.items[idx_opt.?];
+                const lx_u: usize = @intCast(lx);
+                const lz_u: usize = @intCast(lz);
+                if (lx_u >= 16 or lz_u >= 16) return null;
+                const h = ch.heightmaps.world_surface[lz_u * 16 + lx_u];
+                if (h < 0) return null;
+                return @as(f32, @floatFromInt(h + 1));
+            }
+        }.call;
+
+        var i: usize = 0;
+        while (i < self.dynamic_entities.items.len) : (i += 1) {
+            var e = &self.dynamic_entities.items[i];
+            // Apply gravity
+            e.vel[1] -= g * dt;
+
+            // Integrate intended motion
+            var next_pos = e.pos;
+            next_pos[0] += e.vel[0] * dt;
+            next_pos[1] += e.vel[1] * dt;
+            next_pos[2] += e.vel[2] * dt;
+
+            // Vertical collision against ground top from heightmap
+            const half_h = e.aabb_half_extents[1];
+            if (getTopFaceY(self, next_pos[0], next_pos[2])) |top_y| {
+                const bottom_next = next_pos[1] - half_h;
+                if (bottom_next < top_y) {
+                    next_pos[1] = top_y + half_h;
+                    e.vel[1] = 0;
+                    e.flags.on_ground = true;
+                } else {
+                    e.flags.on_ground = false;
+                }
+            }
+
+            e.pos = next_pos;
+        }
     }
     fn phaseAI(self: *Simulation) void {
         _ = self;
@@ -488,7 +546,9 @@ pub const Simulation = struct {
             .pos = .{ center_x, center_y, center_z },
             .vel = .{ 0, 0, 0 },
             .yaw_pitch_roll = .{ 0, 0, 0 },
-            .aabb_half_extents = .{ 0.5, half_height, 0.5 },
+            .look_dir = .{ 1, 0, 0 },
+            // Collider: 0.75w x 1.75h x 0.4l (half-extents 0.375, 0.875, 0.2)
+            .aabb_half_extents = .{ 0.375, 0.875, 0.2 },
             .flags = .{},
         };
         try self.dynamic_entities.append(self.allocator, rec);

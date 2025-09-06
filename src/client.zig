@@ -31,6 +31,22 @@ const Camera = struct {
         self.pitch = pitch;
         self.dir = computeDir(yaw, pitch);
     }
+
+    fn setDir(self: *Camera, dir_in: [3]f32) void {
+        // normalize and update yaw/pitch to match
+        const dx = dir_in[0];
+        const dy = dir_in[1];
+        const dz = dir_in[2];
+        const len: f32 = @sqrt(dx*dx + dy*dy + dz*dz);
+        if (len > 0.000001) {
+            const nx = dx / len;
+            const ny = dy / len;
+            const nz = dz / len;
+            self.dir = .{ nx, ny, nz };
+            self.pitch = std.math.asin(std.math.clamp(ny, -1.0, 1.0));
+            self.yaw = std.math.atan2(nz, nx);
+        }
+    }
 };
 
 const Vertex = struct { pos: [3]f32, uv: [2]f32 };
@@ -75,6 +91,13 @@ pub const Client = struct {
     // Camera mirrored from player entity
     camera: Camera = .{},
 
+    // Input state
+    move_forward: bool = false,
+    move_back: bool = false,
+    move_left: bool = false,
+    move_right: bool = false,
+    jump_pressed: bool = false, // edge-triggered
+
     // Snapshot monitoring
     latest_snapshot: simulation.Snapshot = .{
         .tick = 0,
@@ -92,6 +115,16 @@ pub const Client = struct {
     pub fn init(allocator: std.mem.Allocator, sim: *simulation.Simulation, player_id: player.PlayerId, account_name: []const u8) !Client {
         const acc = try allocator.dupe(u8, account_name);
         return .{ .allocator = allocator, .sim = sim, .player_id = player_id, .account_name = acc };
+    }
+
+    // Enable/disable raw mouse input if supported by the sokol app wrapper
+    fn setRawMouse(on: bool) void {
+        if (@hasDecl(sapp, "rawMouseSupported") and @hasDecl(sapp, "enableRawMouse")) {
+            if (sapp.rawMouseSupported()) {
+                sapp.enableRawMouse(on);
+            }
+        } else {
+        }
     }
 
     pub fn deinit(self: *Client) void {
@@ -177,6 +210,9 @@ pub const Client = struct {
 
         // Initialize camera from player entity if available
         self.updateCameraFromPlayer();
+        // Lock and enable raw mouse input on startup
+        sapp.lockMouse(true);
+        setRawMouse(true);
     }
 
     fn buildChunkSurfaceMesh(self: *Client, out: *std.ArrayList(Vertex)) usize {
@@ -189,12 +225,13 @@ pub const Client = struct {
         // Helpers to append a quad (two triangles) with CCW winding
         const addQuad = struct {
             fn call(list: *std.ArrayList(Vertex), v0: [3]f32, v1: [3]f32, v2: [3]f32, v3: [3]f32, uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32) void {
+                // Emit triangles with flipped winding so CCW remains front-facing under the chosen view handedness
                 list.appendAssumeCapacity(.{ .pos = v0, .uv = uv0 });
+                list.appendAssumeCapacity(.{ .pos = v2, .uv = uv2 });
                 list.appendAssumeCapacity(.{ .pos = v1, .uv = uv1 });
-                list.appendAssumeCapacity(.{ .pos = v2, .uv = uv2 });
                 list.appendAssumeCapacity(.{ .pos = v0, .uv = uv0 });
-                list.appendAssumeCapacity(.{ .pos = v2, .uv = uv2 });
                 list.appendAssumeCapacity(.{ .pos = v3, .uv = uv3 });
+                list.appendAssumeCapacity(.{ .pos = v2, .uv = uv2 });
             }
         }.call;
 
@@ -320,6 +357,9 @@ pub const Client = struct {
 
         sg.beginPass(.{ .action = self.pass_action, .swapchain = sglue.swapchain() });
 
+        // Apply movement inputs to player entity (client-side write into sim)
+        self.applyMovementInputs();
+
         // Build chunk surface mesh into a dynamic list
         var vert_list = std.ArrayList(Vertex).initCapacity(self.allocator, 0) catch return;
         defer vert_list.deinit(self.allocator);
@@ -373,6 +413,37 @@ pub const Client = struct {
             sdtx.color3b(255, 255, 255);
             sdtx.puts(text);
 
+            // Left-side debug: player's position and look vector
+            // Gather current player entity safely
+            self.sim.connections_mutex.lock();
+            var pos: [3]f32 = .{ 0, 0, 0 };
+            var look: [3]f32 = .{ 0, 0, 0 };
+            const idx_opt_dbg = self.sim.entity_by_player.get(self.player_id);
+            if (idx_opt_dbg) |idx_dbg| {
+                if (idx_dbg < self.sim.dynamic_entities.items.len) {
+                    const e_dbg = self.sim.dynamic_entities.items[idx_dbg];
+                    pos = e_dbg.pos;
+                    look = e_dbg.look_dir;
+                }
+            }
+            self.sim.connections_mutex.unlock();
+
+            var pbuf: [96:0]u8 = undefined;
+            const ptxt_slice = std.fmt.bufPrint(pbuf[0 .. pbuf.len - 1], "pos: {d:.2} {d:.2} {d:.2}", .{ pos[0], pos[1], pos[2] }) catch "pos:?";
+            pbuf[ptxt_slice.len] = 0;
+            const ptxt: [:0]const u8 = pbuf[0..ptxt_slice.len :0];
+            sdtx.pos(1.0, 1.0);
+            sdtx.color3b(255, 255, 255);
+            sdtx.puts(ptxt);
+
+            var lbuf: [96:0]u8 = undefined;
+            const ltxt_slice = std.fmt.bufPrint(lbuf[0 .. lbuf.len - 1], "look: {d:.2} {d:.2} {d:.2}", .{ look[0], look[1], look[2] }) catch "look:?";
+            lbuf[ltxt_slice.len] = 0;
+            const ltxt: [:0]const u8 = lbuf[0..ltxt_slice.len :0];
+            sdtx.pos(1.0, 2.0);
+            sdtx.color3b(255, 255, 255);
+            sdtx.puts(ltxt);
+
             sdtx.draw();
         }
 
@@ -384,35 +455,69 @@ pub const Client = struct {
         switch (ev.type) {
             .KEY_UP => {
                 if (ev.key_code == .F3) self.show_debug = !self.show_debug;
-            },
-            .MOUSE_DOWN => {
-                if (ev.mouse_button == .LEFT) {
-                    sapp.lockMouse(true);
+                if (ev.key_code == .ESCAPE) {
+                    // Release mouse when ESC is pressed
+                    sapp.lockMouse(false);
+                    setRawMouse(false);
+                    self.clearMovementInputs();
+                }
+                switch (ev.key_code) {
+                    .W => self.move_forward = false,
+                    .S => self.move_back = false,
+                    .A => self.move_left = false,
+                    .D => self.move_right = false,
+                    else => {},
                 }
             },
-            .MOUSE_UP => {
-                if (ev.mouse_button == .LEFT) {
-                    sapp.lockMouse(false);
+            .FOCUSED => {
+                // Lock the mouse when the window gains focus
+                sapp.lockMouse(true);
+                // Enable raw mouse input if supported
+                setRawMouse(true);
+            },
+            .UNFOCUSED => {
+                // Release the mouse when the window loses focus
+                sapp.lockMouse(false);
+                setRawMouse(false);
+                self.clearMovementInputs();
+            },
+.KEY_DOWN => {
+                switch (ev.key_code) {
+                    .W => self.move_forward = true,
+                    .S => self.move_back = true,
+                    .A => self.move_left = true,
+                    .D => self.move_right = true,
+                    .SPACE => self.jump_pressed = true,
+                    else => {},
+                }
+            },
+            .MOUSE_DOWN => {
+                // If the mouse is unlocked (e.g., after ESC), clicking the window should re-lock it
+                if (!sapp.mouseLocked()) {
+                    sapp.lockMouse(true);
+                    setRawMouse(true);
                 }
             },
             .MOUSE_MOVE => {
                 if (sapp.mouseLocked()) {
                     const sens: f32 = 0.002; // radians per pixel
                     const dx = ev.mouse_dx * sens;
-                    // Only pan left/right: update yaw, leave pitch unchanged
                     self.sim.connections_mutex.lock();
                     const idx_opt = self.sim.entity_by_player.get(self.player_id);
                     if (idx_opt) |idx| {
                         if (idx < self.sim.dynamic_entities.items.len) {
                             var e = &self.sim.dynamic_entities.items[idx];
-                            // Invert sign so dragging right turns right
-                            var yaw = e.yaw_pitch_roll[0] - dx;
-                            // wrap yaw to [-pi, pi]
+                            // rotate look_dir around Y by -dx so right-drag turns right (preferred feel)
+                            const cur_yaw: f32 = std.math.atan2(e.look_dir[2], e.look_dir[0]);
                             const two_pi: f32 = 6.283185307179586;
+                            var yaw = cur_yaw - dx;
                             if (yaw > std.math.pi) yaw -= two_pi;
                             if (yaw < -std.math.pi) yaw += two_pi;
-                            e.yaw_pitch_roll[0] = yaw;
-                            // e.yaw_pitch_roll[1] unchanged (no pitch)
+                            const cy = @cos(yaw);
+                            const sy = @sin(yaw);
+                            e.look_dir[0] = cy;
+                            e.look_dir[2] = sy;
+                            // preserve vertical component (no pitch changes via mouse for now)
                         }
                     }
                     self.sim.connections_mutex.unlock();
@@ -450,10 +555,84 @@ pub const Client = struct {
             if (idx < self.sim.dynamic_entities.items.len) {
                 const e = self.sim.dynamic_entities.items[idx];
                 self.camera.pos = e.pos;
-                self.camera.setYawPitch(e.yaw_pitch_roll[0], e.yaw_pitch_roll[1]);
+                self.camera.setDir(e.look_dir);
                 self.camera.roll = e.yaw_pitch_roll[2];
             }
         }
+    }
+
+    // Apply currently-pressed movement keys to the player entity
+    fn applyMovementInputs(self: *Client) void {
+        // Compute desired horizontal velocity from inputs relative to yaw
+        self.sim.connections_mutex.lock();
+        defer self.sim.connections_mutex.unlock();
+        const idx_opt = self.sim.entity_by_player.get(self.player_id);
+        if (idx_opt) |idx| {
+            if (idx < self.sim.dynamic_entities.items.len) {
+                var e = &self.sim.dynamic_entities.items[idx];
+                // Derive forward directly from the entity's look vector so movement matches camera
+                var fwd_x: f32 = e.look_dir[0];
+                var fwd_z: f32 = e.look_dir[2];
+                var flen: f32 = @sqrt(fwd_x * fwd_x + fwd_z * fwd_z);
+                if (flen < 0.0001) {
+                    // Fallback to yaw projection if degenerate
+                    const yaw = std.math.atan2(e.look_dir[2], e.look_dir[0]);
+                    fwd_x = @cos(yaw);
+                    fwd_z = @sin(yaw);
+                    flen = @sqrt(fwd_x * fwd_x + fwd_z * fwd_z);
+                }
+                fwd_x /= flen; fwd_z /= flen;
+                const right_x: f32 = fwd_z; // rotate forward 90° CCW for right (corrected)
+                const right_z: f32 = -fwd_x;
+                var vx: f32 = 0;
+                var vz: f32 = 0;
+                if (self.move_forward) { vx += fwd_x; vz += fwd_z; }
+                if (self.move_back)    { vx -= fwd_x; vz -= fwd_z; }
+                if (self.move_right)   { vx += right_x; vz += right_z; }
+                if (self.move_left)    { vx -= right_x; vz -= right_z; }
+                // Normalize if any input
+                const mag: f32 = @sqrt(vx * vx + vz * vz);
+                if (mag > 0.0001) {
+                    vx /= mag; vz /= mag;
+                }
+                const speed: f32 = 4.5; // m/s walking speed
+                e.vel[0] = vx * speed;
+                e.vel[2] = vz * speed;
+                // While moving, align yaw with look vector and zero pitch/roll to stay upright
+                if (self.move_forward or self.move_back or self.move_left or self.move_right) {
+                    const look_yaw: f32 = std.math.atan2(e.look_dir[2], e.look_dir[0]);
+                    e.yaw_pitch_roll = .{ look_yaw, 0, 0 };
+                }
+                // Jump impulse on edge press if on ground
+                if (self.jump_pressed and e.flags.on_ground) {
+                    const g: f32 = 9.80665;
+                    const target_h: f32 = 1.1; // slightly over 1 block
+                    const v0: f32 = @sqrt(2.0 * g * target_h);
+                    e.vel[1] = v0;
+                    e.flags.on_ground = false;
+                }
+            }
+        }
+        // consume jump edge
+        self.jump_pressed = false;
+    }
+
+    fn clearMovementInputs(self: *Client) void {
+        self.move_forward = false;
+        self.move_back = false;
+        self.move_left = false;
+        self.move_right = false;
+        // zero horizontal velocity
+        self.sim.connections_mutex.lock();
+        const idx_opt = self.sim.entity_by_player.get(self.player_id);
+        if (idx_opt) |idx| {
+            if (idx < self.sim.dynamic_entities.items.len) {
+                var e = &self.sim.dynamic_entities.items[idx];
+                e.vel[0] = 0;
+                e.vel[2] = 0;
+            }
+        }
+        self.sim.connections_mutex.unlock();
     }
 
     // Basic 4x4 column-major matrix helpers
@@ -494,18 +673,18 @@ pub const Client = struct {
         const fx = f0 / flen;
         const fy = f1 / flen;
         const fz = f2 / flen;
-        // s = normalize(cross(f, up))
-        const sx0 = fy * up_in[2] - fz * up_in[1];
-        const sy0 = fz * up_in[0] - fx * up_in[2];
-        const sz0 = fx * up_in[1] - fy * up_in[0];
+        // s = normalize(cross(up, f)) to match input/movement handedness
+        const sx0 = up_in[1] * fz - up_in[2] * fy;
+        const sy0 = up_in[2] * fx - up_in[0] * fz;
+        const sz0 = up_in[0] * fy - up_in[1] * fx;
         const slen: f32 = @sqrt(sx0 * sx0 + sy0 * sy0 + sz0 * sz0);
         const sx = sx0 / slen;
         const sy = sy0 / slen;
         const sz = sz0 / slen;
-        // u = cross(s, f)
-        const ux = sy * fz - sz * fy;
-        const uy = sz * fx - sx * fz;
-        const uz = sx * fy - sy * fx;
+        // u = cross(f, s)
+        const ux = fy * sz - fz * sy;
+        const uy = fz * sx - fx * sz;
+        const uz = fx * sy - fy * sx;
         var m: [16]f32 = undefined;
         m[0] = sx;
         m[4] = ux;

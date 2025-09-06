@@ -47,6 +47,8 @@ pub const Registry = struct {
             // if the first block isn't air, that's a programming error for now
             std.debug.assert(std.mem.eql(u8, self.blocks.items[0].name, "core:air"));
         }
+        // Air should never collide
+        self.blocks.items[0].full_block_collision = false;
     }
 
     pub fn addBlock(self: *Registry, name: []const u8) !ids.BlockId {
@@ -55,8 +57,23 @@ pub const Registry = struct {
             if (std.mem.eql(u8, b.name, name)) return @intCast(i);
         }
         const owned = try self.dup(name);
-        try self.blocks.append(self.allocator, .{ .name = owned });
+        try self.blocks.append(self.allocator, .{ .name = owned, .full_block_collision = true });
         return @intCast(self.blocks.items.len - 1);
+    }
+
+    pub fn setBlockFullCollisionById(self: *Registry, id: ids.BlockId, on: bool) void {
+        if (id < self.blocks.items.len) {
+            self.blocks.items[@intCast(id)].full_block_collision = on;
+        }
+    }
+
+    pub fn setBlockFullCollisionByName(self: *Registry, name: []const u8, on: bool) void {
+        for (self.blocks.items, 0..) |b, i| {
+            if (std.mem.eql(u8, b.name, name)) {
+                self.blocks.items[i].full_block_collision = on;
+                return;
+            }
+        }
     }
 
     pub fn addBiome(self: *Registry, name: []const u8) !ids.BiomeId {
