@@ -11,6 +11,7 @@ const registry = @import("registry.zig");
 const ids = @import("ids.zig");
 const simulation = @import("simulation.zig");
 const player = @import("player.zig");
+const client_mod = @import("client.zig");
 const builtin = @import("builtin");
 const mc = @import("assets/mc_textures_1_18.zig");
 
@@ -18,8 +19,9 @@ const State = struct {
     pass_action: sg.PassAction = .{},
     sim: ?simulation.Simulation = null,
     ui_scale: f32 = 1.0,
-    // optional local test client id
+    // local test client and player id
     local_player_id: ?player.PlayerId = null,
+    client: ?client_mod.Client = null,
     // debug overlay toggle
     show_debug: bool = builtin.mode == .Debug,
 };
@@ -157,10 +159,12 @@ export fn init() void {
     // start simulation thread (decoupled from rendering)
     state.sim.?.start() catch return;
 
-    // TEMP: instantiate a local test client and connect to the SIM
+    // Create a local client and connect it to the simulation
     const pid = player.genUuidV4();
     state.local_player_id = pid;
-    state.sim.?.connectPlayer(pid, "Exa Stencil") catch return;
+    var cl = client_mod.Client.init(allocator, &state.sim.?, pid, "Exa Stencil") catch return;
+    cl.connect() catch return;
+    state.client = cl;
 }
 
 export fn frame() void {
@@ -179,8 +183,8 @@ export fn frame() void {
         // ensure C64 font in case other code changes it later
         sdtx.font(4);
 
-        if (state.sim) |s| {
-            const snap = s.getSnapshot();
+        if (state.client) |*cl| {
+            const snap = cl.pollSnapshot().*;
             var buf: [96:0]u8 = undefined;
             const text_slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "tick: {d}  tps: {d:.2}  players: {d}", .{ snap.tick, snap.rolling_tps, snap.player_count }) catch "tick: ?";
             buf[text_slice.len] = 0; // ensure 0-terminated for sdtx
@@ -206,6 +210,11 @@ export fn cleanup() void {
         s.stop();
         s.deinit();
         state.sim = null;
+    }
+    // deinit client
+    if (state.client) |*c| {
+        c.deinit();
+        state.client = null;
     }
 
     // shutdown debug text first
