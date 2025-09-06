@@ -30,8 +30,25 @@ pub fn build(b: *Build) !void {
 
     // If sokol-shdc is available, generate the Zig shader from GLSL
     if (use_shdc) {
-        const shdc = b.addSystemCommand(&.{
-            "sokol-shdc",
+        // Use sokol-tools-bin package to get a deterministic sokol-shdc binary
+        const dep_tools = b.dependency("sokol-tools-bin", .{});
+        const builtin = @import("builtin");
+        const os_tag = builtin.target.os.tag;
+        const arch_tag = builtin.target.cpu.arch;
+        // Map host OS/arch to sokol-tools-bin subdir
+        const tool_rel_path: []const u8 = switch (os_tag) {
+            .macos => switch (arch_tag) {
+                .aarch64 => "bin/osx_arm64/sokol-shdc", // try arm64 first
+                else => "bin/osx/sokol-shdc",
+            },
+            .linux => "bin/linux/sokol-shdc",
+            .windows => "bin/win64/sokol-shdc.exe",
+            else => "bin/linux/sokol-shdc", // default fallback
+        };
+        const shdc_path = dep_tools.path(tool_rel_path);
+        const shdc = b.addSystemCommand(&.{});
+        shdc.addArg(shdc_path.getPath(b));
+        shdc.addArgs(&.{
             "--input", b.path("shaders/chunk.glsl").getPath(b),
             "--output", b.path("src/shaders/chunk_shd.zig").getPath(b),
             "--slang=glsl330:glsl100:hlsl5:metal_macos:metal_ios:wgsl",
