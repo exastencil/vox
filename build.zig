@@ -43,4 +43,14 @@ pub fn build(b: *Build) !void {
         }),
     });
     test_step.dependOn(&tests_reg.step);
+
+    // Resource registry tests
+    const tests_res = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/registry/resource.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&tests_res.step);
 }

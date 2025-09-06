@@ -4,6 +4,7 @@ pub const Block = @import("registry/block.zig");
 pub const Biome = @import("registry/biome.zig");
 pub const World = @import("registry/world.zig");
 pub const WorldGen = @import("registry/worldgen.zig");
+pub const Resource = @import("registry/resource.zig");
 
 pub const Registry = struct {
     allocator: std.mem.Allocator,
@@ -11,6 +12,7 @@ pub const Registry = struct {
     biomes: std.ArrayList(Biome.Def),
     worlds: World.Registry,
     worldgen: WorldGen.Registry,
+    resources: Resource.Registry,
 
     pub fn init(allocator: std.mem.Allocator) !Registry {
         return .{
@@ -19,6 +21,7 @@ pub const Registry = struct {
             .biomes = try std.ArrayList(Biome.Def).initCapacity(allocator, 4),
             .worlds = World.Registry.init(allocator),
             .worldgen = WorldGen.Registry.init(allocator),
+            .resources = Resource.Registry.init(allocator),
         };
     }
 
@@ -30,6 +33,7 @@ pub const Registry = struct {
         self.biomes.deinit(self.allocator);
         self.worlds.deinit();
         self.worldgen.deinit();
+        self.resources.deinit();
     }
 
     fn dup(self: *Registry, s: []const u8) ![]const u8 {
