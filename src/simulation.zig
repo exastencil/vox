@@ -5,6 +5,7 @@ const registry = @import("registry.zig");
 const worldgen = @import("worldgen.zig");
 const constants = @import("constants.zig");
 const player = @import("player.zig");
+const wreg = @import("world_registry.zig");
 
 pub const StorageMode = union(enum) {
     memory,
@@ -15,7 +16,8 @@ pub const SimulationOptions = struct {
     allocator: std.mem.Allocator,
     registries: *registry.Registry,
     mode: StorageMode,
-    section_count_y: u16,
+    section_count_y: u16 = 0, // if 0, use world registry default
+    world_key: []const u8 = "vox:overworld",
 };
 
 pub const Snapshot = struct {
@@ -36,6 +38,9 @@ pub const Simulation = struct {
     mode: StorageMode,
     section_count_y: u16,
     world_seed: u64,
+    // worlds registry and selected world
+    worlds: wreg.WorldRegistry,
+    current_world_key: []const u8,
     // tick counter and thread control
     tick_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -84,8 +89,10 @@ pub const Simulation = struct {
             .allocator = opts.allocator,
             .reg = opts.registries,
             .mode = opts.mode,
-            .section_count_y = opts.section_count_y,
+            .section_count_y = 0, // decide below
             .world_seed = seed,
+            .worlds = wreg.WorldRegistry.init(opts.allocator),
+            .current_world_key = undefined,
             .tick_counter = std.atomic.Value(u64).init(0),
             .running = std.atomic.Value(bool).init(false),
             .thread = null,
@@ -106,6 +113,12 @@ pub const Simulation = struct {
         };
         // initialize snapshot buffers
         sim.publishSnapshot();
+        // register default world def and select current
+        try sim.worlds.addWorld("vox:overworld", "The Overworld", 4);
+        sim.current_world_key = try opts.allocator.dupe(u8, opts.world_key);
+        const world_def = sim.worlds.get(sim.current_world_key) orelse unreachable;
+        sim.section_count_y = if (opts.section_count_y == 0) world_def.section_count_y else opts.section_count_y;
+
         // initialize lists
         sim.dynamic_entities = try std.ArrayList(gs.EntityRecord).initCapacity(opts.allocator, 0);
         sim.chunks = try std.ArrayList(gs.Chunk).initCapacity(opts.allocator, 0);
@@ -126,6 +139,8 @@ pub const Simulation = struct {
         self.entity_by_player.deinit();
         self.players.deinit();
         self.wg_threads.deinit(self.allocator);
+        self.allocator.free(self.current_world_key);
+        self.worlds.deinit();
     }
 
     pub fn tick(self: *Simulation) void {
