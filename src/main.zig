@@ -7,7 +7,7 @@ const sglue = sokol.glue;
 const sdtx = sokol.debugtext;
 
 fn loadOrFallback(allocator: std.mem.Allocator, path: []const u8) sg.Image {
-    const png = @import("assets/png.zig");
+    const png = @import("png.zig");
     const loaded = png.loadFileRGBA8(allocator, path) catch null;
     if (loaded) |img| {
         defer allocator.free(img.pixels);
