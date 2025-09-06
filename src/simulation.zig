@@ -251,6 +251,16 @@ pub const Simulation = struct {
         }
     }
 
+    fn blockLookupCall(ctx: ?*anyopaque, name: []const u8) ?ids.BlockStateId {
+        if (ctx) |p| {
+            const regp: *registry.Registry = @ptrCast(@alignCast(p));
+            for (regp.blocks.items, 0..) |b, i| {
+                if (std.mem.eql(u8, b.name, name)) return @intCast(i);
+            }
+        }
+        return null;
+    }
+
     fn worldgenThreadMain(self_ptr: *Simulation) void {
         const alloc = self_ptr.allocator;
         var desired: std.AutoHashMap(gs.ChunkPos, void) = std.AutoHashMap(gs.ChunkPos, void).init(alloc);
@@ -310,11 +320,12 @@ pub const Simulation = struct {
                 self_ptr.worlds_mutex.unlock();
                 if (!missing) continue;
 
-                // generate void chunk for now
-                const maybe_void = self_ptr.reg.findBiome("core:void");
-                const void_biome_id: ids.BiomeId = maybe_void orelse self_ptr.reg.addBiome("core:void") catch 0;
+                // pick worldgen based on world def
+                const wg_def = self_ptr.reg.worldgen.get(wd.gen_key) orelse continue;
                 const air_id: ids.BlockStateId = 0;
-                const chunk = worldgen.generateVoidChunk(alloc, wd.section_count_y, pos, air_id, void_biome_id) catch continue;
+                const params: registry.WorldGen.Params = .{ .blocks = wd.gen_blocks, .biomes = wd.gen_biomes };
+                const lookup: registry.WorldGen.BlockLookup = .{ .ctx = self_ptr.reg, .call = blockLookupCall };
+                const chunk = worldgen.generateChunk(alloc, wd.section_count_y, pos, self_ptr.world_seed, wg_def.select_biome, wg_def.select_block, params, lookup, air_id) catch continue;
 
                 // fold into simulation
                 self_ptr.worlds_mutex.lock();

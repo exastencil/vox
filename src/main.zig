@@ -45,8 +45,18 @@ export fn init() void {
         r.deinit();
         return;
     };
-    // register default world in registry (mods will do this later)
-    r.worlds.addWorld("vox:overworld", "The Overworld", 4) catch {
+    // ensure common biomes/blocks used by builtin gens
+    _ = r.addBiome("core:plains") catch {};
+    _ = r.addBlock("core:stone") catch {};
+    const grass_id = r.addBlock("vox:grass") catch 0;
+    const dirt_id = r.addBlock("vox:dirt") catch 0;
+
+    // register default world with superflat worldgen
+    r.worlds.addWorldWithGen("vox:overworld", "The Overworld", 4, .{
+        .key = "core:superflat",
+        .blocks = &[_]ids.BlockStateId{ grass_id, dirt_id },
+        .biomes = &[_]ids.BiomeId{0}, // default to biome 0
+    }) catch {
         r.deinit();
         return;
     };
