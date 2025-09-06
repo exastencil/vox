@@ -341,6 +341,46 @@ pub const Client = struct {
             .KEY_UP => {
                 if (ev.key_code == .F3) self.show_debug = !self.show_debug;
             },
+            .MOUSE_DOWN => {
+                if (ev.mouse_button == .LEFT) {
+                    sapp.lockMouse(true);
+                }
+            },
+            .MOUSE_UP => {
+                if (ev.mouse_button == .LEFT) {
+                    sapp.lockMouse(false);
+                }
+            },
+            .MOUSE_MOVE => {
+                if (sapp.mouseLocked()) {
+                    const sens: f32 = 0.002; // radians per pixel
+                    const dx = ev.mouse_dx * sens;
+                    const dy = ev.mouse_dy * sens;
+                    // update player's yaw/pitch directly in simulation
+                    self.sim.connections_mutex.lock();
+                    const idx_opt = self.sim.entity_by_player.get(self.player_id);
+                    if (idx_opt) |idx| {
+                        if (idx < self.sim.dynamic_entities.items.len) {
+                            var e = &self.sim.dynamic_entities.items[idx];
+                            var yaw = e.yaw_pitch_roll[0] + dx;
+                            var pitch = e.yaw_pitch_roll[1] - dy; // invert so moving mouse up looks up
+                            // wrap yaw to [-pi, pi]
+                            const two_pi: f32 = 6.283185307179586f32;
+                            if (yaw > std.math.pi) yaw -= two_pi;
+                            if (yaw < -std.math.pi) yaw += two_pi;
+                            // clamp pitch to ~+-89 degrees
+                            const max_pitch: f32 = 1.5533430342749532; // 89 deg in radians
+                            if (pitch > max_pitch) pitch = max_pitch;
+                            if (pitch < -max_pitch) pitch = -max_pitch;
+                            e.yaw_pitch_roll[0] = yaw;
+                            e.yaw_pitch_roll[1] = pitch;
+                        }
+                    }
+                    self.sim.connections_mutex.unlock();
+                    // keep camera in sync immediately
+                    self.updateCameraFromPlayer();
+                }
+            },
             else => {},
         }
     }
