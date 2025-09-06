@@ -2,14 +2,19 @@ const std = @import("std");
 const gs = @import("../gs.zig");
 const ids = @import("../ids.zig");
 
-pub const SelectBiomeFn = *const fn (seed: u64, pos: gs.BlockPos) []const u8;
+pub const Params = struct {
+    blocks: []const ids.BlockStateId = &[_]ids.BlockStateId{},
+    biomes: []const ids.BiomeId = &[_]ids.BiomeId{},
+};
+
+pub const SelectBiomeFn = *const fn (seed: u64, pos: gs.BlockPos, params: Params) ids.BiomeId;
 
 pub const BlockLookup = struct {
     ctx: ?*anyopaque,
     call: *const fn (ctx: ?*anyopaque, name: []const u8) ?ids.BlockStateId,
 };
 
-pub const SelectBlockFn = *const fn (seed: u64, biome_key: []const u8, pos: gs.BlockPos, lookup: BlockLookup) ids.BlockStateId;
+pub const SelectBlockFn = *const fn (seed: u64, biome: ids.BiomeId, pos: gs.BlockPos, params: Params, lookup: BlockLookup) ids.BlockStateId;
 
 pub const Def = struct {
     key: []const u8,
@@ -49,31 +54,34 @@ pub const Registry = struct {
 };
 
 // Built-in selectors
-pub fn selectVoid(seed: u64, pos: gs.BlockPos) []const u8 {
+pub fn selectVoid(seed: u64, pos: gs.BlockPos, params: Params) ids.BiomeId {
     _ = seed;
     _ = pos;
-    return "core:void";
+    if (params.biomes.len > 0) return params.biomes[0];
+    return 0;
 }
 
-pub fn selectSuperflat(seed: u64, pos: gs.BlockPos) []const u8 {
+pub fn selectSuperflat(seed: u64, pos: gs.BlockPos, params: Params) ids.BiomeId {
     _ = seed;
     _ = pos;
-    return "core:plains";
+    if (params.biomes.len > 0) return params.biomes[0];
+    return 0;
 }
 
-pub fn selectBlockVoid(seed: u64, biome_key: []const u8, pos: gs.BlockPos, lookup: BlockLookup) ids.BlockStateId {
+pub fn selectBlockVoid(seed: u64, biome: ids.BiomeId, pos: gs.BlockPos, params: Params, lookup: BlockLookup) ids.BlockStateId {
     _ = seed;
-    _ = biome_key;
+    _ = biome;
     _ = pos;
+    _ = params;
     return lookup.call(lookup.ctx, "core:air") orelse 0;
 }
 
-pub fn selectBlockSuperflat(seed: u64, biome_key: []const u8, pos: gs.BlockPos, lookup: BlockLookup) ids.BlockStateId {
+pub fn selectBlockSuperflat(seed: u64, biome: ids.BiomeId, pos: gs.BlockPos, params: Params, lookup: BlockLookup) ids.BlockStateId {
     _ = seed;
-    _ = biome_key;
-    if (pos.y <= 0) {
-        return lookup.call(lookup.ctx, "core:stone") orelse 0;
-    } else {
-        return lookup.call(lookup.ctx, "core:air") orelse 0;
-    }
+    _ = biome;
+    const surface = if (params.blocks.len >= 1) params.blocks[0] else (lookup.call(lookup.ctx, "core:grass") orelse 0);
+    const depth = if (params.blocks.len >= 2) params.blocks[1] else (lookup.call(lookup.ctx, "core:stone") orelse 0);
+    if (pos.y < 0) return depth;
+    if (pos.y <= 2) return surface;
+    return lookup.call(lookup.ctx, "core:air") orelse 0;
 }
