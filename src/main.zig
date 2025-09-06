@@ -83,27 +83,6 @@ export fn init() void {
         .environment = sglue.environment(),
         .logger = .{ .func = slog.func },
     });
-    // debug text setup with builtin fonts
-    sdtx.setup(.{ .fonts = .{
-        sdtx.fontKc853(),
-        sdtx.fontKc854(),
-        sdtx.fontZ1013(),
-        sdtx.fontCpc(),
-        sdtx.fontC64(),
-        sdtx.fontOric(),
-        .{},
-        .{},
-    } });
-    // Use C64 font by default (index 4 in the array above)
-    sdtx.font(4);
-
-    // UI scale (higher -> larger text). On hi-dpi monitors, 2.0 is a good start.
-    state.ui_scale = 2.0;
-    // Clear to solid black (default is zero-initialized, but set explicitly for clarity)
-    state.pass_action.colors[0] = .{
-        .load_action = .CLEAR,
-        .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 1 },
-    };
 
     // Build textures from embedded Minecraft 1.18 assets (testing-only, not for distribution)
     if (reg) |*rp| {
@@ -164,44 +143,16 @@ export fn init() void {
     state.local_player_id = pid;
     var cl = client_mod.Client.init(allocator, &state.sim.?, pid, "Exa Stencil") catch return;
     cl.connect() catch return;
+    cl.initGfx();
     state.client = cl;
 }
 
 export fn frame() void {
     // rendering only; simulation ticks on its own thread
 
-    sg.beginPass(.{ .action = state.pass_action, .swapchain = sglue.swapchain() });
-
-    if (state.show_debug) {
-        // draw tick counter in upper-right
-        // Scale the virtual canvas to enlarge text: canvas = window_size / ui_scale
-        const scale: f32 = state.ui_scale;
-        const w_px: f32 = @floatFromInt(sapp.width());
-        const h_px: f32 = @floatFromInt(sapp.height());
-        sdtx.canvas(w_px / scale, h_px / scale);
-        sdtx.origin(0, 0);
-        // ensure C64 font in case other code changes it later
-        sdtx.font(4);
-
-        if (state.client) |*cl| {
-            const snap = cl.pollSnapshot().*;
-            var buf: [96:0]u8 = undefined;
-            const text_slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "tick: {d}  tps: {d:.2}  players: {d}", .{ snap.tick, snap.rolling_tps, snap.player_count }) catch "tick: ?";
-            buf[text_slice.len] = 0; // ensure 0-terminated for sdtx
-            const text: [:0]const u8 = buf[0..text_slice.len :0];
-            const cols_f: f32 = (w_px / scale) / 8.0;
-            const text_cols_f: f32 = @floatFromInt(text.len);
-            const col_start_f: f32 = @max(0.0, cols_f - text_cols_f - 1.0);
-            sdtx.pos(col_start_f, 1.0);
-            sdtx.color3b(255, 255, 255);
-            sdtx.puts(text);
-        }
-
-        sdtx.draw();
+    if (state.client) |*cl| {
+        cl.frame();
     }
-
-    sg.endPass();
-    sg.commit();
 }
 
 export fn cleanup() void {
@@ -230,13 +181,8 @@ export fn cleanup() void {
 
 export fn event(e: [*c]const sapp.Event) void {
     const ev: sapp.Event = e.*;
-    switch (ev.type) {
-        .KEY_UP => {
-            if (ev.key_code == .F3) {
-                state.show_debug = !state.show_debug;
-            }
-        },
-        else => {},
+    if (state.client) |*cl| {
+        cl.event(ev);
     }
 }
 
