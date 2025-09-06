@@ -7,6 +7,8 @@ const sapp = sokol.app;
 const sglue = sokol.glue;
 const sdtx = sokol.debugtext;
 
+const Vertex = struct { pos: [2]f32, uv: [2]f32 };
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     sim: *simulation.Simulation,
@@ -18,6 +20,15 @@ pub const Client = struct {
     pass_action: sg.PassAction = .{},
     ui_scale: f32 = 2.0,
     show_debug: bool = true,
+
+    // Minimal chunk renderer state
+    shd: sg.Shader = .{},
+    pip: sg.Pipeline = .{},
+    vbuf: sg.Buffer = .{},
+    bind: sg.Bindings = .{},
+    grass_img: sg.Image = .{},
+    grass_view: sg.View = .{},
+    sampler: sg.Sampler = .{},
 
     // Snapshot monitoring
     latest_snapshot: simulation.Snapshot = .{
@@ -66,10 +77,103 @@ pub const Client = struct {
         self.ui_scale = 2.0;
         self.pass_action.colors[0] = .{ .load_action = .CLEAR, .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 1 } };
         self.show_debug = true;
+
+        // shader (Metal only for now)
+        const vs_src = "#include <metal_stdlib>\nusing namespace metal;\nstruct VSIn { float2 pos [[attribute(0)]]; float2 uv [[attribute(1)]]; };\nstruct VSOut { float4 pos [[position]]; float2 uv; };\nvertex VSOut vs_main(VSIn in [[stage_in]]) { VSOut o; o.pos = float4(in.pos, 0.0, 1.0); o.uv = in.uv; return o; }\n";
+        const fs_src = "#include <metal_stdlib>\nusing namespace metal;\nstruct VSOut { float4 pos [[position]]; float2 uv; };\nfragment float4 fs_main(VSOut in [[stage_in]], texture2d<float> tex0 [[texture(0)]], sampler smp [[sampler(0)]]) {\n    constexpr sampler s(address::repeat, filter::nearest);\n    return tex0.sample(s, in.uv);\n}\n";
+        var sdesc: sg.ShaderDesc = .{};
+        sdesc.label = "chunk-shader";
+        sdesc.vertex_func.source = vs_src;
+        sdesc.vertex_func.entry = "vs_main";
+        sdesc.fragment_func.source = fs_src;
+        sdesc.fragment_func.entry = "fs_main";
+        // reflection for texture/sampler
+        sdesc.views[0].texture.stage = .FRAGMENT;
+        sdesc.views[0].texture.image_type = ._2D;
+        sdesc.views[0].texture.sample_type = .FLOAT;
+        sdesc.views[0].texture.msl_texture_n = 0;
+        sdesc.samplers[0].stage = .FRAGMENT;
+        sdesc.samplers[0].sampler_type = .FILTERING;
+        sdesc.samplers[0].msl_sampler_n = 0;
+        sdesc.texture_sampler_pairs[0].stage = .FRAGMENT;
+        sdesc.texture_sampler_pairs[0].view_slot = 0;
+        sdesc.texture_sampler_pairs[0].sampler_slot = 0;
+        self.shd = sg.makeShader(sdesc);
+
+        var pdesc: sg.PipelineDesc = .{};
+        pdesc.label = "chunk-pipeline";
+        pdesc.shader = self.shd;
+        pdesc.layout.attrs[0].format = .FLOAT2;
+        pdesc.layout.attrs[1].format = .FLOAT2;
+        pdesc.primitive_type = .TRIANGLES;
+        self.pip = sg.makePipeline(pdesc);
+        // dynamic vertex buffer for a single chunk top surface (16*16 quads * 6 verts)
+        const vcount_max: usize = 16 * 16 * 6;
+        self.vbuf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true, .stream_update = true }, .size = @intCast(vcount_max * @sizeOf(Vertex)) });
+        self.bind.vertex_buffers[0] = self.vbuf;
+
+        // pick grass top texture from registry
+        if (self.sim.reg.resources.get("vox:grass")) |res| {
+            switch (res) {
+                .Facing => |f| self.grass_img = f.face_tex,
+                .Uniform => |u| self.grass_img = u.all,
+                .Void => self.grass_img = .{},
+            }
+        }
+        // create a view and sampler for the texture
+        self.grass_view = sg.makeView(.{ .texture = .{ .image = self.grass_img } });
+        self.sampler = sg.makeSampler(.{ .min_filter = .NEAREST, .mag_filter = .NEAREST, .mipmap_filter = .NEAREST, .wrap_u = .REPEAT, .wrap_v = .REPEAT });
+        self.bind.views[0] = self.grass_view;
+        self.bind.samplers[0] = self.sampler;
+    }
+
+    fn buildTopSurfaceVerts(self: *Client, out: []Vertex) usize {
+        // render chunk (0,0) from world "vox:overworld" if present
+        const wk = "vox:overworld";
+        self.sim.worlds_mutex.lock();
+        defer self.sim.worlds_mutex.unlock();
+        const ws = self.sim.worlds_state.getPtr(wk) orelse return 0;
+        const rp = simulation.RegionPos{ .x = 0, .z = 0 };
+        const rs = ws.regions.getPtr(rp) orelse return 0;
+        const idx = rs.chunk_index.get(.{ .x = 0, .z = 0 }) orelse return 0;
+        const ch = rs.chunks.items[idx];
+        // map 16x16 grid to NDC square [-0.8,0.8]
+        const start: f32 = -0.8;
+        const size: f32 = 1.6 / 16.0;
+        var n: usize = 0;
+        for (0..16) |z| {
+            for (0..16) |x| {
+                const x0: f32 = start + @as(f32, @floatFromInt(x)) * size;
+                const y0: f32 = start + @as(f32, @floatFromInt(z)) * size;
+                const x1: f32 = x0 + size;
+                const y1: f32 = y0 + size;
+                // 2 triangles
+                if (n + 6 > out.len) return n;
+                out[n + 0] = .{ .pos = .{ x0, y0 }, .uv = .{ 0, 0 } };
+                out[n + 1] = .{ .pos = .{ x1, y0 }, .uv = .{ 1, 0 } };
+                out[n + 2] = .{ .pos = .{ x1, y1 }, .uv = .{ 1, 1 } };
+                out[n + 3] = .{ .pos = .{ x0, y0 }, .uv = .{ 0, 0 } };
+                out[n + 4] = .{ .pos = .{ x1, y1 }, .uv = .{ 1, 1 } };
+                out[n + 5] = .{ .pos = .{ x0, y1 }, .uv = .{ 0, 1 } };
+                n += 6;
+            }
+        }
+        _ = ch; // currently unused heightmap
+        return n;
     }
 
     pub fn frame(self: *Client) void {
         sg.beginPass(.{ .action = self.pass_action, .swapchain = sglue.swapchain() });
+
+        // draw minimal top-surface for chunk (0,0)
+        var verts: [16 * 16 * 6]Vertex = undefined;
+        const vcount = self.buildTopSurfaceVerts(verts[0..]);
+        if (vcount > 0 and self.grass_img.id != 0) {
+            sg.applyPipeline(self.pip);
+            sg.applyBindings(self.bind);
+            sg.updateBuffer(self.vbuf, sg.asRange(verts[0..vcount]));
+            sg.draw(0, @intCast(vcount), 1);
+        }
 
         if (self.show_debug) {
             const scale: f32 = self.ui_scale;
