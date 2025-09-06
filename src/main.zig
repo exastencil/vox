@@ -42,6 +42,11 @@ export fn init() void {
         r.deinit();
         return;
     };
+    // register default world in registry (mods will do this later)
+    r.worlds.addWorld("vox:overworld", "The Overworld", 4) catch {
+        r.deinit();
+        return;
+    };
     reg = r;
 
     // graphics setup

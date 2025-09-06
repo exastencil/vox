@@ -1,5 +1,6 @@
 const std = @import("std");
 const ids = @import("ids.zig");
+const wreg = @import("world_registry.zig");
 
 pub const BlockDef = struct {
     name: []const u8, // namespace:name
@@ -15,12 +16,14 @@ pub const Registry = struct {
     allocator: std.mem.Allocator,
     blocks: std.ArrayList(BlockDef),
     biomes: std.ArrayList(BiomeDef),
+    worlds: wreg.WorldRegistry,
 
     pub fn init(allocator: std.mem.Allocator) !Registry {
         return .{
             .allocator = allocator,
             .blocks = try std.ArrayList(BlockDef).initCapacity(allocator, 8),
             .biomes = try std.ArrayList(BiomeDef).initCapacity(allocator, 4),
+            .worlds = wreg.WorldRegistry.init(allocator),
         };
     }
 
@@ -30,6 +33,7 @@ pub const Registry = struct {
         for (self.biomes.items) |b| self.allocator.free(b.name);
         self.blocks.deinit(self.allocator);
         self.biomes.deinit(self.allocator);
+        self.worlds.deinit();
     }
 
     fn dup(self: *Registry, s: []const u8) ![]const u8 {

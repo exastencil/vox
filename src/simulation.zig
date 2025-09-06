@@ -16,7 +16,6 @@ pub const SimulationOptions = struct {
     allocator: std.mem.Allocator,
     registries: *registry.Registry,
     mode: StorageMode,
-    section_count_y: u16 = 0, // if 0, use world registry default
     world_key: []const u8 = "vox:overworld",
 };
 
@@ -32,15 +31,29 @@ pub const Snapshot = struct {
     dynamic_entity_count: usize,
 };
 
+pub const RegionPos = struct { x: i32, z: i32 };
+
+pub const RegionState = struct {
+    chunks: std.ArrayList(gs.Chunk),
+    chunk_index: std.AutoHashMap(gs.ChunkPos, usize),
+};
+
+pub const WorldState = struct {
+    key: []const u8,
+    section_count_y: u16,
+    regions: std.AutoHashMap(RegionPos, RegionState),
+};
+
 pub const Simulation = struct {
     allocator: std.mem.Allocator,
     reg: *registry.Registry,
     mode: StorageMode,
     section_count_y: u16,
     world_seed: u64,
-    // worlds registry and selected world
-    worlds: wreg.WorldRegistry,
-    current_world_key: []const u8,
+    // save structure: worlds -> regions -> chunks
+    worlds_mutex: std.Thread.Mutex = .{},
+    player_world: std.AutoHashMap(player.PlayerId, []const u8), // references keys in reg.worlds
+    worlds_state: std.StringHashMap(WorldState),
     // tick counter and thread control
     tick_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -70,11 +83,6 @@ pub const Simulation = struct {
     entity_by_player: std.AutoHashMap(player.PlayerId, usize),
     connections_mutex: std.Thread.Mutex = .{},
 
-    // chunk systems
-    chunks: std.ArrayList(gs.Chunk),
-    chunk_index: std.AutoHashMap(gs.ChunkPos, usize),
-    chunk_mutex: std.Thread.Mutex = .{},
-
     // worldgen config and threads
     worldgen_threads: u32 = 1,
     gen_radius_chunks: i32 = 8,
@@ -89,10 +97,11 @@ pub const Simulation = struct {
             .allocator = opts.allocator,
             .reg = opts.registries,
             .mode = opts.mode,
-            .section_count_y = 0, // decide below
+            .section_count_y = 0,
             .world_seed = seed,
-            .worlds = wreg.WorldRegistry.init(opts.allocator),
-            .current_world_key = undefined,
+            .worlds_mutex = .{},
+            .player_world = std.AutoHashMap(player.PlayerId, []const u8).init(opts.allocator),
+            .worlds_state = std.StringHashMap(WorldState).init(opts.allocator),
             .tick_counter = std.atomic.Value(u64).init(0),
             .running = std.atomic.Value(bool).init(false),
             .thread = null,
@@ -107,40 +116,45 @@ pub const Simulation = struct {
             .next_eid = 1,
             .dynamic_entities = undefined,
             .entity_by_player = std.AutoHashMap(player.PlayerId, usize).init(opts.allocator),
-            .chunks = undefined,
-            .chunk_index = std.AutoHashMap(gs.ChunkPos, usize).init(opts.allocator),
             .wg_threads = undefined,
         };
         // initialize snapshot buffers
         sim.publishSnapshot();
-        // register default world def and select current
-        try sim.worlds.addWorld("vox:overworld", "The Overworld", 4);
-        sim.current_world_key = try opts.allocator.dupe(u8, opts.world_key);
-        const world_def = sim.worlds.get(sim.current_world_key) orelse unreachable;
-        sim.section_count_y = if (opts.section_count_y == 0) world_def.section_count_y else opts.section_count_y;
+        // ensure selected world exists in registry
+        _ = sim.reg.worlds.get(opts.world_key) orelse unreachable;
 
         // initialize lists
         sim.dynamic_entities = try std.ArrayList(gs.EntityRecord).initCapacity(opts.allocator, 0);
-        sim.chunks = try std.ArrayList(gs.Chunk).initCapacity(opts.allocator, 0);
         sim.wg_threads = try std.ArrayList(std.Thread).initCapacity(opts.allocator, 0);
 
         return sim;
     }
 
     pub fn initMemory(allocator: std.mem.Allocator, reg: *registry.Registry, section_count_y: u16) !Simulation {
-        return init(.{ .allocator = allocator, .registries = reg, .mode = .memory, .section_count_y = section_count_y });
+        _ = section_count_y; // section count chosen per-world via registry
+        return init(.{ .allocator = allocator, .registries = reg, .mode = .memory });
     }
 
     pub fn deinit(self: *Simulation) void {
-        for (self.chunks.items) |*c| worldgen.deinitChunk(self.allocator, c);
-        self.chunks.deinit(self.allocator);
-        self.chunk_index.deinit();
+        // free all chunks in save structure
+        var w_it = self.worlds_state.iterator();
+        while (w_it.next()) |entry| {
+            var regions_it = entry.value_ptr.regions.iterator();
+            while (regions_it.next()) |rentry| {
+                var rs = rentry.value_ptr.*;
+                for (rs.chunks.items) |*c| worldgen.deinitChunk(self.allocator, c);
+                rs.chunks.deinit(self.allocator);
+                rs.chunk_index.deinit();
+            }
+            entry.value_ptr.regions.deinit();
+            self.allocator.free(entry.value_ptr.key);
+        }
+        self.worlds_state.deinit();
         self.dynamic_entities.deinit(self.allocator);
         self.entity_by_player.deinit();
+        self.player_world.deinit();
         self.players.deinit();
         self.wg_threads.deinit(self.allocator);
-        self.allocator.free(self.current_world_key);
-        self.worlds.deinit();
     }
 
     pub fn tick(self: *Simulation) void {
@@ -275,30 +289,54 @@ pub const Simulation = struct {
             var it2 = desired.keyIterator();
             while (it2.next()) |pos_ptr| {
                 const pos = pos_ptr.*;
+                // compute the player's world (assume default for now)
+                const world_key = "vox:overworld";
+
+                // get world def for section count
+                const wd = self_ptr.reg.worlds.get(world_key) orelse continue;
+
+                // locate region
+                const rpos = RegionPos{ .x = @divTrunc(pos.x, 32), .z = @divTrunc(pos.z, 32) };
+
                 // check if chunk exists
                 var missing = false;
-                self_ptr.chunk_mutex.lock();
-                missing = (self_ptr.chunk_index.get(pos) == null);
-                self_ptr.chunk_mutex.unlock();
+                self_ptr.worlds_mutex.lock();
+                var ws_ptr = self_ptr.ensureWorldState(world_key) catch null;
+                if (ws_ptr) |ws| {
+                    const rs_ptr = self_ptr.ensureRegionState(ws, rpos) catch null;
+                    if (rs_ptr) |rs| {
+                        missing = (rs.chunk_index.get(pos) == null);
+                    }
+                }
+                self_ptr.worlds_mutex.unlock();
                 if (!missing) continue;
 
                 // generate void chunk for now
                 const maybe_void = self_ptr.reg.findBiome("core:void");
                 const void_biome_id: ids.BiomeId = maybe_void orelse self_ptr.reg.addBiome("core:void") catch 0;
                 const air_id: ids.BlockStateId = 0;
-                const chunk = worldgen.generateVoidChunk(alloc, self_ptr.section_count_y, pos, air_id, void_biome_id) catch continue;
+                const chunk = worldgen.generateVoidChunk(alloc, wd.section_count_y, pos, air_id, void_biome_id) catch continue;
 
                 // fold into simulation
-                self_ptr.chunk_mutex.lock();
-                if (self_ptr.chunk_index.get(pos) == null) {
-                    self_ptr.chunks.append(self_ptr.allocator, chunk) catch unreachable;
-                    const idx = self_ptr.chunks.items.len - 1;
-                    self_ptr.chunk_index.put(pos, idx) catch {};
+                self_ptr.worlds_mutex.lock();
+                ws_ptr = self_ptr.ensureWorldState(world_key) catch null;
+                if (ws_ptr) |ws2| {
+                    const rs2 = self_ptr.ensureRegionState(ws2, rpos) catch null;
+                    if (rs2) |rsok| {
+                        if (rsok.chunk_index.get(pos) == null) {
+                            rsok.chunks.append(self_ptr.allocator, chunk) catch unreachable;
+                            const idx = rsok.chunks.items.len - 1;
+                            _ = rsok.chunk_index.put(pos, idx) catch {};
+                        } else {
+                            worldgen.deinitChunk(alloc, &chunk);
+                        }
+                    } else {
+                        worldgen.deinitChunk(alloc, &chunk);
+                    }
                 } else {
-                    // already added by another thread
                     worldgen.deinitChunk(alloc, &chunk);
                 }
-                self_ptr.chunk_mutex.unlock();
+                self_ptr.worlds_mutex.unlock();
 
                 generated += 1;
                 if (generated >= 4) break; // limit per pass
@@ -317,14 +355,23 @@ pub const Simulation = struct {
             const avg_ns_f: f64 = @as(f64, @floatFromInt(self.window_sum_ns)) / @as(f64, @floatFromInt(self.window_count));
             if (avg_ns_f > 0) rolling_tps_val = 1_000_000_000.0 / avg_ns_f;
         }
+        // compute total chunk_count across all worlds/regions
+        var total_chunks: usize = 0;
+        var w_it = self.worlds_state.iterator();
+        while (w_it.next()) |entry| {
+            var r_it = entry.value_ptr.regions.iterator();
+            while (r_it.next()) |rentry| {
+                total_chunks += rentry.value_ptr.chunks.items.len;
+            }
+        }
         const snap = Snapshot{
             .tick = self.tick_counter.load(.monotonic),
             .actual_tps = self.actual_tps,
             .rolling_tps = rolling_tps_val,
             .dt_sec = self.last_tick_dt_sec,
             .world_seed = self.world_seed,
-            .section_count_y = self.section_count_y,
-            .chunk_count = self.chunks.items.len,
+            .section_count_y = 0,
+            .chunk_count = total_chunks,
             .player_count = self.players.by_id.count(),
             .dynamic_entity_count = self.dynamic_entities.items.len,
         };
@@ -402,6 +449,11 @@ pub const Simulation = struct {
         defer self.connections_mutex.unlock();
         // trust the provided identity for now; display_name := account_name
         try self.players.connectWithId(pid, account_name, account_name);
+        // assign player to default world for now
+        if (self.player_world.get(pid) == null) {
+            const wk = self.reg.worlds.get("vox:overworld") orelse return;
+            _ = self.player_world.put(pid, wk.key) catch {};
+        }
         _ = try self.ensurePlayerEntityLocked(pid);
     }
 
@@ -429,6 +481,29 @@ pub const Simulation = struct {
         self.connections_mutex.lock();
         defer self.connections_mutex.unlock();
         return self.ensurePlayerEntityLocked(pid);
+    }
+
+    fn ensureWorldState(self: *Simulation, world_key: []const u8) !*WorldState {
+        if (self.worlds_state.getPtr(world_key)) |ws| return ws;
+        const wd = self.reg.worlds.get(world_key) orelse return error.WorldNotRegistered;
+        const key_copy = try self.allocator.dupe(u8, world_key);
+        const ws = WorldState{
+            .key = key_copy,
+            .section_count_y = wd.section_count_y,
+            .regions = std.AutoHashMap(RegionPos, RegionState).init(self.allocator),
+        };
+        try self.worlds_state.put(key_copy, ws);
+        return self.worlds_state.getPtr(key_copy).?;
+    }
+
+    fn ensureRegionState(self: *Simulation, ws: *WorldState, rp: RegionPos) !*RegionState {
+        if (ws.regions.getPtr(rp)) |rs| return rs;
+        const rs = RegionState{
+            .chunks = try std.ArrayList(gs.Chunk).initCapacity(self.allocator, 0),
+            .chunk_index = std.AutoHashMap(gs.ChunkPos, usize).init(self.allocator),
+        };
+        try ws.regions.put(rp, rs);
+        return ws.regions.getPtr(rp).?;
     }
 
     pub fn start(self: *Simulation) !void {
