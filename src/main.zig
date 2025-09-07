@@ -150,7 +150,7 @@ export fn init() void {
         var j: usize = 0;
         while (j < m.worldgen.len) : (j += 1) {
             const wg = m.worldgen[j];
-            r.worldgen.add(wg.key, wg.display_name, wg.select_biome, wg.select_block) catch {
+            r.worldgen.add(wg.key, wg.display_name, wg) catch {
                 r.deinit();
                 return;
             };

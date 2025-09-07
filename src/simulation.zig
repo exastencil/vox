@@ -3,6 +3,7 @@ const gs = @import("gs.zig");
 const ids = @import("ids.zig");
 const registry = @import("registry.zig");
 const worldgen = @import("worldgen.zig");
+const wapi = @import("worldgen_api.zig");
 const constants = @import("constants.zig");
 const player = @import("player.zig");
 
@@ -87,6 +88,8 @@ pub const Simulation = struct {
     worldgen_threads: u32 = 1,
     gen_radius_chunks: i32 = 8,
     wg_threads: std.ArrayList(std.Thread),
+    // incremental proto-chunks advancing through staged generation
+    proto_chunks: std.AutoHashMap(gs.ChunkPos, wapi.ProtoChunk),
 
     pub fn init(opts: SimulationOptions) !Simulation {
         var seed_bytes: [8]u8 = undefined;
@@ -117,9 +120,12 @@ pub const Simulation = struct {
             .dynamic_entities = undefined,
             .entity_by_player = std.AutoHashMap(player.PlayerId, usize).init(opts.allocator),
             .wg_threads = undefined,
+            .proto_chunks = undefined,
         };
         // initialize snapshot buffers
         sim.publishSnapshot();
+        // initialize containers
+        sim.proto_chunks = std.AutoHashMap(gs.ChunkPos, wapi.ProtoChunk).init(opts.allocator);
         // ensure selected world exists in registry
         _ = sim.reg.worlds.get(opts.world_key) orelse unreachable;
 
@@ -154,6 +160,13 @@ pub const Simulation = struct {
         self.entity_by_player.deinit();
         self.player_world.deinit();
         self.players.deinit();
+        // free any in-flight proto-chunks
+        var pit = self.proto_chunks.valueIterator();
+        while (pit.next()) |p| {
+            var tmp = p.*;
+            worldgen.protoDeinit(&tmp);
+        }
+        self.proto_chunks.deinit();
         self.wg_threads.deinit(self.allocator);
     }
 
@@ -294,8 +307,8 @@ pub const Simulation = struct {
             }
             self_ptr.connections_mutex.unlock();
 
-            // Generate up to a few missing chunks per pass
-            var generated: u32 = 0;
+            // Generate up to a few proto-chunk phase advances per pass
+            var advanced: u32 = 0;
             var it2 = desired.keyIterator();
             while (it2.next()) |pos_ptr| {
                 const pos = pos_ptr.*;
@@ -308,7 +321,7 @@ pub const Simulation = struct {
                 // locate region
                 const rpos = RegionPos{ .x = @divTrunc(pos.x, 32), .z = @divTrunc(pos.z, 32) };
 
-                // check if chunk exists
+                // check if chunk already finalized
                 var missing = false;
                 self_ptr.worlds_mutex.lock();
                 var ws_ptr = self_ptr.ensureWorldState(world_key) catch null;
@@ -323,34 +336,54 @@ pub const Simulation = struct {
 
                 // pick worldgen based on world def
                 const wg_def = self_ptr.reg.worldgen.get(wd.gen_key) orelse continue;
-                const air_id: ids.BlockStateId = 0;
                 const params: registry.WorldGen.Params = .{ .blocks = wd.gen_blocks, .biomes = wd.gen_biomes };
                 const lookup: registry.WorldGen.BlockLookup = .{ .ctx = self_ptr.reg, .call = blockLookupCall };
-                const chunk = worldgen.generateChunk(alloc, wd.section_count_y, pos, self_ptr.world_seed, wg_def.select_biome, wg_def.select_block, params, lookup, air_id) catch continue;
 
-                // fold into simulation
-                self_ptr.worlds_mutex.lock();
-                ws_ptr = self_ptr.ensureWorldState(world_key) catch null;
-                if (ws_ptr) |ws2| {
-                    const rs2 = self_ptr.ensureRegionState(ws2, rpos) catch null;
-                    if (rs2) |rsok| {
-                        if (rsok.chunk_index.get(pos) == null) {
-                            rsok.chunks.append(self_ptr.allocator, chunk) catch unreachable;
-                            const idx = rsok.chunks.items.len - 1;
-                            _ = rsok.chunk_index.put(pos, idx) catch {};
+                // Ensure proto-chunk exists
+                var proto_ptr = self_ptr.proto_chunks.getPtr(pos);
+                if (proto_ptr == null) {
+                    var proto = worldgen.protoInit(alloc, wd.section_count_y, pos) catch continue;
+                    _ = self_ptr.proto_chunks.put(pos, proto) catch {
+                        worldgen.protoDeinit(&proto);
+                        continue;
+                    };
+                    proto_ptr = self_ptr.proto_chunks.getPtr(pos);
+                }
+                if (proto_ptr == null) continue;
+
+                // Advance exactly one phase for this chunk
+                const result = worldgen.advanceOnePhase(proto_ptr.?, self_ptr.world_seed, wg_def, params, lookup, 0) catch null;
+                if (result) |chunk| {
+                    // fold into simulation and drop proto-chunk
+                    self_ptr.worlds_mutex.lock();
+                    ws_ptr = self_ptr.ensureWorldState(world_key) catch null;
+                    if (ws_ptr) |ws2| {
+                        const rs2 = self_ptr.ensureRegionState(ws2, rpos) catch null;
+                        if (rs2) |rsok| {
+                            if (rsok.chunk_index.get(pos) == null) {
+                                rsok.chunks.append(self_ptr.allocator, chunk) catch unreachable;
+                                const idx = rsok.chunks.items.len - 1;
+                                _ = rsok.chunk_index.put(pos, idx) catch {};
+                            } else {
+                                worldgen.deinitChunk(alloc, &chunk);
+                            }
                         } else {
                             worldgen.deinitChunk(alloc, &chunk);
                         }
                     } else {
                         worldgen.deinitChunk(alloc, &chunk);
                     }
-                } else {
-                    worldgen.deinitChunk(alloc, &chunk);
-                }
-                self_ptr.worlds_mutex.unlock();
+                    self_ptr.worlds_mutex.unlock();
 
-                generated += 1;
-                if (generated >= 4) break; // limit per pass
+                    // remove proto
+                    if (self_ptr.proto_chunks.fetchRemove(pos)) |entry| {
+                        var to_free = entry.value;
+                        worldgen.protoDeinit(&to_free);
+                    }
+                }
+
+                advanced += 1;
+                if (advanced >= 8) break; // small per-pass budget across many chunks
             }
 
             // small sleep to avoid busy-loop
@@ -579,28 +612,25 @@ pub const Simulation = struct {
     }
 
     fn computeSpawnAtColumn(self: *Simulation, wd: registry.World.Def, x: i32, z: i32) gs.BlockPos {
-        // Determine the lowest Y where two consecutive air blocks occur at (x, z)
-        const air_id: ids.BlockStateId = 0;
+        // Generate the containing chunk and read its heightmap for (x,z)
         const wg_def = self.reg.worldgen.get(wd.gen_key) orelse return .{ .x = x, .y = 0, .z = z };
         const params: registry.WorldGen.Params = .{ .blocks = wd.gen_blocks, .biomes = wd.gen_biomes };
         const lookup: registry.WorldGen.BlockLookup = .{ .ctx = self.reg, .call = blockLookupCall };
-        const half_height: i32 = @as(i32, @intCast(wd.section_count_y)) * @as(i32, @intCast(constants.section_height));
-        const y_min: i32 = -half_height;
-        const y_max: i32 = half_height; // exclusive upper bound for scan
-        var y: i32 = y_min;
-        while (y < y_max - 1) : (y += 1) {
-            const pos0 = gs.BlockPos{ .x = x, .y = y, .z = z };
-            const biome0 = wg_def.select_biome(self.world_seed, pos0, params);
-            const b0 = wg_def.select_block(self.world_seed, biome0, pos0, params, lookup);
-            const pos1 = gs.BlockPos{ .x = x, .y = y + 1, .z = z };
-            const biome1 = wg_def.select_biome(self.world_seed, pos1, params);
-            const b1 = wg_def.select_block(self.world_seed, biome1, pos1, params, lookup);
-            if (b0 == air_id and b1 == air_id) {
-                return .{ .x = x, .y = y, .z = z };
-            }
-        }
-        // Fallback if not found in scan range
-        return .{ .x = x, .y = 0, .z = z };
+
+        const cx: i32 = @divTrunc(x, @as(i32, @intCast(constants.chunk_size_x)));
+        const cz: i32 = @divTrunc(z, @as(i32, @intCast(constants.chunk_size_z)));
+        const chunk_pos = gs.ChunkPos{ .x = cx, .z = cz };
+        const ch = worldgen.generateChunk(self.allocator, wd.section_count_y, chunk_pos, self.world_seed, wg_def, params, lookup) catch return .{ .x = x, .y = 0, .z = z };
+        defer worldgen.deinitChunk(self.allocator, &ch);
+        // Local indices within chunk
+        const lx_i: i32 = @mod(x, @as(i32, @intCast(constants.chunk_size_x)));
+        const lz_i: i32 = @mod(z, @as(i32, @intCast(constants.chunk_size_z)));
+        const lx: usize = @intCast(@as(u32, @bitCast(lx_i)) % @as(u32, @intCast(constants.chunk_size_x)));
+        const lz: usize = @intCast(@as(u32, @bitCast(lz_i)) % @as(u32, @intCast(constants.chunk_size_z)));
+        const col_idx: usize = lz * constants.chunk_size_x + lx;
+        const top: i32 = ch.heightmaps.world_surface[col_idx];
+        const spawn_y: i32 = if (top < 0) 1 else top + 1;
+        return .{ .x = x, .y = spawn_y, .z = z };
     }
 
     fn ensureRegionState(self: *Simulation, ws: *WorldState, rp: RegionPos) !*RegionState {

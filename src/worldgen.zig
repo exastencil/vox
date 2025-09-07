@@ -3,6 +3,208 @@ const gs = @import("gs.zig");
 const ids = @import("ids.zig");
 const constants = @import("constants.zig");
 const wgen = @import("registry/worldgen.zig");
+const wapi = @import("worldgen_api.zig");
+
+fn totalVoxels(section_count_y: u16) usize {
+    return wapi.totalVoxels(section_count_y);
+}
+
+pub fn protoInit(allocator: std.mem.Allocator, section_count_y: u16, pos: gs.ChunkPos) !wapi.ProtoChunk {
+    const tops_len: usize = constants.chunk_size_x * constants.chunk_size_z;
+    const tops = try allocator.alloc(i32, tops_len);
+    @memset(tops, -1);
+    return .{ .allocator = allocator, .section_count_y = section_count_y, .pos = pos, .tops = tops };
+}
+
+pub fn protoDeinit(proto: *wapi.ProtoChunk) void {
+    if (proto.biomes_buf) |b| proto.allocator.free(b);
+    if (proto.blocks_buf) |b2| proto.allocator.free(b2);
+    proto.allocator.free(proto.tops);
+    proto.* = undefined;
+}
+
+fn callBiomesHook(proto: *wapi.ProtoChunk, seed: u64, def: wgen.Def, params: wgen.Params) !void {
+    if (proto.status != .empty) return;
+    try wapi.ensureBiomesAllocated(proto);
+    if (def.biomes) |f| {
+        try f(seed, proto, params);
+    }
+    proto.status = .biomes;
+}
+
+fn callNoiseHook(proto: *wapi.ProtoChunk, seed: u64, def: wgen.Def, params: wgen.Params, lookup: wgen.BlockLookup) !void {
+    if (proto.status != .biomes) return;
+    try wapi.ensureBlocksAllocated(proto);
+    @memset(proto.tops, -1);
+    if (def.noise) |f| {
+        try f(seed, proto, params, lookup);
+    }
+    proto.status = .noise;
+}
+
+fn advanceNoop(proto: *wapi.ProtoChunk, next: gs.ChunkStatus) void {
+    proto.status = next;
+}
+
+pub fn advanceOnePhase(
+    proto: *wapi.ProtoChunk,
+    seed: u64,
+    def: wgen.Def,
+    params: wgen.Params,
+    lookup: wgen.BlockLookup,
+    air_id: ids.BlockStateId,
+) !?gs.Chunk {
+    _ = air_id; // not used by hook APIs directly; blocks should be set explicitly by noise/surface hooks
+    switch (proto.status) {
+        .empty => {
+            try callBiomesHook(proto, seed, def, params);
+            return null;
+        },
+        .biomes => {
+            try callNoiseHook(proto, seed, def, params, lookup);
+            return null;
+        },
+        .noise => {
+            advanceNoop(proto, .surface);
+            return null;
+        },
+        .surface => {
+            if (def.surface) |f| _ = f(seed, proto, params) catch {};
+            advanceNoop(proto, .carvers);
+            return null;
+        },
+        .carvers => {
+            if (def.carvers) |f| _ = f(seed, proto, params) catch {};
+            advanceNoop(proto, .features);
+            return null;
+        },
+        .features => {
+            if (def.features) |f| _ = f(seed, proto, params) catch {};
+            advanceNoop(proto, .initialize_light);
+            return null;
+        },
+        .initialize_light => {
+            if (def.initialize_light) |f| _ = f(seed, proto, params) catch {};
+            advanceNoop(proto, .light);
+            return null;
+        },
+        .light => {
+            if (def.light) |f| _ = f(seed, proto, params) catch {};
+            advanceNoop(proto, .spawn);
+            return null;
+        },
+        .spawn => {
+            if (def.spawn) |f| _ = f(seed, proto, params) catch {};
+            const ch = try buildChunkFromBuffers(proto);
+            proto.status = .full;
+            return ch;
+        },
+        .structures_starts, .structures_references => {
+            advanceNoop(proto, .biomes);
+            return null;
+        },
+        .full => return null,
+    }
+}
+
+fn buildChunkFromBuffers(proto: *const wapi.ProtoChunk) !gs.Chunk {
+    if (proto.blocks_buf == null or proto.biomes_buf == null) return error.WorldgenNotReady;
+
+    const allocator = proto.allocator;
+    const sections_len: usize = proto.section_count_y;
+    var sections = try allocator.alloc(gs.Section, sections_len);
+
+    const voxel_count: usize = constants.chunk_size_x * constants.section_height * constants.chunk_size_z;
+
+    // build sections from buffers
+    var idx_global: usize = 0;
+    var sy: usize = 0;
+    while (sy < sections_len) : (sy += 1) {
+        // Build palettes for this section
+        var block_map = std.AutoHashMap(ids.BlockStateId, u32).init(allocator);
+        defer block_map.deinit();
+        var biome_map = std.AutoHashMap(ids.BiomeId, u32).init(allocator);
+        defer biome_map.deinit();
+
+        var block_palette_list = try std.ArrayList(ids.BlockStateId).initCapacity(allocator, 0);
+        defer block_palette_list.deinit(allocator);
+        var biome_palette_list = try std.ArrayList(ids.BiomeId).initCapacity(allocator, 0);
+        defer biome_palette_list.deinit(allocator);
+
+        // First pass: collect unique values
+        var i: usize = 0;
+        while (i < voxel_count) : (i += 1) {
+            const bid = proto.blocks_buf.?[idx_global + i];
+            if (block_map.get(bid) == null) {
+                const pi: u32 = @intCast(block_palette_list.items.len);
+                try block_palette_list.append(allocator, bid);
+                try block_map.put(bid, pi);
+            }
+            const bm = proto.biomes_buf.?[idx_global + i];
+            if (biome_map.get(bm) == null) {
+                const pi2: u32 = @intCast(biome_palette_list.items.len);
+                try biome_palette_list.append(allocator, bm);
+                try biome_map.put(bm, pi2);
+            }
+        }
+
+        // Allocate outputs for section
+        const bpi: u6 = bitsFor(block_palette_list.items.len);
+        const words_per_section: usize = ceilDiv(voxel_count * bpi, 32);
+        const light_bytes_per_section: usize = voxel_count / 2;
+
+        const palette = try allocator.dupe(ids.BlockStateId, block_palette_list.items);
+        const indices_bits = try allocator.alloc(u32, words_per_section);
+        @memset(indices_bits, 0);
+        const skylight = try allocator.alloc(u8, light_bytes_per_section);
+        const blocklight = try allocator.alloc(u8, light_bytes_per_section);
+        @memset(skylight, 0);
+        @memset(blocklight, 0);
+
+        const biome_palette = try allocator.dupe(ids.BiomeId, biome_palette_list.items);
+        const biome_bpi: u6 = bitsFor(biome_palette_list.items.len);
+        const biome_words: usize = ceilDiv(voxel_count * biome_bpi, 32);
+        const biome_indices_bits = try allocator.alloc(u32, biome_words);
+        @memset(biome_indices_bits, 0);
+        const block_entities = try allocator.alloc(gs.BlockEntityRecord, 0);
+
+        // Second pass: pack indices
+        i = 0;
+        while (i < voxel_count) : (i += 1) {
+            const bid = proto.blocks_buf.?[idx_global + i];
+            const pid = block_map.get(bid).?;
+            packBitsSet(indices_bits, i, bpi, pid);
+            const bm = proto.biomes_buf.?[idx_global + i];
+            const bpi2 = biome_map.get(bm).?;
+            packBitsSet(biome_indices_bits, i, biome_bpi, bpi2);
+        }
+
+        sections[sy] = .{
+            .palette = palette,
+            .blocks_indices_bits = indices_bits,
+            .skylight = skylight,
+            .blocklight = blocklight,
+            .biome_palette = biome_palette,
+            .biome_indices_bits = biome_indices_bits,
+            .block_entities = block_entities,
+        };
+
+        idx_global += voxel_count;
+    }
+
+    // compute heightmaps from proto.tops
+    var heightmaps: gs.Heightmaps = .{ .motion_blocking = undefined, .world_surface = undefined };
+    for (0..constants.chunk_size_z) |lz| {
+        for (0..constants.chunk_size_x) |lx| {
+            const col_idx = lz * constants.chunk_size_x + lx;
+            heightmaps.motion_blocking[col_idx] = proto.tops[col_idx];
+            heightmaps.world_surface[col_idx] = proto.tops[col_idx];
+        }
+    }
+
+    const entities = try allocator.alloc(gs.EntityRecord, 0);
+    return .{ .pos = proto.pos, .sections = sections, .heightmaps = heightmaps, .entities = entities };
+}
 
 fn packBitsSet(dst: []u32, idx: usize, bits_per_index: u6, value: u32) void {
     // writes value (lower bits_per_index bits) at logical element index idx
@@ -64,137 +266,25 @@ pub fn generateChunk(
     section_count_y: u16,
     chunk_pos: gs.ChunkPos,
     seed: u64,
-    select_biome: wgen.SelectBiomeFn,
-    select_block: wgen.SelectBlockFn,
+    def: wgen.Def,
     params: wgen.Params,
     lookup: wgen.BlockLookup,
-    air_id: ids.BlockStateId,
 ) !gs.Chunk {
-    const sections_len: usize = section_count_y;
-    var sections = try allocator.alloc(gs.Section, sections_len);
+    var proto = try protoInit(allocator, section_count_y, chunk_pos);
+    defer protoDeinit(&proto);
 
-    const voxel_count: usize = constants.chunk_size_x * constants.section_height * constants.chunk_size_z;
+    try callBiomesHook(&proto, seed, def, params);
+    try callNoiseHook(&proto, seed, def, params, lookup);
+    advanceNoop(&proto, .surface);
+    advanceNoop(&proto, .carvers);
+    advanceNoop(&proto, .features);
+    advanceNoop(&proto, .initialize_light);
+    advanceNoop(&proto, .light);
+    advanceNoop(&proto, .spawn);
 
-    // buffers reused per section
-    var blocks_buf = try allocator.alloc(ids.BlockStateId, voxel_count);
-    defer allocator.free(blocks_buf);
-    var biomes_buf = try allocator.alloc(ids.BiomeId, voxel_count);
-    defer allocator.free(biomes_buf);
-
-    // initialize top heights
-    var tops: [constants.chunk_size_x * constants.chunk_size_z]i32 = [_]i32{-1} ** (constants.chunk_size_x * constants.chunk_size_z);
-
-    for (0..sections_len) |sy| {
-        const y_base: i32 = @intCast(sy * constants.section_height);
-        // fill per-voxel
-        var idx: usize = 0;
-        for (0..constants.chunk_size_z) |lz| {
-            for (0..constants.chunk_size_x) |lx| {
-                for (0..constants.section_height) |ly| {
-                    const wx: i32 = @as(i32, chunk_pos.x) * @as(i32, constants.chunk_size_x) + @as(i32, @intCast(lx));
-                    const wy: i32 = y_base + @as(i32, @intCast(ly));
-                    const wz: i32 = @as(i32, chunk_pos.z) * @as(i32, constants.chunk_size_z) + @as(i32, @intCast(lz));
-                    const bpos = gs.BlockPos{ .x = wx, .y = wy, .z = wz };
-                    const biome_id = select_biome(seed, bpos, params);
-                    biomes_buf[idx] = biome_id;
-                    const bid = select_block(seed, biome_id, bpos, params, lookup);
-                    blocks_buf[idx] = bid;
-                    if (bid != air_id) {
-                        const col_idx = @as(usize, @intCast(lz)) * constants.chunk_size_x + @as(usize, @intCast(lx));
-                        if (wy > tops[col_idx]) tops[col_idx] = wy;
-                    }
-                    idx += 1;
-                }
-            }
-        }
-        // build palettes
-        var block_map = std.AutoHashMap(ids.BlockStateId, u32).init(allocator);
-        defer block_map.deinit();
-        var biome_map = std.AutoHashMap(ids.BiomeId, u32).init(allocator);
-        defer biome_map.deinit();
-
-        var block_palette_list = try std.ArrayList(ids.BlockStateId).initCapacity(allocator, 0);
-        defer block_palette_list.deinit(allocator);
-        var biome_palette_list = try std.ArrayList(ids.BiomeId).initCapacity(allocator, 0);
-        defer biome_palette_list.deinit(allocator);
-
-        // blocks palette
-        for (blocks_buf) |bid| {
-            if (block_map.get(bid) == null) {
-                const pi: u32 = @intCast(block_palette_list.items.len);
-                try block_palette_list.append(allocator, bid);
-                try block_map.put(bid, pi);
-            }
-        }
-        // biomes palette
-        for (biomes_buf) |bm| {
-            if (biome_map.get(bm) == null) {
-                const pi: u32 = @intCast(biome_palette_list.items.len);
-                try biome_palette_list.append(allocator, bm);
-                try biome_map.put(bm, pi);
-            }
-        }
-
-        const bpi: u6 = bitsFor(block_palette_list.items.len);
-        const words_per_section: usize = ceilDiv(voxel_count * bpi, 32);
-        const light_bytes_per_section: usize = voxel_count / 2;
-
-        // allocate outputs
-        const palette = try allocator.dupe(ids.BlockStateId, block_palette_list.items);
-        const indices_bits = try allocator.alloc(u32, words_per_section);
-        @memset(indices_bits, 0);
-        const skylight = try allocator.alloc(u8, light_bytes_per_section);
-        const blocklight = try allocator.alloc(u8, light_bytes_per_section);
-        @memset(skylight, 0);
-        @memset(blocklight, 0);
-
-        const biome_palette = try allocator.dupe(ids.BiomeId, biome_palette_list.items);
-        const biome_bpi: u6 = bitsFor(biome_palette_list.items.len);
-        const biome_words: usize = ceilDiv(voxel_count * biome_bpi, 32);
-        const biome_indices_bits = try allocator.alloc(u32, biome_words);
-        @memset(biome_indices_bits, 0);
-        const block_entities = try allocator.alloc(gs.BlockEntityRecord, 0);
-
-        // pack indices
-        idx = 0;
-        for (0..constants.chunk_size_z) |lz| {
-            for (0..constants.chunk_size_x) |lx| {
-                for (0..constants.section_height) |ly| {
-                    const voxel_idx_in_section: usize = ly * constants.chunk_size_x * constants.chunk_size_z + lz * constants.chunk_size_x + lx;
-                    const bid = blocks_buf[idx];
-                    const pid = block_map.get(bid).?;
-                    packBitsSet(indices_bits, voxel_idx_in_section, bpi, pid);
-                    const bm = biomes_buf[idx];
-                    const bpi2 = biome_map.get(bm).?;
-                    packBitsSet(biome_indices_bits, voxel_idx_in_section, biome_bpi, bpi2);
-                    idx += 1;
-                }
-            }
-        }
-
-        sections[sy] = .{
-            .palette = palette,
-            .blocks_indices_bits = indices_bits,
-            .skylight = skylight,
-            .blocklight = blocklight,
-            .biome_palette = biome_palette,
-            .biome_indices_bits = biome_indices_bits,
-            .block_entities = block_entities,
-        };
-    }
-
-    // compute heightmaps
-    var heightmaps: gs.Heightmaps = .{ .motion_blocking = undefined, .world_surface = undefined };
-    for (0..constants.chunk_size_z) |lz| {
-        for (0..constants.chunk_size_x) |lx| {
-            const col_idx = lz * constants.chunk_size_x + lx;
-            heightmaps.motion_blocking[col_idx] = tops[col_idx];
-            heightmaps.world_surface[col_idx] = tops[col_idx];
-        }
-    }
-
-    const entities = try allocator.alloc(gs.EntityRecord, 0);
-    return .{ .pos = chunk_pos, .sections = sections, .heightmaps = heightmaps, .entities = entities };
+    const chunk = try buildChunkFromBuffers(&proto);
+    proto.status = .full;
+    return chunk;
 }
 
 const testing = std.testing;

@@ -83,6 +83,23 @@ pub const Section = struct {
     block_entities: []const BlockEntityRecord,
 };
 
+// Chunk generation status follows the staged process documented in docs/wiki/worldgen-stages.md
+// Note: UI/screen coordinate system remains top-left origin per WARP.md; not directly relevant here.
+pub const ChunkStatus = enum(u4) {
+    empty,
+    structures_starts,
+    structures_references,
+    biomes,
+    noise,
+    surface,
+    carvers,
+    features,
+    initialize_light,
+    light,
+    spawn,
+    full,
+};
+
 pub const Chunk = struct {
     pos: ChunkPos,
     sections: []const Section, // length == world.section_count_y

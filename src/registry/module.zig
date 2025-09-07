@@ -1,5 +1,5 @@
 const std = @import("std");
-const WorldGen = @import("worldgen.zig");
+pub const WorldGen = @import("worldgen.zig");
 
 // Module definitions represent loadable content groups provided by the engine or mods.
 // Keys use a namespaced identifier with a slash (e.g., "vox/blocks", "core/combat").
