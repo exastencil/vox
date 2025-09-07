@@ -5,6 +5,7 @@ pub const Biome = @import("registry/biome.zig");
 pub const World = @import("registry/world.zig");
 pub const WorldGen = @import("registry/worldgen.zig");
 pub const Resource = @import("registry/resource.zig");
+pub const Module = @import("registry/module.zig");
 
 pub const Registry = struct {
     allocator: std.mem.Allocator,
@@ -13,6 +14,7 @@ pub const Registry = struct {
     worlds: World.Registry,
     worldgen: WorldGen.Registry,
     resources: Resource.Registry,
+    modules: Module.Registry,
 
     pub fn init(allocator: std.mem.Allocator) !Registry {
         return .{
@@ -22,6 +24,7 @@ pub const Registry = struct {
             .worlds = World.Registry.init(allocator),
             .worldgen = WorldGen.Registry.init(allocator),
             .resources = Resource.Registry.init(allocator),
+            .modules = Module.Registry.init(allocator),
         };
     }
 
@@ -34,6 +37,7 @@ pub const Registry = struct {
         self.worlds.deinit();
         self.worldgen.deinit();
         self.resources.deinit();
+        self.modules.deinit();
     }
 
     fn dup(self: *Registry, s: []const u8) ![]const u8 {
