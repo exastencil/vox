@@ -9,6 +9,7 @@ Each world definition provides:
 - section_count_y: number of vertical sections per chunk. Combined with section height, this determines build height.
 
 Later extensions (reserved, not implemented yet):
+
 - environment parameters (skybox id, ambient light, gravity, time scale)
 - generation rules and biome sets
 - allowed dimensions, portals, entry rules

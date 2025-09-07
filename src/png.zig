@@ -184,7 +184,10 @@ pub fn decodeRGBA8(allocator: std.mem.Allocator, bytes: []const u8) !Image {
     var out = try allocator.alloc(u8, out_len);
     var src_i: usize = 0;
     var dst_i: usize = 0;
-    while (src_i < raw.len) : ({ src_i += 3; dst_i += 4; }) {
+    while (src_i < raw.len) : ({
+        src_i += 3;
+        dst_i += 4;
+    }) {
         out[dst_i + 0] = raw[src_i + 0];
         out[dst_i + 1] = raw[src_i + 1];
         out[dst_i + 2] = raw[src_i + 2];

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Ensure we run from the repo root
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT"
+
+# 1) Format Zig source files under src/ and stage any changes
+if command -v zig >/dev/null 2>&1; then
+  if [ -d src ]; then
+    echo "Formatting Zig sources in src/..."
+    zig fmt src
+    # Stage any formatting changes so they’re included in this commit
+    git add -A src
+  else
+    echo "No src/ directory found; skipping Zig formatting."
+  fi
+else
+  echo "error: zig not found in PATH; cannot format Zig sources." >&2
+  exit 1
+fi

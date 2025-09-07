@@ -2,7 +2,6 @@
 
 A modular, first-person, voxel-based, open‑world game engine written in Zig. Inspired by the open‑world survival and exploration design of games like Minecraft, but with a core focus on being a moddable engine first. The base game itself is implemented entirely as mods, serving as a reference implementation you can keep, extend, or replace.
 
-
 ## Vision
 
 - Engine‑first: All gameplay content (blocks, entities, items, recipes, worldgen, UI, etc.) is implemented as mods.
@@ -10,7 +9,6 @@ A modular, first-person, voxel-based, open‑world game engine written in Zig. I
 - Flexible mod licensing: The base engine will be free. The license will allow mod authors to choose their own distribution model (free, paid, subscriptions, donations, etc.) provided their content depends on the base engine.
 - Showcase parity: To sanity‑check the engine and act as documentation, the reference mods will implement as much of Minecraft’s functionality as possible without using the Minecraft trademark or assets.
 - Clear separation of concerns: Engine provides rendering, physics, networking, persistence, mod loading, and deterministic APIs; mods provide content and behavior.
-
 
 ## Guiding Principles
 
@@ -20,7 +18,6 @@ A modular, first-person, voxel-based, open‑world game engine written in Zig. I
 - Performance: Lean into Zig’s strengths; prioritize memory locality, cache‑coherent data layouts, and zero‑cost abstractions.
 - Clear coordinate conventions: Use a screen/UI coordinate system with the origin (0,0) at the top‑left, consistent with Sokol, and document world coordinates explicitly.
 - Safety & stability: Robust versioning and capability negotiation between engine and mods.
-
 
 ## High‑Level Architecture
 
@@ -43,13 +40,11 @@ A modular, first-person, voxel-based, open‑world game engine written in Zig. I
   - Capabilities & Versioning: Semantic versioning for engine APIs, feature flags, and compatibility guards.
   - Tooling: Build, package, and dependency management for modpacks.
 
-
 ## Reference Implementation ("Base Game")
 
 - Purpose: Serve as a living example and test suite for the engine’s APIs.
 - Scope: Reproduce major Minecraft‑like systems (worldgen, crafting, redstone‑like circuits, mobs, day/night cycle, weather, dimensions, structures, etc.) while avoiding any trademarked names or proprietary assets.
 - Deviations: Where it improves engine design or modding, we will deviate (e.g., block eighths for better partial blocks/vertical slabs).
-
 
 ## Modding Model
 
@@ -58,13 +53,11 @@ A modular, first-person, voxel-based, open‑world game engine written in Zig. I
 - Hot Reload (stretch): Where practical, support hot‑reloading of content and scripts.
 - Security: Sandboxing where applicable for scripting environments; clear permission model for IO/network.
 
-
 ## Licensing (Intent)
 
 - Engine: Free license (exact license TBD) encouraging broad adoption and enabling commercial or free mods.
 - Base Game Mods: Free, open reference implementation.
 - Mods: Authors choose their own licensing/pricing; must depend on the engine rather than bundling it.
-
 
 ## Roadmap (Initial)
 
@@ -78,11 +71,9 @@ A modular, first-person, voxel-based, open‑world game engine written in Zig. I
 8. Networking prototype (local + LAN), capability negotiation for mods.
 9. Base game reference mods: worldgen, basic blocks/items/tools, crafting, mobs.
 
-
 ## Trademark Notice
 
 This project aims to replicate certain gameplay features for educational and compatibility purposes. We will not use the term "Minecraft" or any trademarked names or assets in shipped content unless separately licensed. References to third‑party games here are purely descriptive.
-
 
 ## Contributing
 
@@ -90,8 +81,6 @@ This project aims to replicate certain gameplay features for educational and com
 - PRs are welcome once the API stabilizes; early contributions may involve rapid iteration.
 - Please adhere to the coding style and patterns established in the codebase.
 
-
 ## Status
 
 Early planning. README seeded; initial commit will follow. Wiki and technical reference will be created next.
-
