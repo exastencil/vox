@@ -81,6 +81,24 @@ This project aims to replicate certain gameplay features for educational and com
 - PRs are welcome once the API stabilizes; early contributions may involve rapid iteration.
 - Please adhere to the coding style and patterns established in the codebase.
 
+## Build and Run
+
+- Build everything (also regenerates shaders and fetches deps as needed):
+  - zig build
+- Build specific executables:
+  - zig build full     # full single-process (default for `zig build run`)
+  - zig build client   # client-only (Sokol; connects to server)
+  - zig build server   # headless server (authoritative simulation)
+- Run (defaults to full target):
+  - zig build run -- [args]
+
+Binaries land in zig-out/bin/:
+- vox-aetatum (full)
+- vox-client (client)
+- vox-server (server)
+
+See docs/wiki/build-targets.md for details.
+
 ## Status
 
 Early planning. README seeded; initial commit will follow. Wiki and technical reference will be created next.

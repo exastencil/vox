@@ -2,6 +2,7 @@
 
 This folder contains technical documentation and design notes for the Vox Aetatum engine and its reference content.
 
+- Build Targets and Executables: See `build-targets.md`.
 - Client/Server Split and Runtime Topology: See `architecture-client-server.md`.
 - Game State (GS) Model: See `architecture-game-state.md`.
 - Simulation (SIM) Update Order: See `architecture-simulation-update-order.md`.

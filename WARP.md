@@ -11,7 +11,11 @@ Common commands
 
 - Build (also regenerates shaders via sokol-shdc and fetches Zig deps if needed):
   - zig build
-- Run the game:
+  - Build specific targets:
+    - zig build full     # full single-process (default for `zig build run`)
+    - zig build client   # client-only executable (Sokol)
+    - zig build server   # headless server executable (no Sokol)
+- Run the game (defaults to full):
   - zig build run
   - Pass args to the program:
     - zig build run -- <args>
@@ -37,9 +41,11 @@ Dependency and build notes
 
 High-level architecture
 
-- Entry/Executable
-  - src/main.zig is the entry point. The build creates an executable named vox-aetatum.
-  - The executable is integrated with a build “run” step (zig build run) that forwards CLI args.
+- Entry/Executables
+  - Full: src/main.zig builds vox-aetatum (client + in-process simulation). This is the default run target.
+  - Client: src/bin/client_main.zig builds vox-client (Sokol, connects to server; includes Simulation for prediction but does not run it).
+  - Server: src/bin/server_main.zig builds vox-server (headless; authoritative simulation).
+  - The full executable is integrated with a build “run” step (zig build run) that forwards CLI args.
 - Client/Render Loop
   - src/client.zig orchestrates the frame loop and rendering setup using Sokol (sokol-zig). UI/screen coordinates use top-left origin.
   - Shaders live under shaders/ (GLSL source); the generated Zig shader module is in src/shaders/chunk_shd.zig and is used by the renderer.
