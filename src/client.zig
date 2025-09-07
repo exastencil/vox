@@ -70,6 +70,8 @@ pub const Client = struct {
     player_id: player.PlayerId,
     account_name: []const u8,
     connected: bool = false,
+    // Connection/ready state
+    ready: bool = false,
 
     // UI / rendering state
     pass_action: sg.PassAction = .{},
@@ -134,8 +136,11 @@ pub const Client = struct {
         if (self.connected) return;
         try self.sim.connectPlayer(self.player_id, self.account_name);
         self.connected = true;
+        self.ready = false;
         // Ensure server creates/associates an entity for this player
         _ = self.sim.ensurePlayerEntity(self.player_id) catch {};
+        // Do not block here; frame() will show "Connecting…" and poll readiness until the
+        // player's chunk is loaded.
     }
 
     pub fn initGfx(self: *Client) void {
@@ -350,11 +355,64 @@ pub const Client = struct {
         return out.items.len - verts_before;
     }
 
+    fn checkReady(self: *Client) void {
+        if (self.ready) return;
+        // Determine the player's current chunk and see if it's loaded
+        // For now, assume the single-world prototype key
+        const wk = "vox:overworld";
+        // Read player position under the connections mutex
+        self.sim.connections_mutex.lock();
+        var has_pos = false;
+        var cx: i32 = 0;
+        var cz: i32 = 0;
+        const idx_opt = self.sim.entity_by_player.get(self.player_id);
+        if (idx_opt) |idx| {
+            if (idx < self.sim.dynamic_entities.items.len) {
+                const e = self.sim.dynamic_entities.items[idx];
+                cx = @divTrunc(@as(i32, @intFromFloat(e.pos[0])), 16);
+                cz = @divTrunc(@as(i32, @intFromFloat(e.pos[2])), 16);
+                has_pos = true;
+            }
+        }
+        self.sim.connections_mutex.unlock();
+        if (!has_pos) return;
+        if (self.sim.isChunkLoadedAt(wk, .{ .x = cx, .z = cz })) {
+            self.ready = true;
+            // Initialize camera now that the world around the player exists
+            self.updateCameraFromPlayer();
+        }
+    }
+
     pub fn frame(self: *Client) void {
         // Keep camera mirrored to player each frame for now
         self.updateCameraFromPlayer();
 
         sg.beginPass(.{ .action = self.pass_action, .swapchain = sglue.swapchain() });
+
+        // If not ready, draw a simple Connecting overlay and return early
+        if (!self.ready) {
+            const scale: f32 = self.ui_scale;
+            const w_px: f32 = @floatFromInt(sapp.width());
+            const h_px: f32 = @floatFromInt(sapp.height());
+            sdtx.canvas(w_px / scale, h_px / scale);
+            sdtx.origin(0, 0);
+            sdtx.font(4);
+            // Center-ish text: compute columns and rows (8x8 font)
+            const msg: [:0]const u8 = "Connecting...";
+            const cols: f32 = (w_px / scale) / 8.0;
+            const rows: f32 = (h_px / scale) / 8.0;
+            const col_start: f32 = @max(0.0, (cols - @as(f32, @floatFromInt(msg.len))) / 2.0);
+            const row_start: f32 = @max(0.0, rows / 2.0);
+            sdtx.pos(col_start, row_start);
+            sdtx.color3b(255, 255, 255);
+            sdtx.puts(msg);
+            sdtx.draw();
+            sg.endPass();
+            sg.commit();
+            // Poll readiness for next frame
+            self.checkReady();
+            return;
+        }
 
         // Apply movement inputs to player entity (client-side write into sim)
         self.applyMovementInputs();

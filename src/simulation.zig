@@ -613,6 +613,16 @@ pub const Simulation = struct {
         return ws.regions.getPtr(rp).?;
     }
 
+    /// Check if a specific chunk is present in the in-memory world state
+    pub fn isChunkLoadedAt(self: *Simulation, world_key: []const u8, pos: gs.ChunkPos) bool {
+        self.worlds_mutex.lock();
+        defer self.worlds_mutex.unlock();
+        const ws = self.worlds_state.getPtr(world_key) orelse return false;
+        const rpos = RegionPos{ .x = @divTrunc(pos.x, 32), .z = @divTrunc(pos.z, 32) };
+        const rs = ws.regions.getPtr(rpos) orelse return false;
+        return rs.chunk_index.get(pos) != null;
+    }
+
     pub fn start(self: *Simulation) !void {
         if (self.running.swap(true, .acquire)) return; // already running
         self.last_tick_ns = std.time.nanoTimestamp();
