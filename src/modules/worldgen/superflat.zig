@@ -18,8 +18,8 @@ fn hook_noise(seed: u64, proto: *wapi.ProtoChunk, params: WorldGen.Params, looku
     _ = seed;
     try wapi.ensureBlocksAllocated(proto);
     const air: ids.BlockStateId = lookup.call(lookup.ctx, "core:air") orelse 0;
-    const surface: ids.BlockStateId = if (params.blocks.len >= 1) params.blocks[0] else (lookup.call(lookup.ctx, "core:grass") orelse 0);
-    const depth: ids.BlockStateId = if (params.blocks.len >= 2) params.blocks[1] else (lookup.call(lookup.ctx, "core:dirt") orelse 0);
+    const surface: ids.BlockStateId = if (params.blocks.len >= 1) params.blocks[0] else (lookup.call(lookup.ctx, "minecraft:grass") orelse 0);
+    const depth: ids.BlockStateId = if (params.blocks.len >= 2) params.blocks[1] else (lookup.call(lookup.ctx, "minecraft:dirt") orelse 0);
 
     const scy: usize = @intCast(proto.section_count_y);
     var idx: usize = 0;

@@ -5,6 +5,7 @@ const vox = @import("vox");
 const registry = vox.registry;
 const simulation = vox.simulation;
 const worldgen = vox.worldgen;
+const vox_modules = vox.vox_modules;
 
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
@@ -19,11 +20,20 @@ pub fn main() !void {
     var reg = try registry.Registry.init(allocator);
     defer reg.deinit();
     try reg.ensureAir();
-    const plains_biome = reg.addBiome("vox:plains") catch 0;
-    _ = reg.addBlock("core:stone") catch {};
-    const grass_id = reg.addBlock("vox:grass") catch 0;
-    const dirt_id = reg.addBlock("vox:dirt") catch 0;
-    reg.worlds.addWorldWithGen("vox:overworld", "The Overworld", 4, .{ .key = "core:superflat", .blocks = &[_]ids.BlockStateId{ grass_id, dirt_id }, .biomes = &[_]ids.BiomeId{plains_biome} }) catch {};
+
+    // Load all modules and register their worldgen and content
+    inline for (vox_modules.modules) |m| {
+        reg.modules.add(m.key, m.display_name, m.version, m.requires, m.worldgen) catch {};
+        var j: usize = 0;
+        while (j < m.worldgen.len) : (j += 1) {
+            const wg = m.worldgen[j];
+            reg.worldgen.add(wg.key, wg.display_name, wg) catch {};
+        }
+        if (m.init) |f| {
+            const ctx: *anyopaque = @ptrCast(&reg);
+            f(ctx) catch {};
+        }
+    }
 
     // Start authoritative simulation thread
     var sim = try simulation.Simulation.initMemory(allocator, &reg, 4);

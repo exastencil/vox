@@ -8,6 +8,83 @@ const sglue = sokol.glue;
 const sdtx = sokol.debugtext;
 const shd_mod = @import("shaders/chunk_shd.zig");
 
+fn loadOrFallback(allocator: std.mem.Allocator, path: []const u8) sg.Image {
+    const png = @import("png.zig");
+    const loaded = png.loadFileRGBA8(allocator, path) catch null;
+    if (loaded) |img| {
+        defer allocator.free(img.pixels);
+        return sg.makeImage(.{
+            .width = @intCast(img.width),
+            .height = @intCast(img.height),
+            .pixel_format = .RGBA8,
+            .data = .{ .subimage = .{
+                .{ sg.asRange(img.pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+            } },
+        });
+    } else {
+        // Generate a magenta/black checkerboard as a visible missing-texture fallback
+        const w: usize = 128;
+        const h: usize = 128;
+        const tile: usize = 16;
+        var pixels = allocator.alloc(u8, w * h * 4) catch {
+            var one = [_]u8{ 255, 0, 255, 255 };
+            return sg.makeImage(.{
+                .width = 1,
+                .height = 1,
+                .pixel_format = .RGBA8,
+                .data = .{ .subimage = .{
+                    .{ sg.asRange(one[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                } },
+            });
+        };
+        defer allocator.free(pixels);
+        var y: usize = 0;
+        while (y < h) : (y += 1) {
+            var x: usize = 0;
+            while (x < w) : (x += 1) {
+                const cx = (x / tile) & 1;
+                const cy = (y / tile) & 1;
+                const is_magenta = (cx ^ cy) == 0;
+                const idx = (y * w + x) * 4;
+                if (is_magenta) {
+                    pixels[idx + 0] = 255;
+                    pixels[idx + 1] = 0;
+                    pixels[idx + 2] = 255;
+                    pixels[idx + 3] = 255;
+                } else {
+                    pixels[idx + 0] = 0;
+                    pixels[idx + 1] = 0;
+                    pixels[idx + 2] = 0;
+                    pixels[idx + 3] = 255;
+                }
+            }
+        }
+        return sg.makeImage(.{
+            .width = @intCast(w),
+            .height = @intCast(h),
+            .pixel_format = .RGBA8,
+            .data = .{ .subimage = .{
+                .{ sg.asRange(pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+            } },
+        });
+    }
+}
+
 const Camera = struct {
     pos: [3]f32 = .{ 0, 0, 0 },
     yaw: f32 = 0.0,
@@ -64,6 +141,300 @@ fn buildQuadVerts(out: []Vertex, x0: f32, y0: f32, size: f32) usize {
     return 6;
 }
 
+const UvRect = struct { u0: f32, v0: f32, u1: f32, v1: f32, w: u32, h: u32 };
+
+fn makeFallbackTile(allocator: std.mem.Allocator, size: usize) !struct { w: u32, h: u32, pixels: []u8 } {
+    const w: usize = size;
+    const h: usize = size;
+    const tile: usize = @max(1, size / 8);
+    var pixels = try allocator.alloc(u8, w * h * 4);
+    errdefer allocator.free(pixels);
+    var y: usize = 0;
+    while (y < h) : (y += 1) {
+        var x: usize = 0;
+        while (x < w) : (x += 1) {
+            const cx = (x / tile) & 1;
+            const cy = (y / tile) & 1;
+            const is_magenta = (cx ^ cy) == 0;
+            const idx = (y * w + x) * 4;
+            if (is_magenta) {
+                pixels[idx + 0] = 255;
+                pixels[idx + 1] = 0;
+                pixels[idx + 2] = 255;
+                pixels[idx + 3] = 255;
+            } else {
+                pixels[idx + 0] = 0;
+                pixels[idx + 1] = 0;
+                pixels[idx + 2] = 0;
+                pixels[idx + 3] = 255;
+            }
+        }
+    }
+    return .{ .w = @intCast(w), .h = @intCast(h), .pixels = pixels };
+}
+
+fn buildAtlasFromPaths(allocator: std.mem.Allocator, paths: []const []const u8) !struct {
+    atlas_pixels: []u8,
+    atlas_w: u32,
+    atlas_h: u32,
+    rects: []UvRect,
+} {
+    const png = @import("png.zig");
+    // Load all images (or fallback tiles) and record dims
+    const N = paths.len;
+    var loaded = try allocator.alloc(struct { w: u32, h: u32, pixels: []u8 }, N);
+    errdefer {
+        // free any allocated pixels
+        var j: usize = 0;
+        while (j < loaded.len) : (j += 1) {
+            if (loaded[j].pixels.len > 0) allocator.free(loaded[j].pixels);
+        }
+        allocator.free(loaded);
+    }
+
+    var max_w: u32 = 0;
+    var max_h: u32 = 0;
+    var i: usize = 0;
+    while (i < N) : (i += 1) {
+        const img = png.loadFileRGBA8(allocator, paths[i]) catch null;
+        if (img) |im| {
+            loaded[i].w = im.width;
+            loaded[i].h = im.height;
+            loaded[i].pixels = im.pixels; // take ownership
+        } else {
+            const fb = try makeFallbackTile(allocator, 16);
+            loaded[i].w = fb.w;
+            loaded[i].h = fb.h;
+            loaded[i].pixels = fb.pixels;
+        }
+        if (loaded[i].w > max_w) max_w = loaded[i].w;
+        if (loaded[i].h > max_h) max_h = loaded[i].h;
+    }
+    const tile_w: u32 = if (max_w == 0) 16 else max_w;
+    const tile_h: u32 = if (max_h == 0) 16 else max_h;
+
+    // Simple grid packing: smallest cols where cols*cols >= N
+    var cols: u32 = 1;
+    while (@as(usize, cols) * @as(usize, cols) < N) cols += 1;
+    const rows: u32 = @intCast((N + cols - 1) / cols);
+    const atlas_w: u32 = cols * tile_w;
+    const atlas_h: u32 = rows * tile_h;
+    var atlas_pixels = try allocator.alloc(u8, @as(usize, atlas_w) * @as(usize, atlas_h) * 4);
+    @memset(atlas_pixels, 0);
+
+    var rects = try allocator.alloc(UvRect, N);
+
+    // Blit each tile
+    i = 0;
+    while (i < N) : (i += 1) {
+        const c: u32 = @intCast(i % cols);
+        const r: u32 = @intCast(i / cols);
+        const dst_x: u32 = c * tile_w;
+        const dst_y: u32 = r * tile_h;
+        // Copy row by row
+        var py: u32 = 0;
+        while (py < loaded[i].h) : (py += 1) {
+            const src_off: usize = @as(usize, py) * @as(usize, loaded[i].w) * 4;
+            const dst_row_off: usize = (@as(usize, dst_y + py) * @as(usize, atlas_w) + @as(usize, dst_x)) * 4;
+            const copy_bytes: usize = @as(usize, loaded[i].w) * 4;
+            @memcpy(atlas_pixels[dst_row_off .. dst_row_off + copy_bytes], loaded[i].pixels[src_off .. src_off + copy_bytes]);
+        }
+        rects[i] = .{
+            .u0 = @as(f32, @floatFromInt(dst_x)) / @as(f32, @floatFromInt(atlas_w)),
+            .v0 = @as(f32, @floatFromInt(dst_y)) / @as(f32, @floatFromInt(atlas_h)),
+            .u1 = @as(f32, @floatFromInt(dst_x + loaded[i].w)) / @as(f32, @floatFromInt(atlas_w)),
+            .v1 = @as(f32, @floatFromInt(dst_y + loaded[i].h)) / @as(f32, @floatFromInt(atlas_h)),
+            .w = loaded[i].w,
+            .h = loaded[i].h,
+        };
+    }
+
+    // Free individual tiles; keep atlas_pixels and rects
+    i = 0;
+    while (i < N) : (i += 1) allocator.free(loaded[i].pixels);
+    allocator.free(loaded);
+
+    return .{ .atlas_pixels = atlas_pixels, .atlas_w = atlas_w, .atlas_h = atlas_h, .rects = rects };
+}
+
+fn addUniquePath(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), s: []const u8) !void {
+    // Avoid duplicates by linear scan (small N)
+    for (list.items) |p| if (std.mem.eql(u8, p, s)) return;
+    try list.append(allocator, s);
+}
+
+fn findRectForPath(paths: []const []const u8, rects: []const UvRect, s: []const u8) ?UvRect {
+    var i: usize = 0;
+    while (i < paths.len) : (i += 1) if (std.mem.eql(u8, paths[i], s)) return rects[i];
+    return null;
+}
+
+fn buildTextureAtlas(self: *Client) void {
+    // Collect unique paths from resource registry
+    var paths = std.ArrayList([]const u8).initCapacity(self.allocator, 0) catch {
+        self.textures_ready = true;
+        return;
+    };
+    defer paths.deinit(self.allocator);
+    var it = self.sim.reg.resources.by_block.valueIterator();
+    while (it.next()) |res| {
+        switch (res.*) {
+            .Uniform => |u| addUniquePath(self.allocator, &paths, u.all_path) catch {},
+            .Facing => |f| {
+                addUniquePath(self.allocator, &paths, f.face_path) catch {};
+                addUniquePath(self.allocator, &paths, f.other_path) catch {};
+            },
+            .Void => {},
+        }
+    }
+    if (paths.items.len == 0) {
+        // Nothing to do: create a 1x1 fallback atlas
+        var one = [_]u8{ 255, 0, 255, 255 };
+        self.grass_img = sg.makeImage(.{ .width = 1, .height = 1, .pixel_format = .RGBA8, .data = .{ .subimage = .{ .{ sg.asRange(one[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} } } } });
+        self.atlas_uv_scale = .{ 1, 1 };
+        self.atlas_uv_offset = .{ 0, 0 };
+        // Set per-face defaults to match the selected default region
+        self.atlas_uv_top_scale = self.atlas_uv_scale;
+        self.atlas_uv_top_offset = self.atlas_uv_offset;
+        self.atlas_uv_side_scale = self.atlas_uv_scale;
+        self.atlas_uv_side_offset = self.atlas_uv_offset;
+        self.textures_ready = true;
+        return;
+    }
+
+    const built = buildAtlasFromPaths(self.allocator, paths.items) catch {
+        // Fallback as above on failure
+        var one = [_]u8{ 255, 0, 255, 255 };
+        self.grass_img = sg.makeImage(.{ .width = 1, .height = 1, .pixel_format = .RGBA8, .data = .{ .subimage = .{ .{ sg.asRange(one[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} } } } });
+        self.atlas_uv_scale = .{ 1, 1 };
+        self.atlas_uv_offset = .{ 0, 0 };
+        self.atlas_uv_top_scale = self.atlas_uv_scale;
+        self.atlas_uv_top_offset = self.atlas_uv_offset;
+        self.atlas_uv_side_scale = self.atlas_uv_scale;
+        self.atlas_uv_side_offset = self.atlas_uv_offset;
+        self.textures_ready = true;
+        return;
+    };
+    defer self.allocator.free(built.atlas_pixels);
+    defer self.allocator.free(built.rects);
+
+    // Upload atlas image to GPU
+    self.grass_img = sg.makeImage(.{
+        .width = @intCast(built.atlas_w),
+        .height = @intCast(built.atlas_h),
+        .pixel_format = .RGBA8,
+        .data = .{ .subimage = .{
+            .{ sg.asRange(built.atlas_pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+            .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+            .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+            .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+            .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+            .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+        } },
+    });
+
+    // Choose a default atlas region to use for the current single-material demo mesh.
+    // Prefer minecraft:dirt (uniform), otherwise fall back to grass_block face, then stone, then first tile.
+    var chosen: bool = false;
+    if (!chosen) {
+        if (self.sim.reg.resources.get("minecraft:dirt")) |r_dirt| switch (r_dirt) {
+            .Uniform => |u| if (findRectForPath(paths.items, built.rects, u.all_path)) |rc| {
+                self.atlas_uv_offset = .{ rc.u0, rc.v0 };
+                self.atlas_uv_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
+                chosen = true;
+            },
+            else => {},
+        };
+    }
+    if (!chosen) {
+        if (self.sim.reg.resources.get("minecraft:grass_block")) |res| switch (res) {
+            .Facing => |f| if (findRectForPath(paths.items, built.rects, f.face_path)) |rc| {
+                self.atlas_uv_offset = .{ rc.u0, rc.v0 };
+                self.atlas_uv_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
+                chosen = true;
+            },
+            .Uniform => |u| if (findRectForPath(paths.items, built.rects, u.all_path)) |rc| {
+                self.atlas_uv_offset = .{ rc.u0, rc.v0 };
+                self.atlas_uv_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
+                chosen = true;
+            },
+            .Void => {},
+        };
+    }
+    if (!chosen) {
+        if (self.sim.reg.resources.get("minecraft:stone")) |r_stone| switch (r_stone) {
+            .Uniform => |u| if (findRectForPath(paths.items, built.rects, u.all_path)) |rc| {
+                self.atlas_uv_offset = .{ rc.u0, rc.v0 };
+                self.atlas_uv_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
+                chosen = true;
+            },
+            else => {},
+        };
+    }
+    if (!chosen and built.rects.len > 0) {
+        const rc = built.rects[0];
+        self.atlas_uv_offset = .{ rc.u0, rc.v0 };
+        self.atlas_uv_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
+    }
+
+    // Compute per-face transforms
+    // Top: prefer grass_block face, fallback to dirt, then stone, then default
+    var top_set = false;
+    if (!top_set) {
+        if (self.sim.reg.resources.get("minecraft:grass_block")) |res| switch (res) {
+            .Facing => |f| if (findRectForPath(paths.items, built.rects, f.face_path)) |rc| {
+                self.atlas_uv_top_offset = .{ rc.u0, rc.v0 };
+                self.atlas_uv_top_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
+                top_set = true;
+            },
+            else => {},
+        };
+    }
+    if (!top_set) {
+        if (self.sim.reg.resources.get("minecraft:dirt")) |r_dirt2| switch (r_dirt2) {
+            .Uniform => |u| if (findRectForPath(paths.items, built.rects, u.all_path)) |rc| {
+                self.atlas_uv_top_offset = .{ rc.u0, rc.v0 };
+                self.atlas_uv_top_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
+                top_set = true;
+            },
+            else => {},
+        };
+    }
+    if (!top_set) {
+        self.atlas_uv_top_offset = self.atlas_uv_offset;
+        self.atlas_uv_top_scale = self.atlas_uv_scale;
+    }
+
+    // Side: prefer grass_block other (dirt), fallback to dirt, then stone, then default
+    var side_set = false;
+    if (!side_set) {
+        if (self.sim.reg.resources.get("minecraft:grass_block")) |res2| switch (res2) {
+            .Facing => |f| if (findRectForPath(paths.items, built.rects, f.other_path)) |rc| {
+                self.atlas_uv_side_offset = .{ rc.u0, rc.v0 };
+                self.atlas_uv_side_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
+                side_set = true;
+            },
+            else => {},
+        };
+    }
+    if (!side_set) {
+        if (self.sim.reg.resources.get("minecraft:dirt")) |r_dirt3| switch (r_dirt3) {
+            .Uniform => |u| if (findRectForPath(paths.items, built.rects, u.all_path)) |rc| {
+                self.atlas_uv_side_offset = .{ rc.u0, rc.v0 };
+                self.atlas_uv_side_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
+                side_set = true;
+            },
+            else => {},
+        };
+    }
+    if (!side_set) {
+        self.atlas_uv_side_offset = self.atlas_uv_offset;
+        self.atlas_uv_side_scale = self.atlas_uv_scale;
+    }
+
+    self.textures_ready = true;
+}
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     sim: *simulation.Simulation,
@@ -72,6 +443,17 @@ pub const Client = struct {
     connected: bool = false,
     // Connection/ready state
     ready: bool = false,
+
+    // Texture/atlas preloading state
+    textures_ready: bool = false,
+    // UV transform defaults for the current demo material
+    atlas_uv_scale: [2]f32 = .{ 1, 1 },
+    atlas_uv_offset: [2]f32 = .{ 0, 0 },
+    // Per-face transforms for the simple terrain surface (top uses grass top; sides use dirt)
+    atlas_uv_top_scale: [2]f32 = .{ 1, 1 },
+    atlas_uv_top_offset: [2]f32 = .{ 0, 0 },
+    atlas_uv_side_scale: [2]f32 = .{ 1, 1 },
+    atlas_uv_side_offset: [2]f32 = .{ 0, 0 },
 
     // UI / rendering state
     pass_action: sg.PassAction = .{},
@@ -83,6 +465,7 @@ pub const Client = struct {
     pip: sg.Pipeline = .{},
     vbuf: sg.Buffer = .{},
     bind: sg.Bindings = .{},
+    // We reuse grass_* for the atlas image/view binding for now
     grass_img: sg.Image = .{},
     grass_view: sg.View = .{},
     sampler: sg.Sampler = .{},
@@ -197,15 +580,10 @@ pub const Client = struct {
         self.bind.vertex_buffers[0] = self.vbuf;
         self.pass_action.depth = .{ .load_action = .CLEAR, .clear_value = 1.0 };
 
-        // pick grass top texture from registry
-        if (self.sim.reg.resources.get("vox:grass")) |res| {
-            switch (res) {
-                .Facing => |f| self.grass_img = f.face_tex,
-                .Uniform => |u| self.grass_img = u.all,
-                .Void => self.grass_img = .{},
-            }
-        }
-        // create a view and sampler for the texture
+        // Build texture atlas from registry resource paths
+        buildTextureAtlas(self);
+
+        // create a view and sampler for the atlas (reusing grass_* fields)
         self.grass_view = sg.makeView(.{ .texture = .{ .image = self.grass_img } });
         self.sampler = sg.makeSampler(.{ .min_filter = .NEAREST, .mag_filter = .NEAREST, .mipmap_filter = .NEAREST, .wrap_u = .REPEAT, .wrap_v = .REPEAT });
         // shader expects VIEW_tex_texture at slot 1 and SMP_tex_sampler at slot 2
@@ -220,22 +598,31 @@ pub const Client = struct {
     }
 
     fn buildChunkSurfaceMesh(self: *Client, out: *std.ArrayList(Vertex)) usize {
+        const uv_scale_top = self.atlas_uv_top_scale;
+        const uv_offset_top = self.atlas_uv_top_offset;
+        const uv_scale_side = self.atlas_uv_side_scale;
+        const uv_offset_side = self.atlas_uv_side_offset;
         // Render all loaded chunks in the overworld
-        const wk = "vox:overworld";
+        const wk = "minecraft:overworld";
         self.sim.worlds_mutex.lock();
         defer self.sim.worlds_mutex.unlock();
         const ws = self.sim.worlds_state.getPtr(wk) orelse return 0;
 
         // Helpers to append a quad (two triangles) with CCW winding
         const addQuad = struct {
-            fn call(list: *std.ArrayList(Vertex), v0: [3]f32, v1: [3]f32, v2: [3]f32, v3: [3]f32, uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32) void {
+            fn call(list: *std.ArrayList(Vertex), v0: [3]f32, v1: [3]f32, v2: [3]f32, v3: [3]f32, uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32, uv_scale_p: [2]f32, uv_offset_p: [2]f32) void {
+                // Apply atlas transform
+                const t0 = .{ uv0[0] * uv_scale_p[0] + uv_offset_p[0], uv0[1] * uv_scale_p[1] + uv_offset_p[1] };
+                const t1 = .{ uv1[0] * uv_scale_p[0] + uv_offset_p[0], uv1[1] * uv_scale_p[1] + uv_offset_p[1] };
+                const t2 = .{ uv2[0] * uv_scale_p[0] + uv_offset_p[0], uv2[1] * uv_scale_p[1] + uv_offset_p[1] };
+                const t3 = .{ uv3[0] * uv_scale_p[0] + uv_offset_p[0], uv3[1] * uv_scale_p[1] + uv_offset_p[1] };
                 // Emit triangles with flipped winding so CCW remains front-facing under the chosen view handedness
-                list.appendAssumeCapacity(.{ .pos = v0, .uv = uv0 });
-                list.appendAssumeCapacity(.{ .pos = v2, .uv = uv2 });
-                list.appendAssumeCapacity(.{ .pos = v1, .uv = uv1 });
-                list.appendAssumeCapacity(.{ .pos = v0, .uv = uv0 });
-                list.appendAssumeCapacity(.{ .pos = v3, .uv = uv3 });
-                list.appendAssumeCapacity(.{ .pos = v2, .uv = uv2 });
+                list.appendAssumeCapacity(.{ .pos = v0, .uv = t0 });
+                list.appendAssumeCapacity(.{ .pos = v2, .uv = t2 });
+                list.appendAssumeCapacity(.{ .pos = v1, .uv = t1 });
+                list.appendAssumeCapacity(.{ .pos = v0, .uv = t0 });
+                list.appendAssumeCapacity(.{ .pos = v3, .uv = t3 });
+                list.appendAssumeCapacity(.{ .pos = v2, .uv = t2 });
             }
         }.call;
 
@@ -285,6 +672,8 @@ pub const Client = struct {
                             .{ 0, 1 },
                             .{ 1, 1 },
                             .{ 1, 0 },
+                            uv_scale_top,
+                            uv_offset_top,
                         );
                         // Sides if neighbor lower (within the same chunk). For inter-chunk gaps, we'll
                         // handle neighbors later — this renders a simple "wall" at chunk borders for now.
@@ -301,6 +690,8 @@ pub const Client = struct {
                                 .{ 0, (y_top - y0) },
                                 .{ 1, (y_top - y0) },
                                 .{ 1, 0 },
+                                uv_scale_side,
+                                uv_offset_side,
                             );
                         }
                         const h_e = getH(&hm, xi + 1, zi);
@@ -316,6 +707,8 @@ pub const Client = struct {
                                 .{ 0, (y_top - y0) },
                                 .{ 1, (y_top - y0) },
                                 .{ 1, 0 },
+                                uv_scale_side,
+                                uv_offset_side,
                             );
                         }
                         const h_n = getH(&hm, xi, zi - 1);
@@ -331,6 +724,8 @@ pub const Client = struct {
                                 .{ 0, (y_top - y0) },
                                 .{ 1, (y_top - y0) },
                                 .{ 1, 0 },
+                                uv_scale_side,
+                                uv_offset_side,
                             );
                         }
                         const h_s = getH(&hm, xi, zi + 1);
@@ -346,6 +741,8 @@ pub const Client = struct {
                                 .{ 0, (y_top - y0) },
                                 .{ 1, (y_top - y0) },
                                 .{ 1, 0 },
+                                uv_scale_side,
+                                uv_offset_side,
                             );
                         }
                     }
@@ -359,7 +756,7 @@ pub const Client = struct {
         if (self.ready) return;
         // Determine the player's current chunk and see if it's loaded
         // For now, assume the single-world prototype key
-        const wk = "vox:overworld";
+        const wk = "minecraft:overworld";
         // Read player position under the connections mutex
         self.sim.connections_mutex.lock();
         var has_pos = false;
@@ -388,6 +785,28 @@ pub const Client = struct {
         self.updateCameraFromPlayer();
 
         sg.beginPass(.{ .action = self.pass_action, .swapchain = sglue.swapchain() });
+
+        // If textures not ready, draw a Texturing overlay and return early
+        if (!self.textures_ready) {
+            const scale: f32 = self.ui_scale;
+            const w_px: f32 = @floatFromInt(sapp.width());
+            const h_px: f32 = @floatFromInt(sapp.height());
+            sdtx.canvas(w_px / scale, h_px / scale);
+            sdtx.origin(0, 0);
+            sdtx.font(4);
+            const msg: [:0]const u8 = "Texturing...";
+            const cols: f32 = (w_px / scale) / 8.0;
+            const rows: f32 = (h_px / scale) / 8.0;
+            const col_start: f32 = @max(0.0, (cols - @as(f32, @floatFromInt(msg.len))) / 2.0);
+            const row_start: f32 = @max(0.0, rows / 2.0);
+            sdtx.pos(col_start, row_start);
+            sdtx.color3b(255, 255, 255);
+            sdtx.puts(msg);
+            sdtx.draw();
+            sg.endPass();
+            sg.commit();
+            return;
+        }
 
         // If not ready, draw a simple Connecting overlay and return early
         if (!self.ready) {

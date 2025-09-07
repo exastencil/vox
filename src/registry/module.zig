@@ -11,11 +11,17 @@ pub const Version = struct {
     patch: u16 = 0,
 };
 
+pub const InitFn = *const fn (ctx: ?*anyopaque) anyerror!void;
+
 pub const Def = struct {
     key: []const u8, // namespace/name, e.g. "vox/blocks"
     display_name: []const u8, // e.g. "Blocks for Vox Aetatum"
     version: Version, // semantic version for compatibility checks
     requires: []const []const u8, // required module keys
+
+    // Optional initialization hook to register content into registries beyond worldgen.
+    // The ctx pointer is provided by the host and expected to be a *registry.Registry cast to *anyopaque.
+    init: ?InitFn = null,
 
     // Worldgen definitions provided by this module (static references)
     worldgen: []const WorldGen.Def = &[_]WorldGen.Def{},

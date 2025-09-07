@@ -130,19 +130,7 @@ export fn init() void {
         r.deinit();
         return;
     };
-    const plains_biome = r.addBiome("vox:plains") catch 0;
-    _ = r.addBlock("core:stone") catch {};
-    const grass_id = r.addBlock("vox:grass") catch 0;
-    const dirt_id = r.addBlock("vox:dirt") catch 0;
-
-    r.worlds.addWorldWithGen("vox:overworld", "The Overworld", 4, .{
-        .key = "core:superflat",
-        .blocks = &[_]ids.BlockStateId{ grass_id, dirt_id },
-        .biomes = &[_]ids.BiomeId{plains_biome},
-    }) catch {
-        r.deinit();
-        return;
-    };
+    // Load all modules and register their worldgen and content
     inline for (vox_modules.modules) |m| {
         r.modules.add(m.key, m.display_name, m.version, m.requires, m.worldgen) catch {
             r.deinit();
@@ -156,21 +144,20 @@ export fn init() void {
                 return;
             };
         }
+        if (m.init) |f| {
+            const ctx: *anyopaque = @ptrCast(&r);
+            f(ctx) catch {
+                r.deinit();
+                return;
+            };
+        }
     }
+    // (modules loaded above)
 
     reg = r;
 
     // graphics setup (UI origin at top-left per project rule)
     sg.setup(.{ .environment = sglue.environment(), .logger = .{ .func = slog.func } });
-
-    // Load textures from registry
-    if (reg) |*rp| {
-        const dirt_tex = loadOrFallback(gpa.allocator(), "resources/textures/blocks/vox/dirt.png");
-        const grass_top_tex = loadOrFallback(gpa.allocator(), "resources/textures/blocks/vox/grass/face.png");
-        const grass_side_tex = loadOrFallback(gpa.allocator(), "resources/textures/blocks/vox/grass/other.png");
-        rp.resources.setUniform("vox:dirt", dirt_tex) catch {};
-        rp.resources.setFacing("vox:grass", grass_top_tex, grass_side_tex) catch {};
-    }
 
     // Client-only build owns a Simulation instance for client-side state/prediction, but does not run it.
     const sim = simulation.Simulation.initMemory(allocator, &reg.?, 4) catch {

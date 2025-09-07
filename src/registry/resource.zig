@@ -1,6 +1,4 @@
 const std = @import("std");
-const sokol = @import("sokol");
-const sg = sokol.gfx;
 
 // A very small resource registry focused on block rendering resources.
 // Blocks can be assigned one of three resource styles:
@@ -8,7 +6,11 @@ const sg = sokol.gfx;
 // - Uniform:  same texture on all faces
 // - Facing:   one specified face uses a unique texture, all others share one texture
 //
-// Texture references are stored by string keys for now (e.g. "core:stone").
+// IMPORTANT: To keep server/headless builds free of graphics dependencies, this
+// registry stores string paths to texture assets instead of GPU image handles.
+// Client/full builds are responsible for loading these paths into sg.Image
+// handles at runtime.
+//
 // This registry is independent of block definitions, allowing resource packs to
 // override visuals without redefining blocks.
 
@@ -24,12 +26,12 @@ pub const Face = enum {
 pub const BlockRes = union(enum) {
     Void: void,
     Uniform: struct {
-        all: sg.Image, // texture for all faces
+        all_path: []const u8, // path to texture for all faces
     },
     Facing: struct {
         // one face has a different texture, face selection is handled elsewhere
-        face_tex: sg.Image,
-        other_tex: sg.Image,
+        face_path: []const u8,
+        other_path: []const u8,
     },
 };
 
@@ -43,9 +45,20 @@ pub const Registry = struct {
     }
 
     pub fn deinit(self: *Registry) void {
-        // Free owned keys; textures are external handles managed by the renderer
-        var it = self.by_block.keyIterator();
-        while (it.next()) |kptr| self.allocator.free(kptr.*);
+        // Free owned keys and any owned path strings
+        var vit = self.by_block.valueIterator();
+        while (vit.next()) |vptr| {
+            switch (vptr.*) {
+                .Uniform => |u| self.allocator.free(@constCast(u.all_path)),
+                .Facing => |f| {
+                    self.allocator.free(@constCast(f.face_path));
+                    self.allocator.free(@constCast(f.other_path));
+                },
+                .Void => {},
+            }
+        }
+        var kit = self.by_block.keyIterator();
+        while (kit.next()) |kptr| self.allocator.free(kptr.*);
         self.by_block.deinit();
     }
 
@@ -55,13 +68,16 @@ pub const Registry = struct {
         try self.replace(block_key, .{ .Void = {} });
     }
 
-    pub fn setUniform(self: *Registry, block_key: []const u8, all_tex: sg.Image) !void {
-        const res = BlockRes{ .Uniform = .{ .all = all_tex } };
+    pub fn setUniformPath(self: *Registry, block_key: []const u8, all_path_in: []const u8) !void {
+        const owned_path = try self.allocator.dupe(u8, all_path_in);
+        const res = BlockRes{ .Uniform = .{ .all_path = owned_path } };
         try self.replace(block_key, res);
     }
 
-    pub fn setFacing(self: *Registry, block_key: []const u8, face_tex: sg.Image, other_tex: sg.Image) !void {
-        const res = BlockRes{ .Facing = .{ .face_tex = face_tex, .other_tex = other_tex } };
+    pub fn setFacingPaths(self: *Registry, block_key: []const u8, face_path_in: []const u8, other_path_in: []const u8) !void {
+        const face_owned = try self.allocator.dupe(u8, face_path_in);
+        const other_owned = try self.allocator.dupe(u8, other_path_in);
+        const res = BlockRes{ .Facing = .{ .face_path = face_owned, .other_path = other_owned } };
         try self.replace(block_key, res);
     }
 
@@ -71,8 +87,16 @@ pub const Registry = struct {
     }
 
     fn replace(self: *Registry, block_key: []const u8, res: BlockRes) !void {
-        // If entry exists, replace value in-place
+        // If entry exists, free any previously owned paths and replace value
         if (self.by_block.getPtr(block_key)) |p| {
+            switch (p.*) {
+                .Uniform => |u| self.allocator.free(@constCast(u.all_path)),
+                .Facing => |f| {
+                    self.allocator.free(@constCast(f.face_path));
+                    self.allocator.free(@constCast(f.other_path));
+                },
+                .Void => {},
+            }
             p.* = res;
             return;
         }
@@ -96,13 +120,9 @@ test "resource: register void, uniform, facing and retrieve" {
     defer reg.deinit();
 
     try reg.setVoid("core:air");
-    // Mock image handles (no real gfx setup needed for registry tests)
-    const tex_stone: sg.Image = .{};
-    const tex_grass_top: sg.Image = .{};
-    const tex_grass_side: sg.Image = .{};
 
-    try reg.setUniform("core:stone", tex_stone);
-    try reg.setFacing("core:grass", tex_grass_top, tex_grass_side);
+    try reg.setUniformPath("core:stone", "resources/textures/stone.png");
+    try reg.setFacingPaths("core:grass", "resources/textures/grass_top.png", "resources/textures/grass_side.png");
 
     const air = reg.get("core:air") orelse return error.UnexpectedNull;
     switch (air) {
@@ -113,8 +133,7 @@ test "resource: register void, uniform, facing and retrieve" {
     const stone = reg.get("core:stone") orelse return error.UnexpectedNull;
     switch (stone) {
         .Uniform => |u| {
-            // Just check it's the same handle value we set
-            try testing.expectEqual(tex_stone, u.all);
+            try testing.expectEqualStrings("resources/textures/stone.png", u.all_path);
         },
         else => return error.Invalid,
     }
@@ -122,8 +141,8 @@ test "resource: register void, uniform, facing and retrieve" {
     const grass = reg.get("core:grass") orelse return error.UnexpectedNull;
     switch (grass) {
         .Facing => |f| {
-            try testing.expectEqual(tex_grass_top, f.face_tex);
-            try testing.expectEqual(tex_grass_side, f.other_tex);
+            try testing.expectEqualStrings("resources/textures/grass_top.png", f.face_path);
+            try testing.expectEqualStrings("resources/textures/grass_side.png", f.other_path);
         },
         else => return error.Invalid,
     }

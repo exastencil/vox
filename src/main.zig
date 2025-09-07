@@ -121,26 +121,12 @@ export fn init() void {
         r.deinit();
         return;
     };
-    // register default void biome (id unused here; Simulation will look it up)
+    // register default void biome (id unused here; Simulation may look it up)
     _ = r.addBiome("core:void") catch {
         r.deinit();
         return;
     };
-    // ensure common biomes/blocks used by builtin gens
-    const plains_biome = r.addBiome("vox:plains") catch 0;
-    _ = r.addBlock("core:stone") catch {};
-    const grass_id = r.addBlock("vox:grass") catch 0;
-    const dirt_id = r.addBlock("vox:dirt") catch 0;
 
-    // register default world with superflat worldgen
-    r.worlds.addWorldWithGen("vox:overworld", "The Overworld", 4, .{
-        .key = "core:superflat",
-        .blocks = &[_]ids.BlockStateId{ grass_id, dirt_id },
-        .biomes = &[_]ids.BiomeId{plains_biome},
-    }) catch {
-        r.deinit();
-        return;
-    };
     // Load all modules discovered at build-time and register any worldgen they expose
     inline for (vox_modules.modules) |m| {
         r.modules.add(m.key, m.display_name, m.version, m.requires, m.worldgen) catch {
@@ -155,6 +141,13 @@ export fn init() void {
                 return;
             };
         }
+        if (m.init) |f| {
+            const ctx: *anyopaque = @ptrCast(&r);
+            f(ctx) catch {
+                r.deinit();
+                return;
+            };
+        }
     }
 
     reg = r;
@@ -164,25 +157,6 @@ export fn init() void {
         .environment = sglue.environment(),
         .logger = .{ .func = slog.func },
     });
-
-    // Build textures: prefer PNGs under resources/, fallback to embedded data
-    if (reg) |*rp| {
-        const dirt_tex = loadOrFallback(
-            gpa.allocator(),
-            "resources/textures/blocks/vox/dirt.png",
-        );
-        const grass_top_tex = loadOrFallback(
-            gpa.allocator(),
-            "resources/textures/blocks/vox/grass/face.png",
-        );
-        const grass_side_tex = loadOrFallback(
-            gpa.allocator(),
-            "resources/textures/blocks/vox/grass/other.png",
-        );
-
-        rp.resources.setUniform("vox:dirt", dirt_tex) catch {};
-        rp.resources.setFacing("vox:grass", grass_top_tex, grass_side_tex) catch {};
-    }
 
     // Create in-memory simulation with a default height of 4 sections (4*32 = 128)
     const sim = simulation.Simulation.initMemory(allocator, &reg.?, 4) catch {

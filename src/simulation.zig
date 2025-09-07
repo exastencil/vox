@@ -16,7 +16,7 @@ pub const SimulationOptions = struct {
     allocator: std.mem.Allocator,
     registries: *registry.Registry,
     mode: StorageMode,
-    world_key: []const u8 = "vox:overworld",
+    world_key: []const u8 = "minecraft:overworld",
 };
 
 pub const Snapshot = struct {
@@ -313,7 +313,7 @@ pub const Simulation = struct {
             while (it2.next()) |pos_ptr| {
                 const pos = pos_ptr.*;
                 // compute the player's world (assume default for now)
-                const world_key = "vox:overworld";
+                const world_key = "minecraft:overworld";
 
                 // get world def for section count
                 const wd = self_ptr.reg.worlds.get(world_key) orelse continue;
@@ -451,7 +451,7 @@ pub const Simulation = struct {
         // Simple physics: gravity and vertical collision against world surface.
         const dt: f32 = @floatCast(1.0 / self.target_tps);
         const g: f32 = 9.80665; // m/s^2 downward
-        const world_key = "vox:overworld"; // single-world prototype
+        const world_key = "minecraft:overworld"; // single-world prototype
 
         // Helper to sample top surface (y of top face) from loaded chunks
         const getTopFaceY = struct {
@@ -553,7 +553,7 @@ pub const Simulation = struct {
         try self.players.connectWithId(pid, account_name, account_name);
         // assign player to default world for now
         if (self.player_world.get(pid) == null) {
-            const wk = self.reg.worlds.get("vox:overworld") orelse return;
+            const wk = self.reg.worlds.get("minecraft:overworld") orelse return;
             _ = self.player_world.put(pid, wk.key) catch {};
         }
         _ = try self.ensurePlayerEntityLocked(pid);
@@ -562,7 +562,7 @@ pub const Simulation = struct {
     fn ensurePlayerEntityLocked(self: *Simulation, pid: player.PlayerId) !usize {
         if (self.entity_by_player.get(pid)) |idx| return idx;
         // Determine player's world and spawn at world spawn (adjusted to positive Y)
-        const wk = self.player_world.get(pid) orelse "vox:overworld";
+        const wk = self.player_world.get(pid) orelse "minecraft:overworld";
         const ws = try self.ensureWorldState(wk);
         var sp = ws.spawn_point;
         if (sp.y < 1) sp.y = 1; // ensure positive Y to avoid caves
