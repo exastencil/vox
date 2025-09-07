@@ -5,13 +5,23 @@ set -euo pipefail
 REPO_ROOT=$(git rev-parse --show-toplevel)
 cd "$REPO_ROOT"
 
-# 1) Format Zig source files under src/ and stage any changes
+# 1) Format Zig source files under src/, excluding generated shaders, and stage any changes
 if command -v zig >/dev/null 2>&1; then
   if [ -d src ]; then
-    echo "Formatting Zig sources in src/..."
-    zig fmt src
-    # Stage any formatting changes so they’re included in this commit
-    git add -A src
+    echo "Formatting Zig sources in src/... (excluding src/shaders and src/generated)"
+    files=()
+    while IFS= read -r -d '' f; do files+=("$f"); done < <(
+      find src \
+        \( -path 'src/shaders' -o -path 'src/generated' \) -prune -o \
+        -type f -name '*.zig' -print0
+    )
+    if [ "${#files[@]}" -gt 0 ]; then
+      zig fmt "${files[@]}"
+      # Stage only formatted files
+      git add -- "${files[@]}"
+    else
+      echo "No Zig files to format."
+    fi
   else
     echo "No src/ directory found; skipping Zig formatting."
   fi
