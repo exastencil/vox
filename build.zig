@@ -75,6 +75,7 @@ pub fn build(b: *Build) !void {
     const mod_ids = b.createModule(.{ .root_source_file = b.path("src/ids.zig"), .target = target, .optimize = optimize });
     const mod_constants = b.createModule(.{ .root_source_file = b.path("src/constants.zig"), .target = target, .optimize = optimize });
     const mod_gs = b.createModule(.{ .root_source_file = b.path("src/gs.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ids", .module = mod_ids }, .{ .name = "constants", .module = mod_constants } } });
+    const mod_noise = b.createModule(.{ .root_source_file = b.path("src/noise.zig"), .target = target, .optimize = optimize });
 
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -85,6 +86,7 @@ pub fn build(b: *Build) !void {
             .{ .name = "gs", .module = mod_gs },
             .{ .name = "ids", .module = mod_ids },
             .{ .name = "constants", .module = mod_constants },
+            .{ .name = "noise", .module = mod_noise },
         },
     });
 
@@ -134,6 +136,16 @@ pub fn build(b: *Build) !void {
 
     // Unit test runner
     const test_step = b.step("test", "Run unit tests");
+
+    // Noise tests
+    const tests_noise = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/noise/simplex.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&tests_noise.step);
 
     // Additional registry and module tests re-enabled
 
