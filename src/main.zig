@@ -91,6 +91,7 @@ const simulation = @import("simulation.zig");
 const player = @import("player.zig");
 const client_mod = @import("client.zig");
 const builtin = @import("builtin");
+const vox_modules = @import("generated/vox_modules.zig");
 
 const State = struct {
     pass_action: sg.PassAction = .{},
@@ -140,18 +141,21 @@ export fn init() void {
         r.deinit();
         return;
     };
-    // register built-in worldgen types
-    r.worldgen.add("core:void", "Void", registry.WorldGen.selectVoid, registry.WorldGen.selectBlockVoid) catch {
-        r.deinit();
-        return;
-    };
-    r.worldgen.add("core:superflat", "Superflat", registry.WorldGen.selectSuperflat, registry.WorldGen.selectBlockSuperflat) catch {
-        r.deinit();
-        return;
-    };
-    // ensure common biomes/blocks used by builtin gens
-    _ = r.addBiome("vox:plains") catch {};
-    _ = r.addBlock("core:stone") catch {};
+    // Load all modules discovered at build-time and register any worldgen they expose
+    inline for (vox_modules.modules) |m| {
+        r.modules.add(m.key, m.display_name, m.version, m.requires, m.worldgen) catch {
+            r.deinit();
+            return;
+        };
+        var j: usize = 0;
+        while (j < m.worldgen.len) : (j += 1) {
+            const wg = m.worldgen[j];
+            r.worldgen.add(wg.key, wg.display_name, wg.select_biome, wg.select_block) catch {
+                r.deinit();
+                return;
+            };
+        }
+    }
 
     reg = r;
 

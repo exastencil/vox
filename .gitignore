@@ -1,3 +1,6 @@
+# Generated source
+src/generated
+
 # Zig build cache
 zig-out
 .zig-cache

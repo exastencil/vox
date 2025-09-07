@@ -1,23 +1,91 @@
 const std = @import("std");
 const Build = std.Build;
 
+fn collectModuleFiles(allocator: std.mem.Allocator, dir_path: []const u8, list: *std.ArrayList([]const u8)) !void {
+    var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        switch (entry.kind) {
+            .file => {
+                if (std.mem.endsWith(u8, entry.name, ".zig")) {
+                    const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+                    try list.append(allocator, full);
+                }
+            },
+            .directory => {
+                if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+                const child = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+                try collectModuleFiles(allocator, child, list);
+            },
+            else => {},
+        }
+    }
+}
+
+fn generateModulesIndex(b: *Build, files: []const []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(b.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var out = try std.ArrayList(u8).initCapacity(allocator, 0);
+    const w = out.writer(allocator);
+    // Emit root-owned imports of each module file using absolute paths
+    var i: usize = 0;
+    while (i < files.len) : (i += 1) {
+        const abs = b.path(files[i]).getPath(b);
+        try w.print("const m{d} = @import(\"{s}\");\n", .{ i, abs });
+    }
+    try w.writeAll("\n");
+    try w.writeAll("pub const modules = .{\n");
+    i = 0;
+    while (i < files.len) : (i += 1) {
+        try w.print("    m{d}.module,\n", .{ i });
+    }
+    try w.writeAll("};\n");
+
+    const contents = out.items;
+    // Write into the source tree so main.zig can import it as part of the root module
+    try std.fs.cwd().makePath("src/generated");
+    var f = try std.fs.cwd().createFile("src/generated/vox_modules.zig", .{ .read = true, .truncate = true });
+    defer f.close();
+    try f.writeAll(contents);
+}
+
 pub fn build(b: *Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
     const dep_sokol = b.dependency("sokol", .{ .target = target, .optimize = optimize });
 
+    // Discover modules and generate a compile-time index
+    var arena = std.heap.ArenaAllocator.init(b.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var files = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+    collectModuleFiles(allocator, "src/modules", &files) catch |e| switch (e) {
+        error.FileNotFound, error.NotDir => {},
+        else => return e,
+    };
+
+    try generateModulesIndex(b, files.items);
+
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "sokol", .module = dep_sokol.module("sokol") }},
+        .imports = &.{
+            .{ .name = "sokol", .module = dep_sokol.module("sokol") },
+        },
     });
 
     const exe = b.addExecutable(.{
         .name = "vox-aetatum",
         .root_module = root_mod,
     });
+
+    // No-op: modules index is created on disk above before compiling
 
     // If sokol-shdc is available, generate the Zig shader from GLSL
     // Always run shdc from sokol-tools-bin to generate the cross-platform shader
@@ -94,4 +162,23 @@ pub fn build(b: *Build) !void {
         }),
     });
     test_step.dependOn(&tests_mod.step);
+
+    // Ensure worldgen modules compile and tests (if any) run
+    const tests_wg_void = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/modules/worldgen/void.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&tests_wg_void.step);
+
+    const tests_wg_superflat = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/modules/worldgen/superflat.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&tests_wg_superflat.step);
 }
