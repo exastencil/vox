@@ -37,7 +37,7 @@ const Camera = struct {
         const dx = dir_in[0];
         const dy = dir_in[1];
         const dz = dir_in[2];
-        const len: f32 = @sqrt(dx*dx + dy*dy + dz*dz);
+        const len: f32 = @sqrt(dx * dx + dy * dy + dz * dz);
         if (len > 0.000001) {
             const nx = dx / len;
             const ny = dy / len;
@@ -123,8 +123,7 @@ pub const Client = struct {
             if (sapp.rawMouseSupported()) {
                 sapp.enableRawMouse(on);
             }
-        } else {
-        }
+        } else {}
     }
 
     pub fn deinit(self: *Client) void {
@@ -481,7 +480,7 @@ pub const Client = struct {
                 setRawMouse(false);
                 self.clearMovementInputs();
             },
-.KEY_DOWN => {
+            .KEY_DOWN => {
                 switch (ev.key_code) {
                     .W => self.move_forward = true,
                     .S => self.move_back = true,
@@ -554,7 +553,9 @@ pub const Client = struct {
         if (idx_opt) |idx| {
             if (idx < self.sim.dynamic_entities.items.len) {
                 const e = self.sim.dynamic_entities.items[idx];
-                self.camera.pos = e.pos;
+                // Position camera at the top-center of the player's bounding box (eye-like)
+                const eye_y: f32 = e.pos[1] + e.aabb_half_extents[1];
+                self.camera.pos = .{ e.pos[0], eye_y, e.pos[2] };
                 self.camera.setDir(e.look_dir);
                 self.camera.roll = e.yaw_pitch_roll[2];
             }
@@ -581,19 +582,33 @@ pub const Client = struct {
                     fwd_z = @sin(yaw);
                     flen = @sqrt(fwd_x * fwd_x + fwd_z * fwd_z);
                 }
-                fwd_x /= flen; fwd_z /= flen;
+                fwd_x /= flen;
+                fwd_z /= flen;
                 const right_x: f32 = fwd_z; // rotate forward 90° CCW for right (corrected)
                 const right_z: f32 = -fwd_x;
                 var vx: f32 = 0;
                 var vz: f32 = 0;
-                if (self.move_forward) { vx += fwd_x; vz += fwd_z; }
-                if (self.move_back)    { vx -= fwd_x; vz -= fwd_z; }
-                if (self.move_right)   { vx += right_x; vz += right_z; }
-                if (self.move_left)    { vx -= right_x; vz -= right_z; }
+                if (self.move_forward) {
+                    vx += fwd_x;
+                    vz += fwd_z;
+                }
+                if (self.move_back) {
+                    vx -= fwd_x;
+                    vz -= fwd_z;
+                }
+                if (self.move_right) {
+                    vx += right_x;
+                    vz += right_z;
+                }
+                if (self.move_left) {
+                    vx -= right_x;
+                    vz -= right_z;
+                }
                 // Normalize if any input
                 const mag: f32 = @sqrt(vx * vx + vz * vz);
                 if (mag > 0.0001) {
-                    vx /= mag; vz /= mag;
+                    vx /= mag;
+                    vz /= mag;
                 }
                 const speed: f32 = 4.5; // m/s walking speed
                 e.vel[0] = vx * speed;
