@@ -1,10 +1,10 @@
 const std = @import("std");
-const gs = @import("gs.zig");
-const ids = @import("ids.zig");
+const gs = @import("gs");
+const ids = @import("ids");
 const registry = @import("registry.zig");
 const worldgen = @import("worldgen.zig");
 const wapi = @import("worldgen_api.zig");
-const constants = @import("constants.zig");
+const constants = @import("constants");
 const player = @import("player.zig");
 
 pub const StorageMode = union(enum) {

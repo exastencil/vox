@@ -71,12 +71,20 @@ pub fn build(b: *Build) !void {
 
     try generateModulesIndex(b, files.items);
 
+    // Named core modules used across the build
+    const mod_ids = b.createModule(.{ .root_source_file = b.path("src/ids.zig"), .target = target, .optimize = optimize });
+    const mod_constants = b.createModule(.{ .root_source_file = b.path("src/constants.zig"), .target = target, .optimize = optimize });
+    const mod_gs = b.createModule(.{ .root_source_file = b.path("src/gs.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ids", .module = mod_ids }, .{ .name = "constants", .module = mod_constants } } });
+
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "sokol", .module = dep_sokol.module("sokol") },
+            .{ .name = "gs", .module = mod_gs },
+            .{ .name = "ids", .module = mod_ids },
+            .{ .name = "constants", .module = mod_constants },
         },
     });
 
@@ -84,6 +92,8 @@ pub fn build(b: *Build) !void {
         .name = "vox-aetatum",
         .root_module = root_mod,
     });
+
+    // For tests we will use wrappers with root at src/ so relative imports work
 
     // No-op: modules index is created on disk above before compiling
 
@@ -135,7 +145,7 @@ pub fn build(b: *Build) !void {
             .root_source_file = b.path("src/registry.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{ .{ .name = "sokol", .module = dep_sokol.module("sokol") } },
+            .imports = &.{ .{ .name = "sokol", .module = dep_sokol.module("sokol") }, .{ .name = "gs", .module = mod_gs }, .{ .name = "ids", .module = mod_ids } },
         }),
     });
     test_step.dependOn(&tests_reg.step);
@@ -146,7 +156,7 @@ pub fn build(b: *Build) !void {
             .root_source_file = b.path("src/registry/resource.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{ .{ .name = "sokol", .module = dep_sokol.module("sokol") } },
+            .imports = &.{ .{ .name = "sokol", .module = dep_sokol.module("sokol") }, .{ .name = "gs", .module = mod_gs }, .{ .name = "ids", .module = mod_ids } },
         }),
     });
     test_step.dependOn(&tests_res.step);
@@ -157,9 +167,30 @@ pub fn build(b: *Build) !void {
             .root_source_file = b.path("src/registry_module_test.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{ .{ .name = "gs", .module = mod_gs }, .{ .name = "ids", .module = mod_ids } },
         }),
     });
     test_step.dependOn(&tests_mod.step);
 
-    // Worldgen module tests disabled for now; they require a named-import setup incompatible with the main build's relative-import structure.
+    // Worldgen modules (void, superflat) compile with named imports
+    // Module worldgen compile tests (with named gs/ids/constants)
+    const tests_wg_void = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/worldgen_void_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{ .{ .name = "gs", .module = mod_gs }, .{ .name = "ids", .module = mod_ids }, .{ .name = "constants", .module = mod_constants } },
+        }),
+    });
+    test_step.dependOn(&tests_wg_void.step);
+
+    const tests_wg_superflat = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/worldgen_superflat_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{ .{ .name = "gs", .module = mod_gs }, .{ .name = "ids", .module = mod_ids }, .{ .name = "constants", .module = mod_constants } },
+        }),
+    });
+    test_step.dependOn(&tests_wg_superflat.step);
 }

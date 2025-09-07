@@ -1,6 +1,6 @@
 const std = @import("std");
-const constants = @import("constants.zig");
-const ids = @import("ids.zig");
+const constants = @import("constants");
+const ids = @import("ids");
 
 pub const BlockPos = struct {
     x: i32,

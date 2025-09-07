@@ -1,7 +1,7 @@
 const std = @import("std");
-const gs = @import("gs.zig");
-const ids = @import("ids.zig");
-const constants = @import("constants.zig");
+const gs = @import("gs");
+const ids = @import("ids");
+const constants = @import("constants");
 const wgen = @import("registry/worldgen.zig");
 const wapi = @import("worldgen_api.zig");
 
@@ -13,7 +13,7 @@ pub fn protoInit(allocator: std.mem.Allocator, section_count_y: u16, pos: gs.Chu
     const tops_len: usize = constants.chunk_size_x * constants.chunk_size_z;
     const tops = try allocator.alloc(i32, tops_len);
     @memset(tops, -1);
-    return .{ .allocator = allocator, .section_count_y = section_count_y, .pos = pos, .tops = tops };
+    return .{ .allocator = allocator, .section_count_y = section_count_y, .pos = .{ .x = pos.x, .z = pos.z }, .tops = tops };
 }
 
 pub fn protoDeinit(proto: *wapi.ProtoChunk) void {
@@ -24,26 +24,26 @@ pub fn protoDeinit(proto: *wapi.ProtoChunk) void {
 }
 
 fn callBiomesHook(proto: *wapi.ProtoChunk, seed: u64, def: wgen.Def, params: wgen.Params) !void {
-    if (proto.status != .empty) return;
+    if (@as(gs.ChunkStatus, @enumFromInt(proto.status)) != .empty) return;
     try wapi.ensureBiomesAllocated(proto);
     if (def.biomes) |f| {
         try f(seed, proto, params);
     }
-    proto.status = .biomes;
+    proto.status = @intFromEnum(gs.ChunkStatus.biomes);
 }
 
 fn callNoiseHook(proto: *wapi.ProtoChunk, seed: u64, def: wgen.Def, params: wgen.Params, lookup: wgen.BlockLookup) !void {
-    if (proto.status != .biomes) return;
+    if (@as(gs.ChunkStatus, @enumFromInt(proto.status)) != .biomes) return;
     try wapi.ensureBlocksAllocated(proto);
     @memset(proto.tops, -1);
     if (def.noise) |f| {
         try f(seed, proto, params, lookup);
     }
-    proto.status = .noise;
+    proto.status = @intFromEnum(gs.ChunkStatus.noise);
 }
 
 fn advanceNoop(proto: *wapi.ProtoChunk, next: gs.ChunkStatus) void {
-    proto.status = next;
+    proto.status = @intFromEnum(next);
 }
 
 pub fn advanceOnePhase(
@@ -55,7 +55,7 @@ pub fn advanceOnePhase(
     air_id: ids.BlockStateId,
 ) !?gs.Chunk {
     _ = air_id; // not used by hook APIs directly; blocks should be set explicitly by noise/surface hooks
-    switch (proto.status) {
+    switch (@as(gs.ChunkStatus, @enumFromInt(proto.status))) {
         .empty => {
             try callBiomesHook(proto, seed, def, params);
             return null;
@@ -96,7 +96,7 @@ pub fn advanceOnePhase(
         .spawn => {
             if (def.spawn) |f| _ = f(seed, proto, params) catch {};
             const ch = try buildChunkFromBuffers(proto);
-            proto.status = .full;
+            proto.status = @intFromEnum(gs.ChunkStatus.full);
             return ch;
         },
         .structures_starts, .structures_references => {
@@ -203,7 +203,7 @@ fn buildChunkFromBuffers(proto: *const wapi.ProtoChunk) !gs.Chunk {
     }
 
     const entities = try allocator.alloc(gs.EntityRecord, 0);
-    return .{ .pos = proto.pos, .sections = sections, .heightmaps = heightmaps, .entities = entities };
+    return .{ .pos = .{ .x = proto.pos.x, .z = proto.pos.z }, .sections = sections, .heightmaps = heightmaps, .entities = entities };
 }
 
 fn packBitsSet(dst: []u32, idx: usize, bits_per_index: u6, value: u32) void {
@@ -283,7 +283,7 @@ pub fn generateChunk(
     advanceNoop(&proto, .spawn);
 
     const chunk = try buildChunkFromBuffers(&proto);
-    proto.status = .full;
+    proto.status = @intFromEnum(gs.ChunkStatus.full);
     return chunk;
 }
 

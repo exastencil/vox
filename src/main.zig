@@ -83,10 +83,10 @@ fn loadOrFallback(allocator: std.mem.Allocator, path: []const u8) sg.Image {
         });
     }
 }
-const gs = @import("gs.zig");
+const gs = @import("gs");
 const worldgen = @import("worldgen.zig");
 const registry = @import("registry.zig");
-const ids = @import("ids.zig");
+const ids = @import("ids");
 const simulation = @import("simulation.zig");
 const player = @import("player.zig");
 const client_mod = @import("client.zig");

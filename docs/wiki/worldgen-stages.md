@@ -30,23 +30,24 @@ Current core implementation
 
 Registry hooks for mods
 
-Worldgen module definition supports required selectors and optional per-phase hooks:
+Module worldgen hooks (new API):
 
-Required selectors:
+Your worldgen module provides a WorldGen.Def with any subset of these hooks. The engine calls them while advancing a proto-chunk. Implement at least biomes and noise.
 
-- select_biome(seed, BlockPos, Params) -> BiomeId
-- select_block(seed, biome: BiomeId, BlockPos, Params, BlockLookup) -> BlockStateId
+- biomes(seed: u64, proto: *ProtoChunk, params: Params) -> !void
+  - Allocate (ensureBiomesAllocated) and fill proto.biomes_buf for all voxels.
+- noise(seed: u64, proto: *ProtoChunk, params: Params, lookup: BlockLookup) -> !void
+  - Allocate (ensureBlocksAllocated), fill proto.blocks_buf, and update proto.tops per (x,z) column. Use lookup to resolve block IDs (e.g., "core:air").
+- surface(seed, proto, params) -> !void
+- carvers(seed, proto, params) -> !void
+- features(seed, proto, params) -> !void
+- initialize_light(seed, proto, params) -> !void
+- light(seed, proto, params) -> !void
+- spawn(seed, proto, params) -> !void
 
-Optional phase hooks (all parameters subject to evolution as features land):
-
-- structures_starts(seed, ChunkPos, Params)
-- structures_references(seed, ChunkPos, Params)
-- surface(seed, ChunkPos, Params)
-- carvers(seed, ChunkPos, Params)
-- features(seed, ChunkPos, Params)
-- initialize_light(seed, ChunkPos, Params)
-- light(seed, ChunkPos, Params)
-- spawn(seed, ChunkPos, Params)
+Notes:
+- The legacy selector API (select_biome/select_block) has been removed in favor of phase hooks.
+- Params carries world-configured blocks/biomes; BlockLookup resolves named blocks.
 
 Notes:
 

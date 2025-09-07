@@ -1,5 +1,5 @@
 const std = @import("std");
-const ids = @import("../ids.zig");
+const ids = @import("ids");
 
 pub const GenSpec = struct {
     key: []const u8,

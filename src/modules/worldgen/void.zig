@@ -1,8 +1,8 @@
 const Module = @import("../../registry/module.zig");
 const WorldGen = @import("../../registry/worldgen.zig");
 const wapi = @import("../../worldgen_api.zig");
-const gs = @import("../../gs.zig");
-const constants = @import("../../constants.zig");
+const gs = @import("gs");
+const constants = @import("constants");
 
 fn hook_biomes(seed: u64, proto: *wapi.ProtoChunk, params: WorldGen.Params) !void {
     _ = seed;

@@ -1,5 +1,5 @@
 const std = @import("std");
-const ids = @import("ids.zig");
+const ids = @import("ids");
 pub const Block = @import("registry/block.zig");
 pub const Biome = @import("registry/biome.zig");
 pub const World = @import("registry/world.zig");

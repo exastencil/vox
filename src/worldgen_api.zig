@@ -1,7 +1,6 @@
 const std = @import("std");
-const gs = @import("gs.zig");
-const ids = @import("ids.zig");
-const constants = @import("constants.zig");
+const ids = @import("ids");
+const constants = @import("constants");
 
 pub const Params = struct {
     blocks: []const ids.BlockStateId = &[_]ids.BlockStateId{},
@@ -17,8 +16,8 @@ pub const BlockLookup = struct {
 pub const ProtoChunk = struct {
     allocator: std.mem.Allocator,
     section_count_y: u16,
-    pos: gs.ChunkPos,
-    status: gs.ChunkStatus = .empty,
+    pos: struct { x: i32, z: i32 },
+    status: u4 = 0, // gs.ChunkStatus-like; 0==empty
     biomes_buf: ?[]ids.BiomeId = null,
     blocks_buf: ?[]ids.BlockStateId = null,
     tops: []i32, // per-column height tracking
