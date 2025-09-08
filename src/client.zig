@@ -1,6 +1,8 @@
 const std = @import("std");
 const simulation = @import("simulation.zig");
 const player = @import("player.zig");
+const constants = @import("constants");
+const gs = @import("gs");
 const sokol = @import("sokol");
 const sg = sokol.gfx;
 const sapp = sokol.app;
@@ -133,6 +135,39 @@ const Camera = struct {
 };
 
 const Vertex = struct { pos: [3]f32, uv: [2]f32 };
+
+const AtlasTransform = struct {
+    offset: [2]f32,
+    scale: [2]f32,
+};
+
+fn bitsFor(n: usize) u6 {
+    if (n <= 1) return 1;
+    var v: usize = n - 1;
+    var b: u6 = 0;
+    while (v > 0) : (v >>= 1) b += 1;
+    return if (b == 0) 1 else b;
+}
+
+fn unpackBitsGet(src: []const u32, idx: usize, bits_per_index: u6) u32 {
+    // read logical element at index idx where each element has bits_per_index bits
+    const bit_off: usize = idx * @as(usize, bits_per_index);
+    const word_idx: usize = bit_off >> 5; // /32
+    const bit_idx: u5 = @intCast(bit_off & 31);
+    if (bits_per_index == 32) return src[word_idx];
+    const mask: u32 = (@as(u32, 1) << @intCast(bits_per_index)) - 1;
+    const rem: u6 = @as(u6, 32) - @as(u6, bit_idx);
+    if (bits_per_index <= rem) {
+        return (src[word_idx] >> bit_idx) & mask;
+    } else {
+        const lo_bits: u6 = rem;
+        const hi_bits: u6 = @intCast(bits_per_index - lo_bits);
+        const lo_mask: u32 = (@as(u32, 1) << @as(u5, @intCast(lo_bits))) - 1;
+        const lo_val: u32 = (src[word_idx] >> bit_idx) & lo_mask;
+        const hi_val: u32 = (src[word_idx + 1] & ((@as(u32, 1) << @as(u5, @intCast(hi_bits))) - 1)) << @as(u5, @intCast(lo_bits));
+        return lo_val | hi_val;
+    }
+}
 
 fn buildQuadVerts(out: []Vertex, x0: f32, y0: f32, size: f32) usize {
     if (out.len < 6) return 0;
@@ -316,6 +351,9 @@ fn buildTextureAtlas(self: *Client) void {
         return;
     }
 
+    // Clear any previous atlas map entries
+    self.atlas_uv_by_path.clearRetainingCapacity();
+
     const built = buildAtlasFromPaths(self.allocator, paths.items) catch {
         // Fallback as above on failure
         var one = [_]u8{ 255, 0, 255, 255 };
@@ -350,6 +388,15 @@ fn buildTextureAtlas(self: *Client) void {
     });
     self.atlas_w = built.atlas_w;
     self.atlas_h = built.atlas_h;
+
+    // Populate atlas UV map for each source path
+    var i_paths: usize = 0;
+    while (i_paths < paths.items.len) : (i_paths += 1) {
+        const rc = built.rects[i_paths];
+        const tx: AtlasTransform = .{ .offset = .{ rc.u0, rc.v0 }, .scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 } };
+        // Note: keys are owned by registry; we do not dup or free them here
+        _ = self.atlas_uv_by_path.put(paths.items[i_paths], tx) catch {};
+    }
 
     // Choose a default atlas region to use for the current single-material demo mesh.
     // Prefer minecraft:dirt (uniform), otherwise fall back to grass_block face, then stone, then first tile.
@@ -492,6 +539,8 @@ pub const Client = struct {
     sampler: sg.Sampler = .{},
     atlas_w: u32 = 1,
     atlas_h: u32 = 1,
+    // Atlas UV transforms per texture path
+    atlas_uv_by_path: std.StringHashMap(AtlasTransform) = undefined,
 
     // GPU buffer capacity tracking
     vbuf_capacity_bytes: usize = 0,
@@ -533,7 +582,13 @@ pub const Client = struct {
 
     pub fn init(allocator: std.mem.Allocator, sim: *simulation.Simulation, player_id: player.PlayerId, account_name: []const u8) !Client {
         const acc = try allocator.dupe(u8, account_name);
-        return .{ .allocator = allocator, .sim = sim, .player_id = player_id, .account_name = acc };
+        return .{
+            .allocator = allocator,
+            .sim = sim,
+            .player_id = player_id,
+            .account_name = acc,
+            .atlas_uv_by_path = std.StringHashMap(AtlasTransform).init(allocator),
+        };
     }
 
     // Enable/disable raw mouse input if supported by the sokol app wrapper
@@ -546,6 +601,20 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
+        // Release GPU resources if created
+        if (self.vbuf.id != 0) sg.destroyBuffer(self.vbuf);
+        if (self.ui_vbuf.id != 0) sg.destroyBuffer(self.ui_vbuf);
+        if (self.grass_view.id != 0) sg.destroyView(self.grass_view);
+        if (self.sampler.id != 0) sg.destroySampler(self.sampler);
+        if (self.grass_img.id != 0) sg.destroyImage(self.grass_img);
+        if (self.pip.id != 0) sg.destroyPipeline(self.pip);
+        if (self.quad_pip.id != 0) sg.destroyPipeline(self.quad_pip);
+        if (self.shd.id != 0) sg.destroyShader(self.shd);
+
+        // Deinitialize atlas map (values only; keys are borrowed from registry)
+        self.atlas_uv_by_path.deinit();
+
+        // Owned string
         self.allocator.free(self.account_name);
     }
 
@@ -633,7 +702,7 @@ pub const Client = struct {
         self.ui_vbuf_capacity_bytes = ui_initial_bytes;
         self.pass_action.depth = .{ .load_action = .CLEAR, .clear_value = 1.0 };
 
-        // Build texture atlas from registry resource paths
+        // Build texture atlas from registry resource paths (map already initialized in init)
         buildTextureAtlas(self);
 
         // create a view and sampler for the atlas (reusing grass_* fields)
@@ -945,7 +1014,7 @@ pub const Client = struct {
         // Build chunk surface mesh into a dynamic list
         var vert_list = std.ArrayList(Vertex).initCapacity(self.allocator, 0) catch return;
         defer vert_list.deinit(self.allocator);
-        _ = self.buildChunkSurfaceMesh(&vert_list);
+        _ = self.buildChunkBlockMesh(&vert_list);
 
         // Prepare MVP
         const w_px: f32 = @floatFromInt(sapp.width());
@@ -1297,6 +1366,243 @@ pub const Client = struct {
         }
         // consume jump edge
         self.jump_pressed = false;
+    }
+
+    fn isSolidAt(self: *Client, ws: *const simulation.WorldState, start_chunk: *const gs.Chunk, cpos_x_in: i32, cpos_z_in: i32, lx_in: i32, abs_y_in: i32, lz_in: i32) bool {
+        var nx = lx_in;
+        const ny = abs_y_in;
+        var nz = lz_in;
+        var cpos_x = cpos_x_in;
+        var cpos_z = cpos_z_in;
+        var chn: *const gs.Chunk = start_chunk;
+
+        // Cross-chunk in X
+        if (nx < 0) {
+            cpos_x -= 1;
+            const rp_w = simulation.RegionPos{ .x = @divTrunc(cpos_x, 32), .z = @divTrunc(cpos_z, 32) };
+            const rsn = ws.regions.getPtr(rp_w) orelse return false;
+            const idxn = rsn.chunk_index.get(.{ .x = cpos_x, .z = cpos_z }) orelse return false;
+            chn = &rsn.chunks.items[idxn];
+            nx += @as(i32, @intCast(constants.chunk_size_x));
+        } else if (nx >= @as(i32, @intCast(constants.chunk_size_x))) {
+            cpos_x += 1;
+            const rp_e = simulation.RegionPos{ .x = @divTrunc(cpos_x, 32), .z = @divTrunc(cpos_z, 32) };
+            const rsn2 = ws.regions.getPtr(rp_e) orelse return false;
+            const idxn2 = rsn2.chunk_index.get(.{ .x = cpos_x, .z = cpos_z }) orelse return false;
+            chn = &rsn2.chunks.items[idxn2];
+            nx -= @as(i32, @intCast(constants.chunk_size_x));
+        }
+        // Cross-chunk in Z
+        if (nz < 0) {
+            cpos_z -= 1;
+            const rp_n = simulation.RegionPos{ .x = @divTrunc(cpos_x, 32), .z = @divTrunc(cpos_z, 32) };
+            const rsn3 = ws.regions.getPtr(rp_n) orelse return false;
+            const idxn3 = rsn3.chunk_index.get(.{ .x = cpos_x, .z = cpos_z }) orelse return false;
+            chn = &rsn3.chunks.items[idxn3];
+            nz += @as(i32, @intCast(constants.chunk_size_z));
+        } else if (nz >= @as(i32, @intCast(constants.chunk_size_z))) {
+            cpos_z += 1;
+            const rp_s = simulation.RegionPos{ .x = @divTrunc(cpos_x, 32), .z = @divTrunc(cpos_z, 32) };
+            const rsn4 = ws.regions.getPtr(rp_s) orelse return false;
+            const idxn4 = rsn4.chunk_index.get(.{ .x = cpos_x, .z = cpos_z }) orelse return false;
+            chn = &rsn4.chunks.items[idxn4];
+            nz -= @as(i32, @intCast(constants.chunk_size_z));
+        }
+
+        // Y in-bounds
+        const total_y: i32 = @intCast(chn.sections.len * constants.section_height);
+        if (ny < 0 or ny >= total_y) return false;
+        const n_sy_idx: usize = @intCast(@divTrunc(ny, @as(i32, @intCast(constants.section_height))));
+        const n_ly: usize = @intCast(@mod(ny, @as(i32, @intCast(constants.section_height))));
+        const s = chn.sections[n_sy_idx];
+        const bpi: u6 = bitsFor(s.palette.len);
+        const idx: usize = @as(usize, @intCast(nz)) * (constants.chunk_size_x * constants.section_height) + @as(usize, @intCast(nx)) * constants.section_height + n_ly;
+        const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx, bpi));
+        if (pidx >= s.palette.len) return false;
+        const bid: u32 = s.palette[pidx];
+        if (bid == 0) return false;
+        if (bid < self.sim.reg.blocks.items.len) {
+            return self.sim.reg.blocks.items[@intCast(bid)].full_block_collision;
+        }
+        return true;
+    }
+
+    fn buildChunkBlockMesh(self: *Client, out: *std.ArrayList(Vertex)) usize {
+        // Helpers for UV padding and wrapping
+        const pad_u: f32 = if (self.atlas_w > 0) (1.0 / @as(f32, @floatFromInt(self.atlas_w))) else 0.0;
+        const pad_v: f32 = if (self.atlas_h > 0) (1.0 / @as(f32, @floatFromInt(self.atlas_h))) else 0.0;
+        const addQuad = struct {
+            fn wrap01(v: f32) f32 {
+                const f = v - std.math.floor(v);
+                return if (f == 0.0 and v > 0.0) 1.0 else f;
+            }
+            fn call(list: *std.ArrayList(Vertex), v0: [3]f32, v1: [3]f32, v2: [3]f32, v3: [3]f32, uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32, uv_scale_p: [2]f32, uv_offset_p: [2]f32, pad_u_in: f32, pad_v_in: f32) void {
+                const w0x: f32 = wrap01(uv0[0]);
+                const w0y: f32 = wrap01(uv0[1]);
+                const w1x: f32 = wrap01(uv1[0]);
+                const w1y: f32 = wrap01(uv1[1]);
+                const w2x: f32 = wrap01(uv2[0]);
+                const w2y: f32 = wrap01(uv2[1]);
+                const w3x: f32 = wrap01(uv3[0]);
+                const w3y: f32 = wrap01(uv3[1]);
+                const min_u = uv_offset_p[0] + pad_u_in;
+                const min_v = uv_offset_p[1] + pad_v_in;
+                const range_u = @max(0.0, uv_scale_p[0] - 2.0 * pad_u_in);
+                const range_v = @max(0.0, uv_scale_p[1] - 2.0 * pad_v_in);
+                const t0 = .{ min_u + w0x * range_u, min_v + w0y * range_v };
+                const t1 = .{ min_u + w1x * range_u, min_v + w1y * range_v };
+                const t2 = .{ min_u + w2x * range_u, min_v + w2y * range_v };
+                const t3 = .{ min_u + w3x * range_u, min_v + w3y * range_v };
+                list.appendAssumeCapacity(.{ .pos = v0, .uv = t0 });
+                list.appendAssumeCapacity(.{ .pos = v1, .uv = t1 });
+                list.appendAssumeCapacity(.{ .pos = v2, .uv = t2 });
+                list.appendAssumeCapacity(.{ .pos = v0, .uv = t0 });
+                list.appendAssumeCapacity(.{ .pos = v2, .uv = t2 });
+                list.appendAssumeCapacity(.{ .pos = v3, .uv = t3 });
+            }
+        }.call;
+
+        // Mesh all loaded chunks in the single overworld for now
+        const wk = "minecraft:overworld";
+        self.sim.worlds_mutex.lock();
+        defer self.sim.worlds_mutex.unlock();
+        const ws = self.sim.worlds_state.getPtr(wk) orelse return 0;
+
+        const verts_before: usize = out.items.len;
+
+        var reg_it = ws.regions.iterator();
+        while (reg_it.next()) |rentry| {
+            const rs_ptr = rentry.value_ptr; // keep pointer to access chunk_index
+            for (rs_ptr.chunks.items) |*ch_ptr| {
+                const ch = ch_ptr.*; // copy for convenience
+                const base_x: f32 = @floatFromInt(ch.pos.x * @as(i32, @intCast(constants.chunk_size_x)));
+                const base_z: f32 = @floatFromInt(ch.pos.z * @as(i32, @intCast(constants.chunk_size_z)));
+
+                // Rough upper bound capacity: worst-case 6 faces per voxel (very high), but we reserve moderately
+                const cur_len: usize = out.items.len;
+                out.ensureTotalCapacity(self.allocator, cur_len + 16 * 16 * 32 * 6) catch {};
+
+                // Iterate sections
+                const sections_len: usize = ch.sections.len;
+                var sy: usize = 0;
+                while (sy < sections_len) : (sy += 1) {
+                    const s = ch.sections[sy];
+                    const pal_len = s.palette.len;
+                    const bpi: u6 = bitsFor(pal_len);
+                    // Build per-palette info (draw, solid, top/side transforms)
+                    const PalInfo = struct {
+                        draw: bool,
+                        solid: bool,
+                        top_tx: AtlasTransform,
+                        side_tx: AtlasTransform,
+                    };
+                    var pal_info = std.ArrayList(PalInfo).initCapacity(self.allocator, pal_len) catch {
+                        // If alloc fails, skip this section gracefully
+                        continue;
+                    };
+                    defer pal_info.deinit(self.allocator);
+                    var pi: usize = 0;
+                    while (pi < pal_len) : (pi += 1) {
+                        const bid: u32 = s.palette[pi];
+                        var pinfo: PalInfo = .{
+                            .draw = true,
+                            .solid = true,
+                            .top_tx = .{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale },
+                            .side_tx = .{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale },
+                        };
+                        // Solid from registry collision flag
+                        if (bid < self.sim.reg.blocks.items.len) {
+                            pinfo.solid = self.sim.reg.blocks.items[@intCast(bid)].full_block_collision;
+                        }
+                        // Treat block 0 (air) as not drawn and not solid
+                        if (bid == 0) {
+                            pinfo.draw = false;
+                            pinfo.solid = false;
+                        } else {
+                            // Resource lookup by block name
+                            const name = self.sim.reg.getBlockName(@intCast(bid));
+                            if (self.sim.reg.resources.get(name)) |res| switch (res) {
+                                .Void => {
+                                    pinfo.draw = false;
+                                    pinfo.solid = false;
+                                },
+                                .Uniform => |u| {
+                                    const tx: AtlasTransform = self.atlas_uv_by_path.get(u.all_path) orelse AtlasTransform{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale };
+                                    pinfo.top_tx = tx;
+                                    pinfo.side_tx = tx;
+                                },
+                                .Facing => |f| {
+                                    const top_tx: AtlasTransform = self.atlas_uv_by_path.get(f.face_path) orelse AtlasTransform{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale };
+                                    const side_tx: AtlasTransform = self.atlas_uv_by_path.get(f.other_path) orelse AtlasTransform{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale };
+                                    pinfo.top_tx = top_tx;
+                                    pinfo.side_tx = side_tx;
+                                },
+                            };
+                        }
+                        pal_info.appendAssumeCapacity(pinfo);
+                    }
+
+                    // Precompute section base Y to avoid capturing mutable 'sy'
+                    const section_base_y: i32 = @intCast(sy * constants.section_height);
+
+                    // Iterate voxels: order used in worldgen is (lz, lx, ly) with ly fastest
+                    for (0..constants.chunk_size_z) |lz| {
+                        for (0..constants.chunk_size_x) |lx| {
+                            for (0..constants.section_height) |ly| {
+                                const idx: usize = lz * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
+                                const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx, bpi));
+                                if (pidx >= pal_info.items.len) continue;
+                                const info = pal_info.items[pidx];
+                                if (!info.draw) continue;
+
+                                // World coords for this block
+                                const wx0: f32 = base_x + @as(f32, @floatFromInt(lx));
+                                const wy0: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(sy * constants.section_height)) + @as(i32, @intCast(ly))));
+                                const wz0: f32 = base_z + @as(f32, @floatFromInt(lz));
+                                const wx1: f32 = wx0 + 1.0;
+                                const wy1: f32 = wy0 + 1.0;
+                                const wz1: f32 = wz0 + 1.0;
+
+                                // We'll use a helper that takes absolute Y and handles cross-chunk
+                                const abs_y_this: i32 = section_base_y + @as(i32, @intCast(ly));
+
+                                // Emit faces if neighbor is not solid
+                                const uv00: [2]f32 = .{ 0, 0 };
+                                const uv01: [2]f32 = .{ 0, 1 };
+                                const uv11: [2]f32 = .{ 1, 1 };
+                                const uv10: [2]f32 = .{ 1, 0 };
+
+                                // +Y (top)
+                                if (!self.isSolidAt(ws, &ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this + 1, @as(i32, @intCast(lz)))) {
+                                    addQuad(out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv01, uv11, uv10, info.top_tx.scale, info.top_tx.offset, pad_u, pad_v);
+                                }
+                                // -Y (bottom)
+                                if (!self.isSolidAt(ws, &ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this - 1, @as(i32, @intCast(lz)))) {
+                                    addQuad(out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
+                                }
+                                // -X (west)
+                                if (!self.isSolidAt(ws, &ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) - 1, abs_y_this, @as(i32, @intCast(lz)))) {
+                                    addQuad(out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
+                                }
+                                // +X (east)
+                                if (!self.isSolidAt(ws, &ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) + 1, abs_y_this, @as(i32, @intCast(lz)))) {
+                                    addQuad(out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
+                                }
+                                // -Z (north)
+                                if (!self.isSolidAt(ws, &ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) - 1)) {
+                                    addQuad(out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
+                                }
+                                // +Z (south)
+                                if (!self.isSolidAt(ws, &ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) + 1)) {
+                                    addQuad(out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return out.items.len - verts_before;
     }
 
     fn clearMovementInputs(self: *Client) void {
