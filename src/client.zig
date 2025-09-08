@@ -134,36 +134,23 @@ const Camera = struct {
     }
 };
 
-const Vertex = struct { pos: [3]f32, uv: [2]f32 };
+const Vertex = struct { pos: [3]f32, uv: [2]f32, uv_off: [2]f32, uv_scale: [2]f32 };
 
 inline fn wrap01m(v: f32) f32 {
     const f = v - std.math.floor(v);
     return if (f == 0.0 and v > 0.0) 1.0 else f;
 }
 
-inline fn emitQuad(allocator: std.mem.Allocator, list: *std.ArrayList(Vertex), v0: [3]f32, v1: [3]f32, v2: [3]f32, v3: [3]f32, uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32, uv_scale_p: [2]f32, uv_offset_p: [2]f32, pad_u_in: f32, pad_v_in: f32) void {
-    const w0x: f32 = wrap01m(uv0[0]);
-    const w0y: f32 = wrap01m(uv0[1]);
-    const w1x: f32 = wrap01m(uv1[0]);
-    const w1y: f32 = wrap01m(uv1[1]);
-    const w2x: f32 = wrap01m(uv2[0]);
-    const w2y: f32 = wrap01m(uv2[1]);
-    const w3x: f32 = wrap01m(uv3[0]);
-    const w3y: f32 = wrap01m(uv3[1]);
-    const min_u = uv_offset_p[0] + pad_u_in;
-    const min_v = uv_offset_p[1] + pad_v_in;
-    const range_u = @max(0.0, uv_scale_p[0] - 2.0 * pad_u_in);
-    const range_v = @max(0.0, uv_scale_p[1] - 2.0 * pad_v_in);
-    const t0 = .{ min_u + w0x * range_u, min_v + w0y * range_v };
-    const t1 = .{ min_u + w1x * range_u, min_v + w1y * range_v };
-    const t2 = .{ min_u + w2x * range_u, min_v + w2y * range_v };
-    const t3 = .{ min_u + w3x * range_u, min_v + w3y * range_v };
-    list.append(allocator, .{ .pos = v0, .uv = t0 }) catch return;
-    list.append(allocator, .{ .pos = v1, .uv = t1 }) catch return;
-    list.append(allocator, .{ .pos = v2, .uv = t2 }) catch return;
-    list.append(allocator, .{ .pos = v0, .uv = t0 }) catch return;
-    list.append(allocator, .{ .pos = v2, .uv = t2 }) catch return;
-    list.append(allocator, .{ .pos = v3, .uv = t3 }) catch return;
+inline fn emitQuad(allocator: std.mem.Allocator, list: *std.ArrayList(Vertex), v0: [3]f32, v1: [3]f32, v2: [3]f32, v3: [3]f32, uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32, uv_scale_p: [2]f32, uv_offset_p: [2]f32) void {
+    // Store tile-local UVs (may be >1) and atlas transform; shader applies fract and transform
+    const off = uv_offset_p;
+    const sc = uv_scale_p;
+    list.append(allocator, .{ .pos = v0, .uv = uv0, .uv_off = off, .uv_scale = sc }) catch return;
+    list.append(allocator, .{ .pos = v1, .uv = uv1, .uv_off = off, .uv_scale = sc }) catch return;
+    list.append(allocator, .{ .pos = v2, .uv = uv2, .uv_off = off, .uv_scale = sc }) catch return;
+    list.append(allocator, .{ .pos = v0, .uv = uv0, .uv_off = off, .uv_scale = sc }) catch return;
+    list.append(allocator, .{ .pos = v2, .uv = uv2, .uv_off = off, .uv_scale = sc }) catch return;
+    list.append(allocator, .{ .pos = v3, .uv = uv3, .uv_off = off, .uv_scale = sc }) catch return;
 }
 
 // Cached mesh types (region-level aggregation)
@@ -743,6 +730,8 @@ pub const Client = struct {
         const desc = sg.queryDesc();
         pdesc.color_count = 1;
         pdesc.colors[0].pixel_format = desc.environment.defaults.color_format;
+        pdesc.layout.attrs[2].format = .FLOAT2;
+        pdesc.layout.attrs[3].format = .FLOAT2;
         self.pip = sg.makePipeline(pdesc);
         // dedicated 2D quad pipeline for overlay (no depth test, no culling)
         var qdesc: sg.PipelineDesc = .{};
@@ -750,6 +739,8 @@ pub const Client = struct {
         qdesc.shader = self.shd;
         qdesc.layout.attrs[0].format = .FLOAT3;
         qdesc.layout.attrs[1].format = .FLOAT2;
+        qdesc.layout.attrs[2].format = .FLOAT2;
+        qdesc.layout.attrs[3].format = .FLOAT2;
         qdesc.primitive_type = .TRIANGLES;
         qdesc.cull_mode = .NONE;
         qdesc.face_winding = .CCW;
@@ -1107,7 +1098,7 @@ pub const Client = struct {
         const view = self.makeViewNoRoll(self.camera.pos, self.camera.yaw, self.camera.pitch);
         const mvp = matMul(proj, view);
         self.updateFrustum(mvp);
-        var vs_params: shd_mod.VsParams = .{ .mvp = mvp };
+        var vs_params: shd_mod.VsParams = .{ .mvp = mvp, .atlas_pad = .{ 0, 0 } };
 
         // Render cached meshes (build on demand)
         if (self.grass_img.id != 0) {
@@ -1500,7 +1491,7 @@ pub const Client = struct {
         return true;
     }
 
-    fn buildSectionVertices(self: *Client, ws: *const simulation.WorldState, ch: *const gs.Chunk, sy: usize, base_x: f32, base_z: f32, pad_u: f32, pad_v: f32, out: *std.ArrayList(Vertex)) void {
+    fn buildSectionVertices(self: *Client, ws: *const simulation.WorldState, ch: *const gs.Chunk, sy: usize, base_x: f32, base_z: f32, out: *std.ArrayList(Vertex)) void {
         const s = ch.sections[sy];
         const pal_len = s.palette.len;
         const bpi: u6 = bitsFor(pal_len);
@@ -1553,7 +1544,86 @@ pub const Client = struct {
             pal_info.appendAssumeCapacity(pinfo);
         }
 
+        // Greedy meshing for +Y (top) faces per Y-slice to drastically reduce vertex count
+        const FaceMat = struct { off: [2]f32, sc: [2]f32 };
+        const Mat = struct {
+            fn eq(a: FaceMat, b: FaceMat) bool {
+                return a.off[0] == b.off[0] and a.off[1] == b.off[1] and a.sc[0] == b.sc[0] and a.sc[1] == b.sc[1];
+            }
+        };
+        const MaskCell = struct { present: bool, m: FaceMat };
         const section_base_y: i32 = @intCast(sy * constants.section_height);
+        var ly_top: usize = 0;
+        while (ly_top < constants.section_height) : (ly_top += 1) {
+            const abs_y: i32 = section_base_y + @as(i32, @intCast(ly_top));
+            var mask: [constants.chunk_size_z * constants.chunk_size_x]MaskCell = undefined;
+            // fill mask
+            var mz: usize = 0;
+            while (mz < constants.chunk_size_z) : (mz += 1) {
+                var mx: usize = 0;
+                while (mx < constants.chunk_size_x) : (mx += 1) {
+                    const idx: usize = mz * constants.chunk_size_x + mx;
+                    mask[idx].present = false;
+                    // palette index
+                    const src_idx: usize = mz * (constants.chunk_size_x * constants.section_height) + mx * constants.section_height + ly_top;
+                    const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, src_idx, bpi));
+                    if (pidx >= pal_info.items.len) continue;
+                    const info = pal_info.items[pidx];
+                    if (!info.draw) continue;
+                    // top visible if neighbor above not solid
+                    if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(mx)), abs_y + 1, @as(i32, @intCast(mz)))) {
+                        mask[idx] = .{ .present = true, .m = .{ .off = info.top_tx.offset, .sc = info.top_tx.scale } };
+                    }
+                }
+            }
+            // greedy rectangles over mask (x along width, z along height)
+            mz = 0;
+            while (mz < constants.chunk_size_z) : (mz += 1) {
+                var mx: usize = 0;
+                while (mx < constants.chunk_size_x) : (mx += 1) {
+                    const base_idx: usize = mz * constants.chunk_size_x + mx;
+                    if (!mask[base_idx].present) continue;
+                    const mkey: FaceMat = mask[base_idx].m;
+                    // determine width
+                    var w: usize = 1;
+                    while ((mx + w) < constants.chunk_size_x) : (w += 1) {
+                        const idx2 = mz * constants.chunk_size_x + (mx + w);
+                        if (!(mask[idx2].present and Mat.eq(mask[idx2].m, mkey))) break;
+                    }
+                    // determine height
+                    var h: usize = 1;
+                    outer: while ((mz + h) < constants.chunk_size_z) : (h += 1) {
+                        var kx: usize = 0;
+                        while (kx < w) : (kx += 1) {
+                            const idx3 = (mz + h) * constants.chunk_size_x + (mx + kx);
+                            if (!(mask[idx3].present and Mat.eq(mask[idx3].m, mkey))) break :outer;
+                        }
+                    }
+                    // emit quad for rectangle (mx..mx+w, mz..mz+h) at y = abs_y + 1
+                    const wx0: f32 = base_x + @as(f32, @floatFromInt(mx));
+                    const wz0: f32 = base_z + @as(f32, @floatFromInt(mz));
+                    const wx1: f32 = base_x + @as(f32, @floatFromInt(mx + w));
+                    const wz1: f32 = base_z + @as(f32, @floatFromInt(mz + h));
+                    const wy1: f32 = @as(f32, @floatFromInt(abs_y + 1));
+                    // UVs repeat across the merged area (0..w, 0..h)
+                    const uv00: [2]f32 = .{ 0, 0 };
+                    const uv0h: [2]f32 = .{ 0, @as(f32, @floatFromInt(h)) };
+                    const uvwh: [2]f32 = .{ @as(f32, @floatFromInt(w)), @as(f32, @floatFromInt(h)) };
+                    const uvw0: [2]f32 = .{ @as(f32, @floatFromInt(w)), 0 };
+                    emitQuad(self.allocator, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv0h, uvwh, uvw0, mkey.sc, mkey.off);
+                    // clear mask for used cells
+                    var zz: usize = 0;
+                    while (zz < h) : (zz += 1) {
+                        var xx: usize = 0;
+                        while (xx < w) : (xx += 1) {
+                            mask[(mz + zz) * constants.chunk_size_x + (mx + xx)].present = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Now emit the remaining faces (bottom and sides) per-voxel
         for (0..constants.chunk_size_z) |lz| {
             for (0..constants.chunk_size_x) |lx| {
                 for (0..constants.section_height) |ly| {
@@ -1577,23 +1647,21 @@ pub const Client = struct {
                     const uv11: [2]f32 = .{ 1, 1 };
                     const uv10: [2]f32 = .{ 1, 0 };
 
-                    if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this + 1, @as(i32, @intCast(lz)))) {
-                        emitQuad(self.allocator, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv01, uv11, uv10, info.top_tx.scale, info.top_tx.offset, pad_u, pad_v);
-                    }
+                    if (false) {}
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this - 1, @as(i32, @intCast(lz)))) {
-                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
+                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
                     }
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) - 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                        emitQuad(self.allocator, out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
+                        emitQuad(self.allocator, out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
                     }
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) + 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                        emitQuad(self.allocator, out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
+                        emitQuad(self.allocator, out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
                     }
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) - 1)) {
-                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
+                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
                     }
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) + 1)) {
-                        emitQuad(self.allocator, out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
+                        emitQuad(self.allocator, out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
                     }
                 }
             }
@@ -1601,7 +1669,7 @@ pub const Client = struct {
     }
 
     // Build a single region mesh (one buffer) by concatenating all section vertices of all chunks in the region
-    fn ensureRegionMesh(self: *Client, ws: *const simulation.WorldState, rpos: simulation.RegionPos, rs: *const simulation.RegionState, pad_u: f32, pad_v: f32) void {
+    fn ensureRegionMesh(self: *Client, ws: *const simulation.WorldState, rpos: simulation.RegionPos, rs: *const simulation.RegionState) void {
         if (self.region_mesh_cache.getPtr(rpos)) |existing| {
             // Rebuild if chunk count changed (new chunks streamed in)
             if (existing.built_chunk_count == rs.chunks.items.len and existing.vbuf.id != 0) return;
@@ -1629,7 +1697,7 @@ pub const Client = struct {
             var sy: usize = 0;
             while (sy < ch.sections.len) : (sy += 1) {
                 const start: usize = verts.items.len;
-                self.buildSectionVertices(ws, &ch, sy, base_x, base_z, pad_u, pad_v, &verts);
+                self.buildSectionVertices(ws, &ch, sy, base_x, base_z, &verts);
                 const count: usize = verts.items.len - start;
                 if (count > 0) {
                     draws[draws_len] = .{ .chunk_pos = ch.pos, .sy = @intCast(sy), .first = @intCast(start), .count = @intCast(count) };
@@ -1661,7 +1729,7 @@ pub const Client = struct {
         };
     }
 
-    fn renderWorldCached(self: *Client, vs_params: *const shd_mod.VsParams) void {
+    fn renderWorldCached(self: *Client, vs_in: *const shd_mod.VsParams) void {
         const wk = "minecraft:overworld";
         self.sim.worlds_mutex.lock();
         defer self.sim.worlds_mutex.unlock();
@@ -1670,6 +1738,7 @@ pub const Client = struct {
         // constants for padding
         const pad_u: f32 = if (self.atlas_w > 0) (1.0 / @as(f32, @floatFromInt(self.atlas_w))) else 0.0;
         const pad_v: f32 = if (self.atlas_h > 0) (1.0 / @as(f32, @floatFromInt(self.atlas_h))) else 0.0;
+        var vs_loc: shd_mod.VsParams = .{ .mvp = vs_in.mvp, .atlas_pad = .{ pad_u, pad_v } };
 
         var reg_it = ws.regions.iterator();
         while (reg_it.next()) |rentry| {
@@ -1677,7 +1746,7 @@ pub const Client = struct {
             const rs_ptr = rentry.value_ptr;
 
             // Build region mesh on demand
-            self.ensureRegionMesh(ws, rpos, rs_ptr, pad_u, pad_v);
+            self.ensureRegionMesh(ws, rpos, rs_ptr);
             const rmesh = self.region_mesh_cache.getPtr(rpos) orelse continue;
             if (rmesh.vbuf.id == 0 or rmesh.draws.len == 0) continue;
 
@@ -1700,7 +1769,7 @@ pub const Client = struct {
                     const vis_sec = aabbContainsPoint(minp_s, maxp_s, cam) or aabbInFrustum(self.frustum_planes, minp_s, maxp_s, 0.5);
                     if (!vis_sec) continue;
                 }
-                sg.applyUniforms(0, sg.asRange(vs_params));
+                sg.applyUniforms(0, sg.asRange(&vs_loc));
                 sg.draw(d.first, d.count, 1);
                 // Mark chunk seen this frame (used by heuristic elsewhere)
                 _ = self.last_visible_frame_chunk.put(d.chunk_pos, self.frame_index) catch {};
@@ -2065,15 +2134,15 @@ pub const Client = struct {
         const x1: f32 = x0 + dw;
         const y1: f32 = y0 + dh;
         var quad: [6]Vertex = .{
-            .{ .pos = .{ x0, y0, 0 }, .uv = .{ 0, 0 } },
-            .{ .pos = .{ x1, y0, 0 }, .uv = .{ 1, 0 } },
-            .{ .pos = .{ x1, y1, 0 }, .uv = .{ 1, 1 } },
-            .{ .pos = .{ x0, y0, 0 }, .uv = .{ 0, 0 } },
-            .{ .pos = .{ x1, y1, 0 }, .uv = .{ 1, 1 } },
-            .{ .pos = .{ x0, y1, 0 }, .uv = .{ 0, 1 } },
+            .{ .pos = .{ x0, y0, 0 }, .uv = .{ 0, 0 }, .uv_off = .{ 0, 0 }, .uv_scale = .{ 1, 1 } },
+            .{ .pos = .{ x1, y0, 0 }, .uv = .{ 1, 0 }, .uv_off = .{ 0, 0 }, .uv_scale = .{ 1, 1 } },
+            .{ .pos = .{ x1, y1, 0 }, .uv = .{ 1, 1 }, .uv_off = .{ 0, 0 }, .uv_scale = .{ 1, 1 } },
+            .{ .pos = .{ x0, y0, 0 }, .uv = .{ 0, 0 }, .uv_off = .{ 0, 0 }, .uv_scale = .{ 1, 1 } },
+            .{ .pos = .{ x1, y1, 0 }, .uv = .{ 1, 1 }, .uv_off = .{ 0, 0 }, .uv_scale = .{ 1, 1 } },
+            .{ .pos = .{ x0, y1, 0 }, .uv = .{ 0, 1 }, .uv_off = .{ 0, 0 }, .uv_scale = .{ 1, 1 } },
         };
         const ortho = makeOrthoTopLeft(w_px, h_px);
-        var vs_params: shd_mod.VsParams = .{ .mvp = ortho };
+        var vs_params: shd_mod.VsParams = .{ .mvp = ortho, .atlas_pad = .{ 0, 0 } };
         sg.applyPipeline(self.quad_pip);
         // use a separate UI vertex buffer to avoid multiple updates to the same buffer in one frame
         var bind_ui = self.bind;
