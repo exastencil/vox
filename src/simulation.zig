@@ -580,6 +580,7 @@ pub const Simulation = struct {
             .vel = .{ 0, 0, 0 },
             .yaw_pitch_roll = .{ 0, 0, 0 },
             .look_dir = .{ 1, 0, 0 },
+            .facing_dir_xz = .{ 1, 0 },
             // Collider: 0.75w x 1.75h x 0.4l (half-extents 0.375, 0.875, 0.2)
             .aabb_half_extents = .{ 0.375, 0.875, 0.2 },
             .flags = .{},

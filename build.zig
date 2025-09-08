@@ -40,7 +40,7 @@ fn generateModulesIndex(b: *Build, files: []const []const u8) !void {
     try w.writeAll("pub const modules = .{\n");
     i = 0;
     while (i < files.len) : (i += 1) {
-        try w.print("    m{d}.module,\n", .{ i });
+        try w.print("    m{d}.module,\n", .{i});
     }
     try w.writeAll("};\n");
 
@@ -153,12 +153,11 @@ pub fn build(b: *Build) !void {
         else => "bin/linux/sokol-shdc",
     };
     const shdc_path = dep_tools.path(tool_rel_path);
-    const shdc = b.addSystemCommand(&.{ shdc_path.getPath(b) });
+    const shdc = b.addSystemCommand(&.{shdc_path.getPath(b)});
     shdc.addArgs(&.{
-        "--input",  b.path("shaders/chunk.glsl").getPath(b),
-        "--output", b.path("src/shaders/chunk_shd.zig").getPath(b),
-        "--slang=glsl430:hlsl5:metal_macos:wgsl",
-        "--format=sokol_zig",
+        "--input",                                b.path("shaders/chunk.glsl").getPath(b),
+        "--output",                               b.path("src/shaders/chunk_shd.zig").getPath(b),
+        "--slang=glsl430:hlsl5:metal_macos:wgsl", "--format=sokol_zig",
         "--bytecode",
     });
     // Ensure shader gets generated before compiling client/full

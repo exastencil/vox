@@ -27,10 +27,10 @@ fn loadOrFallback(allocator: std.mem.Allocator, path: []const u8) sg.Image {
             } },
         });
     } else {
-        // Generate a magenta/black checkerboard as a visible missing-texture fallback
-        const w: usize = 128;
-        const h: usize = 128;
-        const tile: usize = 16;
+        // Generate a magenta/black checkerboard fallback with exactly 4 squares (2x2) per face
+        const w: usize = 16;
+        const h: usize = 16;
+        const tile: usize = 8; // 2 squares across each axis, 8x8 each
         var pixels = allocator.alloc(u8, w * h * 4) catch {
             var one = [_]u8{ 255, 0, 255, 255 };
             return sg.makeImage(.{
@@ -146,7 +146,7 @@ const UvRect = struct { u0: f32, v0: f32, u1: f32, v1: f32, w: u32, h: u32 };
 fn makeFallbackTile(allocator: std.mem.Allocator, size: usize) !struct { w: u32, h: u32, pixels: []u8 } {
     const w: usize = size;
     const h: usize = size;
-    const tile: usize = @max(1, size / 8);
+    const tile: usize = @max(1, size / 2); // exactly 2x2 squares per face
     var pixels = try allocator.alloc(u8, w * h * 4);
     errdefer allocator.free(pixels);
     var y: usize = 0;
@@ -347,7 +347,7 @@ fn buildTextureAtlas(self: *Client) void {
         };
     }
     if (!chosen) {
-        if (self.sim.reg.resources.get("minecraft:grass_block")) |res| switch (res) {
+        if (self.sim.reg.resources.get("minecraft:grass")) |res| switch (res) {
             .Facing => |f| if (findRectForPath(paths.items, built.rects, f.face_path)) |rc| {
                 self.atlas_uv_offset = .{ rc.u0, rc.v0 };
                 self.atlas_uv_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
@@ -473,8 +473,18 @@ pub const Client = struct {
     // GPU buffer capacity tracking
     vbuf_capacity_bytes: usize = 0,
 
-    // Camera mirrored from player entity
+    // Camera mirrored from player entity (position only; orientation is client-local)
     camera: Camera = .{},
+
+    // Local view state (client-predicted, decoupled from simulation)
+    local_yaw: f32 = 0.0,
+    local_pitch: f32 = 0.0,
+    local_dir: [3]f32 = .{ 1, 0, 0 },
+    local_orient_initialized: bool = false,
+    last_look_tick_sent: u64 = 0,
+
+    // Debug: track last observed position for delta reporting
+    dbg_last_pos: [3]f32 = .{ 0, 0, 0 },
 
     // Input state
     move_forward: bool = false,
@@ -564,7 +574,7 @@ pub const Client = struct {
         pdesc.layout.attrs[1].format = .FLOAT2;
         pdesc.primitive_type = .TRIANGLES;
         pdesc.cull_mode = .BACK;
-        // Ensure we define a consistent front-face winding across backends
+        // Front-face winding should match our emitted CCW triangles
         pdesc.face_winding = .CCW;
         pdesc.depth = .{ .compare = .LESS_EQUAL, .write_enabled = true };
         // ensure pipeline color/depth target matches swapchain format
@@ -616,13 +626,13 @@ pub const Client = struct {
                 const t1 = .{ uv1[0] * uv_scale_p[0] + uv_offset_p[0], uv1[1] * uv_scale_p[1] + uv_offset_p[1] };
                 const t2 = .{ uv2[0] * uv_scale_p[0] + uv_offset_p[0], uv2[1] * uv_scale_p[1] + uv_offset_p[1] };
                 const t3 = .{ uv3[0] * uv_scale_p[0] + uv_offset_p[0], uv3[1] * uv_scale_p[1] + uv_offset_p[1] };
-                // Emit triangles with flipped winding so CCW remains front-facing under the chosen view handedness
+                // Emit triangles with standard CCW winding (v0->v1->v2, v0->v2->v3)
                 list.appendAssumeCapacity(.{ .pos = v0, .uv = t0 });
-                list.appendAssumeCapacity(.{ .pos = v2, .uv = t2 });
                 list.appendAssumeCapacity(.{ .pos = v1, .uv = t1 });
-                list.appendAssumeCapacity(.{ .pos = v0, .uv = t0 });
-                list.appendAssumeCapacity(.{ .pos = v3, .uv = t3 });
                 list.appendAssumeCapacity(.{ .pos = v2, .uv = t2 });
+                list.appendAssumeCapacity(.{ .pos = v0, .uv = t0 });
+                list.appendAssumeCapacity(.{ .pos = v2, .uv = t2 });
+                list.appendAssumeCapacity(.{ .pos = v3, .uv = t3 });
             }
         }.call;
 
@@ -835,6 +845,8 @@ pub const Client = struct {
 
         // Apply movement inputs to player entity (client-side write into sim)
         self.applyMovementInputs();
+        // Send local look to simulation at most once per tick
+        self.maybeSendLookToSim();
 
         // Build chunk surface mesh into a dynamic list
         var vert_list = std.ArrayList(Vertex).initCapacity(self.allocator, 0) catch return;
@@ -846,9 +858,12 @@ pub const Client = struct {
         const h_px: f32 = @floatFromInt(sapp.height());
         const aspect_wh: f32 = if (h_px > 0) (w_px / h_px) else 1.0;
         const proj = makePerspective(60.0 * std.math.pi / 180.0, aspect_wh, 0.1, 1000.0);
-        const view = makeView(self.camera.pos, self.camera.dir, .{ 0, 1, 0 });
+        // Horizon lock (no-roll) view: strictly horizontal right and world +Y up
+        const view = self.makeViewNoRoll(self.camera.pos, self.camera.yaw, self.camera.pitch);
         const mvp = matMul(proj, view);
         var vs_params: shd_mod.VsParams = .{ .mvp = mvp };
+
+        // Optional continuous probe logging
 
         if (vert_list.items.len > 0 and self.grass_img.id != 0) {
             sg.applyPipeline(self.pip);
@@ -879,7 +894,7 @@ pub const Client = struct {
 
             const snap = self.pollSnapshot().*;
             var buf: [96:0]u8 = undefined;
-            const text_slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "tick: {d}  tps: {d:.2}  players: {d}", .{ snap.tick, snap.rolling_tps, snap.player_count }) catch "tick: ?";
+            const text_slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "Tick: {d}  TPS: {d:.2}", .{ snap.tick, snap.rolling_tps }) catch "Ticks: ?";
             buf[text_slice.len] = 0;
             const text: [:0]const u8 = buf[0..text_slice.len :0];
             const cols_f: f32 = (w_px / scale) / 8.0;
@@ -905,7 +920,7 @@ pub const Client = struct {
             self.sim.connections_mutex.unlock();
 
             var pbuf: [96:0]u8 = undefined;
-            const ptxt_slice = std.fmt.bufPrint(pbuf[0 .. pbuf.len - 1], "pos: {d:.2} {d:.2} {d:.2}", .{ pos[0], pos[1], pos[2] }) catch "pos:?";
+            const ptxt_slice = std.fmt.bufPrint(pbuf[0 .. pbuf.len - 1], "Position: {d:.1} {d:.1} {d:.1}", .{ pos[0], pos[1], pos[2] }) catch "Position: ?";
             pbuf[ptxt_slice.len] = 0;
             const ptxt: [:0]const u8 = pbuf[0..ptxt_slice.len :0];
             sdtx.pos(1.0, 1.0);
@@ -913,7 +928,7 @@ pub const Client = struct {
             sdtx.puts(ptxt);
 
             var lbuf: [96:0]u8 = undefined;
-            const ltxt_slice = std.fmt.bufPrint(lbuf[0 .. lbuf.len - 1], "look: {d:.2} {d:.2} {d:.2}", .{ look[0], look[1], look[2] }) catch "look:?";
+            const ltxt_slice = std.fmt.bufPrint(lbuf[0 .. lbuf.len - 1], "Look: {d:.2} {d:.2} {d:.2}", .{ look[0], look[1], look[2] }) catch "Look: ?";
             lbuf[ltxt_slice.len] = 0;
             const ltxt: [:0]const u8 = lbuf[0..ltxt_slice.len :0];
             sdtx.pos(1.0, 2.0);
@@ -978,27 +993,66 @@ pub const Client = struct {
                 if (sapp.mouseLocked()) {
                     const sens: f32 = 0.002; // radians per pixel
                     const dx = ev.mouse_dx * sens;
-                    self.sim.connections_mutex.lock();
-                    const idx_opt = self.sim.entity_by_player.get(self.player_id);
-                    if (idx_opt) |idx| {
-                        if (idx < self.sim.dynamic_entities.items.len) {
-                            var e = &self.sim.dynamic_entities.items[idx];
-                            // rotate look_dir around Y by -dx so right-drag turns right (preferred feel)
-                            const cur_yaw: f32 = std.math.atan2(e.look_dir[2], e.look_dir[0]);
-                            const two_pi: f32 = 6.283185307179586;
-                            var yaw = cur_yaw - dx;
-                            if (yaw > std.math.pi) yaw -= two_pi;
-                            if (yaw < -std.math.pi) yaw += two_pi;
-                            const cy = @cos(yaw);
-                            const sy = @sin(yaw);
-                            e.look_dir[0] = cy;
-                            e.look_dir[2] = sy;
-                            // preserve vertical component (no pitch changes via mouse for now)
+                    _ = ev.mouse_dy; // ignore vertical mouse input (no pitch)
+
+                    // Rotate look around +Y for horizontal mouse motion
+                    var new_dir = self.local_dir;
+                    if (dx != 0) {
+                        const c = @cos(-dx); // right drag turns right
+                        const s = @sin(-dx);
+                        const x = new_dir[0];
+                        const z = new_dir[2];
+                        new_dir[0] = c * x - s * z;
+                        new_dir[2] = s * x + c * z;
+                    }
+                    // normalize
+                    const len = @sqrt(new_dir[0] * new_dir[0] + new_dir[1] * new_dir[1] + new_dir[2] * new_dir[2]);
+                    if (len > 0.000001) {
+                        new_dir[0] /= len;
+                        new_dir[1] /= len;
+                        new_dir[2] /= len;
+                    }
+                    self.local_dir = new_dir;
+                    // update camera from dir (also updates yaw/pitch)
+                    self.camera.setDir(self.local_dir);
+                    self.local_yaw = self.camera.yaw;
+                    self.local_pitch = self.camera.pitch;
+
+                    // If not moving, constrain facing so look stays within 90° of facing (XZ)
+                    if (!(self.move_forward or self.move_back or self.move_left or self.move_right)) {
+                        // Use camera forward
+                        const lpx = self.local_dir[0];
+                        const lpz = self.local_dir[2];
+                        const lplen = @sqrt(lpx * lpx + lpz * lpz);
+                        if (lplen > 0.0001) {
+                            const nlx = lpx / lplen;
+                            const nlz = lpz / lplen;
+                            // Read/adjust facing under mutex
+                            self.sim.connections_mutex.lock();
+                            const idx_opt_f = self.sim.entity_by_player.get(self.player_id);
+                            if (idx_opt_f) |idx_f| {
+                                if (idx_f < self.sim.dynamic_entities.items.len) {
+                                    var e_f = &self.sim.dynamic_entities.items[idx_f];
+                                    const fvx = e_f.facing_dir_xz[0];
+                                    const fvz = e_f.facing_dir_xz[1];
+                                    const dot = fvx * nlx + fvz * nlz;
+                                    if (dot < 0) { // angle > 90°
+                                        const facing_yaw = std.math.atan2(fvz, fvx);
+                                        const look_yaw = std.math.atan2(nlz, nlx);
+                                        var diff = look_yaw - facing_yaw;
+                                        // wrap to [-pi, pi]
+                                        if (diff > std.math.pi) diff -= 2 * std.math.pi;
+                                        if (diff < -std.math.pi) diff += 2 * std.math.pi;
+                                        const sign: f32 = if (diff >= 0) 1.0 else -1.0;
+                                        const delta = @abs(diff) - (std.math.pi / 2.0);
+                                        const new_yaw = facing_yaw + sign * delta;
+                                        e_f.facing_dir_xz = .{ @cos(new_yaw), @sin(new_yaw) };
+                                    }
+                                }
+                            }
+                            self.sim.connections_mutex.unlock();
                         }
                     }
-                    self.sim.connections_mutex.unlock();
-                    // keep camera in sync immediately
-                    self.updateCameraFromPlayer();
                 }
             },
             else => {},
@@ -1020,49 +1074,85 @@ pub const Client = struct {
         return &self.latest_snapshot;
     }
 
-    // Update camera to mirror the player's entity position and yaw/pitch
+    // Update camera to mirror the player's entity position; keep orientation client-local
+    fn maybeSendLookToSim(self: *Client) void {
+        const snap = self.pollSnapshot().*;
+        if (snap.tick == self.last_look_tick_sent) return;
+        self.last_look_tick_sent = snap.tick;
+        self.sim.connections_mutex.lock();
+        const idx_opt = self.sim.entity_by_player.get(self.player_id);
+        if (idx_opt) |idx| {
+            if (idx < self.sim.dynamic_entities.items.len) {
+                var e = &self.sim.dynamic_entities.items[idx];
+                e.look_dir = self.local_dir;
+            }
+        }
+        self.sim.connections_mutex.unlock();
+    }
+
+    // Update camera to mirror the player's entity position; keep orientation client-local
     fn updateCameraFromPlayer(self: *Client) void {
-        // Use simulation's connections mutex to safely inspect player->entity mapping
         self.sim.connections_mutex.lock();
         defer self.sim.connections_mutex.unlock();
-
         const idx_opt = self.sim.entity_by_player.get(self.player_id);
         if (idx_opt) |idx| {
             if (idx < self.sim.dynamic_entities.items.len) {
                 const e = self.sim.dynamic_entities.items[idx];
-                // Position camera at the top-center of the player's bounding box (eye-like)
                 const eye_y: f32 = e.pos[1] + e.aabb_half_extents[1];
                 self.camera.pos = .{ e.pos[0], eye_y, e.pos[2] };
-                self.camera.setDir(e.look_dir);
-                self.camera.roll = e.yaw_pitch_roll[2];
+                if (!self.local_orient_initialized) {
+                    // Seed local orientation from sim once
+                    const dx = e.look_dir[0];
+                    const dy = e.look_dir[1];
+                    const dz = e.look_dir[2];
+                    const len: f32 = @sqrt(dx * dx + dy * dy + dz * dz);
+                    if (len > 0.000001) {
+                        const nx = dx / len;
+                        const ny = dy / len;
+                        const nz = dz / len;
+                        self.local_pitch = std.math.asin(std.math.clamp(ny, -1.0, 1.0));
+                        self.local_yaw = std.math.atan2(nz, nx);
+                        const cp = @cos(self.local_pitch);
+                        const sp = @sin(self.local_pitch);
+                        const cy = @cos(self.local_yaw);
+                        const sy = @sin(self.local_yaw);
+                        self.local_dir = .{ cp * cy, sp, cp * sy };
+                        self.local_orient_initialized = true;
+                    }
+                }
+                // Always orient camera from local yaw/pitch, zero roll
+                self.camera.setYawPitch(self.local_yaw, self.local_pitch);
+                self.camera.roll = 0;
             }
         }
     }
 
     // Apply currently-pressed movement keys to the player entity
     fn applyMovementInputs(self: *Client) void {
-        // Compute desired horizontal velocity from inputs relative to yaw
+        // Compute desired horizontal velocity from inputs relative to local yaw
         self.sim.connections_mutex.lock();
         defer self.sim.connections_mutex.unlock();
         const idx_opt = self.sim.entity_by_player.get(self.player_id);
         if (idx_opt) |idx| {
             if (idx < self.sim.dynamic_entities.items.len) {
                 var e = &self.sim.dynamic_entities.items[idx];
-                // Derive forward directly from the entity's look vector so movement matches camera
-                var fwd_x: f32 = e.look_dir[0];
-                var fwd_z: f32 = e.look_dir[2];
-                var flen: f32 = @sqrt(fwd_x * fwd_x + fwd_z * fwd_z);
-                if (flen < 0.0001) {
-                    // Fallback to yaw projection if degenerate
-                    const yaw = std.math.atan2(e.look_dir[2], e.look_dir[0]);
-                    fwd_x = @cos(yaw);
-                    fwd_z = @sin(yaw);
-                    flen = @sqrt(fwd_x * fwd_x + fwd_z * fwd_z);
+                // While moving, keep facing synced to the horizontal component of the look vector
+                if (self.move_forward or self.move_back or self.move_left or self.move_right) {
+                    // Sync facing to camera forward projected onto XZ
+                    const lx = self.local_dir[0];
+                    const lz = self.local_dir[2];
+                    const llen: f32 = @sqrt(lx * lx + lz * lz);
+                    if (llen > 0.0001) {
+                        e.facing_dir_xz = .{ lx / llen, lz / llen };
+                    }
                 }
-                fwd_x /= flen;
-                fwd_z /= flen;
-                const right_x: f32 = fwd_z; // rotate forward 90° CCW for right (corrected)
-                const right_z: f32 = -fwd_x;
+                // Derive forward from yaw only (horizontal heading), independent of pitch
+                const fwd_x: f32 = -@cos(self.local_yaw);
+                const fwd_z: f32 = @sin(self.local_yaw);
+                // Screen-right (world right) is cross(forward, up) on XZ: (-fwd_z, fwd_x)
+                const right_x: f32 = -fwd_z;
+                const right_z: f32 = fwd_x;
+
                 var vx: f32 = 0;
                 var vz: f32 = 0;
                 if (self.move_forward) {
@@ -1090,10 +1180,10 @@ pub const Client = struct {
                 const speed: f32 = 4.5; // m/s walking speed
                 e.vel[0] = vx * speed;
                 e.vel[2] = vz * speed;
-                // While moving, align yaw with look vector and zero pitch/roll to stay upright
+                // While moving, ensure entity yaw aligns to facing on XZ (optional; keeps model heading)
                 if (self.move_forward or self.move_back or self.move_left or self.move_right) {
-                    const look_yaw: f32 = std.math.atan2(e.look_dir[2], e.look_dir[0]);
-                    e.yaw_pitch_roll = .{ look_yaw, 0, 0 };
+                    const facing_yaw: f32 = std.math.atan2(e.facing_dir_xz[1], e.facing_dir_xz[0]);
+                    e.yaw_pitch_roll = .{ facing_yaw, 0, 0 };
                 }
                 // Jump impulse on edge press if on ground
                 if (self.jump_pressed and e.flags.on_ground) {
@@ -1156,45 +1246,60 @@ pub const Client = struct {
         return m;
     }
 
-    fn makeView(eye: [3]f32, forward: [3]f32, up_in: [3]f32) [16]f32 {
+    fn makeViewConv(eye: [3]f32, forward: [3]f32, up_in: [3]f32, conventional: bool) [16]f32 {
+        // normalize forward
         const f0 = forward[0];
         const f1 = forward[1];
         const f2 = forward[2];
-        // normalize f
         const flen: f32 = @sqrt(f0 * f0 + f1 * f1 + f2 * f2);
-        const fx = f0 / flen;
-        const fy = f1 / flen;
-        const fz = f2 / flen;
-        // s = normalize(cross(up, f)) to match input/movement handedness
-        const sx0 = up_in[1] * fz - up_in[2] * fy;
-        const sy0 = up_in[2] * fx - up_in[0] * fz;
-        const sz0 = up_in[0] * fy - up_in[1] * fx;
+        const fx = if (flen > 0.000001) (f0 / flen) else 1.0;
+        const fy = if (flen > 0.000001) (f1 / flen) else 0.0;
+        const fz = if (flen > 0.000001) (f2 / flen) else 0.0;
+        // s = normalize(cross(f, up)) (conventional) or cross(up, f)
+        var sx0: f32 = undefined;
+        var sy0: f32 = undefined;
+        var sz0: f32 = undefined;
+        if (conventional) {
+            // cross(f, up)
+            sx0 = fy * up_in[2] - fz * up_in[1];
+            sy0 = fz * up_in[0] - fx * up_in[2];
+            sz0 = fx * up_in[1] - fy * up_in[0];
+        } else {
+            // cross(up, f)
+            sx0 = up_in[1] * fz - up_in[2] * fy;
+            sy0 = up_in[2] * fx - up_in[0] * fz;
+            sz0 = up_in[0] * fy - up_in[1] * fx;
+        }
         const slen: f32 = @sqrt(sx0 * sx0 + sy0 * sy0 + sz0 * sz0);
         const sx = sx0 / slen;
         const sy = sy0 / slen;
         const sz = sz0 / slen;
-        // u = cross(f, s)
-        const ux = fy * sz - fz * sy;
-        const uy = fz * sx - fx * sz;
-        const uz = fx * sy - fy * sx;
+        // u = cross(s, f)
+        const ux = sy * fz - sz * fy;
+        const uy = sz * fx - sx * fz;
+        const uz = sx * fy - sy * fx;
+        return makeViewFromBasis(eye, .{ sx, sy, sz }, .{ ux, uy, uz }, .{ fx, fy, fz });
+    }
+
+    fn makeViewFromBasis(eye: [3]f32, s: [3]f32, u: [3]f32, f: [3]f32) [16]f32 {
         var m: [16]f32 = undefined;
-        m[0] = sx;
-        m[4] = ux;
-        m[8] = -fx;
+        m[0] = s[0];
+        m[4] = u[0];
+        // Use OpenGL-style view with -f in the third column (camera looks down -Z in view space)
+        m[8] = -f[0];
         m[12] = 0;
-        m[1] = sy;
-        m[5] = uy;
-        m[9] = -fy;
+        m[1] = s[1];
+        m[5] = u[1];
+        m[9] = -f[1];
         m[13] = 0;
-        m[2] = sz;
-        m[6] = uz;
-        m[10] = -fz;
+        m[2] = s[2];
+        m[6] = u[2];
+        m[10] = -f[2];
         m[14] = 0;
         m[3] = 0;
         m[7] = 0;
         m[11] = 0;
         m[15] = 1;
-        // translation
         var t: [16]f32 = [_]f32{0} ** 16;
         t[0] = 1;
         t[5] = 1;
@@ -1204,5 +1309,19 @@ pub const Client = struct {
         t[13] = -eye[1];
         t[14] = -eye[2];
         return matMul(m, t);
+    }
+
+    fn makeViewNoRoll(self: *Client, eye: [3]f32, yaw: f32, pitch: f32) [16]f32 {
+        _ = self;
+        const cy = @cos(yaw);
+        const sy = @sin(yaw);
+        const cp = @cos(pitch);
+        const sp = @sin(pitch);
+        // forward from yaw/pitch
+        const f: [3]f32 = .{ cp * cy, sp, cp * sy };
+        // force horizon: right is strictly horizontal, up is world +Y
+        const s: [3]f32 = .{ -sy, 0, cy };
+        const u: [3]f32 = .{ 0, 1, 0 };
+        return makeViewFromBasis(eye, s, u, f);
     }
 };
