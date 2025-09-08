@@ -191,16 +191,16 @@ export fn frame() void {
 }
 
 export fn cleanup() void {
-    // stop and deinit simulation if present
+    // deinit client first to stop background threads that reference Simulation
+    if (state.client) |*c| {
+        c.deinit();
+        state.client = null;
+    }
+    // then stop and deinit simulation
     if (state.sim) |*s| {
         s.stop();
         s.deinit();
         state.sim = null;
-    }
-    // deinit client
-    if (state.client) |*c| {
-        c.deinit();
-        state.client = null;
     }
 
     // shutdown debug text first

@@ -156,7 +156,43 @@ inline fn emitQuad(allocator: std.mem.Allocator, list: *std.ArrayList(Vertex), v
 // Cached mesh types (region-level aggregation)
 const SectionMesh = struct { first: u32 = 0, count: u32 = 0 };
 const SectionDraw = struct { chunk_pos: gs.ChunkPos, sy: u16, first: u32, count: u32 };
-const RegionMesh = struct { vbuf: sg.Buffer = .{}, draws: []SectionDraw, built_chunk_count: usize = 0 };
+const RegionMesh = struct {
+    vbuf: sg.Buffer = .{},
+    draws: []SectionDraw,
+    built_chunk_count: usize = 0,
+    dirty: bool = false,
+    inflight: bool = false,
+    last_built_frame: u32 = 0,
+};
+
+const MeshingJob = struct { rpos: simulation.RegionPos };
+const MeshingResult = struct { rpos: simulation.RegionPos, built_chunk_count: usize, verts: []Vertex, draws: []SectionDraw };
+
+// Snapshot types for background meshing
+const SectionSnapshot = struct {
+    palette: []u32,
+    blocks_indices_bits: []u32,
+};
+
+const ChunkSnapshot = struct {
+    pos: gs.ChunkPos,
+    sections: []SectionSnapshot,
+};
+
+const RegionSnapshot = struct {
+    rpos: simulation.RegionPos,
+    base_cx: i32,
+    base_cz: i32,
+    section_count_y: u16,
+    chunks: []ChunkSnapshot,
+    // 32x32 grid mapping local (x,z) -> chunk index or -1
+    grid_map: []i32,
+};
+
+// Temporary slice-ref structs for capturing under lock, then copying outside the lock
+const SectionSliceRefs = struct { pal_ptr: [*]const u32, pal_len: usize, bits_ptr: [*]const u32, bits_len: usize };
+const ChunkSliceRefs = struct { pos: gs.ChunkPos, sections: []SectionSliceRefs };
+const RegionSliceRefs = struct { rpos: simulation.RegionPos, section_count_y: u16, base_cx: i32, base_cz: i32, chunks: []ChunkSliceRefs };
 
 const REGION_MESH_BUDGET: usize = 128; // generous, regions are fewer than chunks
 
@@ -583,6 +619,25 @@ pub const Client = struct {
     last_visible_frame_region: std.AutoHashMap(simulation.RegionPos, u32) = undefined,
     frame_index: u32 = 0,
 
+    // Meshing throttle
+    rebuild_budget_per_frame: u32 = 1,
+    rebuilds_issued_this_frame: u32 = 0,
+    rebuild_cooldown_frames: u32 = 8,
+
+    // Background mesher
+    mesher_mutex: std.Thread.Mutex = .{},
+    mesher_cv: std.Thread.Condition = .{},
+    mesher_jobs: std.ArrayList(MeshingJob) = undefined,
+    mesher_results: std.ArrayList(MeshingResult) = undefined,
+    mesher_threads: std.ArrayList(std.Thread) = undefined,
+    mesher_running: bool = false,
+    mesher_started: bool = false,
+    adopt_budget_per_frame: u32 = 1,
+
+    // Debug counters
+    dbg_last_scheduled: u32 = 0,
+    dbg_last_adopted: u32 = 0,
+
     // Camera mirrored from player entity (position only; orientation is client-local)
     camera: Camera = .{},
 
@@ -634,7 +689,67 @@ pub const Client = struct {
             .region_mesh_cache = std.AutoHashMap(simulation.RegionPos, RegionMesh).init(allocator),
             .last_visible_frame_chunk = std.AutoHashMap(gs.ChunkPos, u32).init(allocator),
             .last_visible_frame_region = std.AutoHashMap(simulation.RegionPos, u32).init(allocator),
+            .mesher_jobs = std.ArrayList(MeshingJob).initCapacity(allocator, 0) catch unreachable,
+            .mesher_results = std.ArrayList(MeshingResult).initCapacity(allocator, 0) catch unreachable,
+            .mesher_threads = std.ArrayList(std.Thread).initCapacity(allocator, 0) catch unreachable,
         };
+    }
+
+    fn mesherThreadMain(self: *Client) void {
+        // mark started (debug)
+        self.mesher_started = true;
+        const alloc = std.heap.page_allocator;
+        while (true) {
+            // Wait for a job
+            self.mesher_mutex.lock();
+            while (self.mesher_running and self.mesher_jobs.items.len == 0) self.mesher_cv.wait(&self.mesher_mutex);
+            if (!self.mesher_running) {
+                self.mesher_mutex.unlock();
+                return;
+            }
+            const job = self.mesher_jobs.items[self.mesher_jobs.items.len - 1];
+            _ = self.mesher_jobs.pop();
+            self.mesher_mutex.unlock();
+
+            // Under world lock: gather slice refs only (no large allocations or copies)
+            self.sim.worlds_mutex.lock();
+            const ws_ptr = self.sim.worlds_state.getPtr("minecraft:overworld") orelse {
+                self.sim.worlds_mutex.unlock();
+                continue;
+            };
+            const rs_ptr = ws_ptr.regions.getPtr(job.rpos) orelse {
+                self.sim.worlds_mutex.unlock();
+                continue;
+            };
+            var refs = self.buildRegionRefsUnderLock(alloc, ws_ptr, rs_ptr, job.rpos);
+            self.sim.worlds_mutex.unlock();
+
+            if (refs.chunks.len == 0) {
+                self.freeRegionRefs(alloc, &refs);
+                continue;
+            }
+
+            // Outside the world lock: copy data into an owned snapshot and free refs
+            var snap = self.copySnapshotFromRefs(alloc, &refs);
+            self.freeRegionRefs(alloc, &refs);
+
+            if (snap.chunks.len == 0) {
+                self.freeRegionSnapshot(alloc, &snap);
+                continue;
+            }
+
+            // Mesh from snapshot (no locks)
+            const result = self.meshRegionFromSnapshot(alloc, &snap);
+            self.freeRegionSnapshot(alloc, &snap);
+
+            // Publish result
+            self.mesher_mutex.lock();
+            self.mesher_results.append(self.allocator, result) catch {
+                if (result.verts.len > 0) alloc.free(result.verts);
+                if (result.draws.len > 0) self.allocator.free(result.draws);
+            };
+            self.mesher_mutex.unlock();
+        }
     }
 
     // Enable/disable raw mouse input if supported by the sokol app wrapper
@@ -656,6 +771,26 @@ pub const Client = struct {
         if (self.pip.id != 0) sg.destroyPipeline(self.pip);
         if (self.quad_pip.id != 0) sg.destroyPipeline(self.quad_pip);
         if (self.shd.id != 0) sg.destroyShader(self.shd);
+
+        // Stop mesher threads
+        if (self.mesher_running) {
+            self.mesher_mutex.lock();
+            self.mesher_running = false;
+            self.mesher_cv.broadcast();
+            self.mesher_mutex.unlock();
+            var i: usize = 0;
+            while (i < self.mesher_threads.items.len) : (i += 1) self.mesher_threads.items[i].join();
+            self.mesher_threads.deinit(self.allocator);
+            // Free any pending results
+            var r: usize = 0;
+            while (r < self.mesher_results.items.len) : (r += 1) {
+                const mr = self.mesher_results.items[r];
+                std.heap.page_allocator.free(mr.verts);
+                self.allocator.free(mr.draws);
+            }
+            self.mesher_results.deinit(self.allocator);
+            self.mesher_jobs.deinit(self.allocator);
+        }
 
         // Deinitialize atlas map (values only; keys are borrowed from registry)
         // Destroy cached region meshes
@@ -748,6 +883,12 @@ pub const Client = struct {
         qdesc.color_count = 1;
         qdesc.colors[0].pixel_format = desc.environment.defaults.color_format;
         self.quad_pip = sg.makePipeline(qdesc);
+
+        // Defer starting mesher threads until first frame when this Client is stored in state
+        self.mesher_running = false;
+        self.mesher_started = false;
+        // honor user's request: adopt 1 result per frame
+        self.adopt_budget_per_frame = 1;
 
         // dynamic vertex buffer; start with a generous capacity (e.g., 16384 verts)
         const initial_vcount: usize = 16 * 16 * 16; // plenty for top + sides on flat worlds
@@ -999,8 +1140,8 @@ pub const Client = struct {
         if (idx_opt) |idx| {
             if (idx < self.sim.dynamic_entities.items.len) {
                 const e = self.sim.dynamic_entities.items[idx];
-                cx = @divTrunc(@as(i32, @intFromFloat(e.pos[0])), 16);
-                cz = @divTrunc(@as(i32, @intFromFloat(e.pos[2])), 16);
+                cx = @divFloor(@as(i32, @intFromFloat(@floor(e.pos[0]))), 16);
+                cz = @divFloor(@as(i32, @intFromFloat(@floor(e.pos[2]))), 16);
                 has_pos = true;
             }
         }
@@ -1011,6 +1152,43 @@ pub const Client = struct {
             // Initialize camera now that the world around the player exists
             self.updateCameraFromPlayer();
         }
+    }
+
+    fn startMesherIfNeeded(self: *Client) void {
+        if (!self.mesher_started) {
+            self.mesher_running = true;
+            const thread_count: usize = 1;
+            self.mesher_threads.ensureTotalCapacity(self.allocator, thread_count) catch return;
+            var ti: usize = 0;
+            while (ti < thread_count) : (ti += 1) {
+                const th = std.Thread.spawn(.{}, mesherThreadMain, .{self}) catch break;
+                self.mesher_threads.appendAssumeCapacity(th);
+            }
+            self.mesher_started = true;
+        }
+    }
+
+    fn pumpMesherScheduleAndAdopt(self: *Client) void {
+        // Snapshot regions and chunk counts, schedule jobs, and adopt results without drawing
+        const wk = "minecraft:overworld";
+        var regions = std.ArrayList(struct { rpos: simulation.RegionPos, chunk_count: usize }).initCapacity(self.allocator, 0) catch return;
+        defer regions.deinit(self.allocator);
+        self.sim.worlds_mutex.lock();
+        const ws = self.sim.worlds_state.getPtr(wk);
+        if (ws) |ws_ptr| {
+            var reg_it = ws_ptr.regions.iterator();
+            while (reg_it.next()) |rentry| {
+                regions.append(self.allocator, .{ .rpos = rentry.key_ptr.*, .chunk_count = rentry.value_ptr.chunks.items.len }) catch {};
+            }
+        }
+        self.sim.worlds_mutex.unlock();
+        // reset issuance counter for this prepass
+        self.rebuilds_issued_this_frame = 0;
+        var i: usize = 0;
+        while (i < regions.items.len) : (i += 1) self.ensureRegionMesh(regions.items[i].rpos, regions.items[i].chunk_count);
+        self.dbg_last_scheduled = self.rebuilds_issued_this_frame;
+        // adopt after scheduling
+        self.adoptMesherResults();
     }
 
     pub fn frame(self: *Client) void {
@@ -1038,6 +1216,11 @@ pub const Client = struct {
 
         sg.beginPass(.{ .action = self.pass_action, .swapchain = sglue.swapchain() });
 
+        // Ensure mesher thread(s) started after this Client is fully stored
+        self.startMesherIfNeeded();
+        // Even if not ready, keep background mesher pumping so meshes are ready when world appears
+        self.pumpMesherScheduleAndAdopt();
+
         // If textures not ready, draw a Texturing overlay and return early
         if (!self.textures_ready) {
             const scale: f32 = self.ui_scale;
@@ -1060,8 +1243,10 @@ pub const Client = struct {
             return;
         }
 
-        // If not ready, draw a simple Connecting overlay and return early
+        // If not ready, keep mesher pumping and draw a simple Connecting overlay, then return early
         if (!self.ready) {
+            // one more pump (in case new regions appeared this frame)
+            self.pumpMesherScheduleAndAdopt();
             const scale: f32 = self.ui_scale;
             const w_px: f32 = @floatFromInt(sapp.width());
             const h_px: f32 = @floatFromInt(sapp.height());
@@ -1125,16 +1310,32 @@ pub const Client = struct {
             sdtx.font(4);
 
             const snap = self.pollSnapshot().*;
-            var buf: [96:0]u8 = undefined;
-            const text_slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "Tick: {d}  TPS: {d:.2}  FPS: {d:.1}", .{ snap.tick, snap.rolling_tps, self.fps_value }) catch "Ticks: ?";
-            buf[text_slice.len] = 0;
-            const text: [:0]const u8 = buf[0..text_slice.len :0];
             const cols_f: f32 = (w_px / scale) / 8.0;
-            const text_cols_f: f32 = @floatFromInt(text.len);
-            const col_start_f: f32 = @max(0.0, cols_f - text_cols_f - 1.0);
+            // Right-aligned, one datum per line
+            var tbuf: [64:0]u8 = undefined;
+            var slice = std.fmt.bufPrint(tbuf[0 .. tbuf.len - 1], "Tick: {d}", .{snap.tick}) catch "Tick: ?";
+            tbuf[slice.len] = 0;
+            var line: [:0]const u8 = tbuf[0..slice.len :0];
+            var col_start_f: f32 = @max(0.0, cols_f - @as(f32, @floatFromInt(line.len)) - 1.0);
             sdtx.pos(col_start_f, 1.0);
             sdtx.color3b(255, 255, 255);
-            sdtx.puts(text);
+            sdtx.puts(line);
+
+            slice = std.fmt.bufPrint(tbuf[0 .. tbuf.len - 1], "TPS: {d:.2}", .{snap.rolling_tps}) catch "TPS: ?";
+            tbuf[slice.len] = 0;
+            line = tbuf[0..slice.len :0];
+            col_start_f = @max(0.0, cols_f - @as(f32, @floatFromInt(line.len)) - 1.0);
+            sdtx.pos(col_start_f, 2.0);
+            sdtx.color3b(255, 255, 255);
+            sdtx.puts(line);
+
+            slice = std.fmt.bufPrint(tbuf[0 .. tbuf.len - 1], "FPS: {d:.1}", .{self.fps_value}) catch "FPS: ?";
+            tbuf[slice.len] = 0;
+            line = tbuf[0..slice.len :0];
+            col_start_f = @max(0.0, cols_f - @as(f32, @floatFromInt(line.len)) - 1.0);
+            sdtx.pos(col_start_f, 3.0);
+            sdtx.color3b(255, 255, 255);
+            sdtx.puts(line);
 
             // Left-side debug: player's position and look vector
             // Gather current player entity safely
@@ -1166,6 +1367,129 @@ pub const Client = struct {
             sdtx.pos(1.0, 2.0);
             sdtx.color3b(255, 255, 255);
             sdtx.puts(ltxt);
+
+            // World and mesher stats
+            // Count regions and chunks under lock
+            var regions_count: usize = 0;
+            var chunks_count: usize = 0;
+            self.sim.worlds_mutex.lock();
+            const ws_dbg = self.sim.worlds_state.getPtr("minecraft:overworld");
+            if (ws_dbg) |wsp| {
+                var it = wsp.regions.iterator();
+                while (it.next()) |entry| {
+                    regions_count += 1;
+                    chunks_count += entry.value_ptr.chunks.items.len;
+                }
+            }
+            self.sim.worlds_mutex.unlock();
+
+            // Mesher queues and cache counts
+            var jobs_len: usize = 0;
+            var results_len: usize = 0;
+            self.mesher_mutex.lock();
+            jobs_len = self.mesher_jobs.items.len;
+            results_len = self.mesher_results.items.len;
+            self.mesher_mutex.unlock();
+            var rcache_count: usize = 0;
+            var inflight_count: usize = 0;
+            var it_rm = self.region_mesh_cache.valueIterator();
+            while (it_rm.next()) |rmc| {
+                rcache_count += 1;
+                if (rmc.inflight) inflight_count += 1;
+            }
+
+            // World group header
+            const world_hdr: [:0]const u8 = "World";
+            sdtx.pos(1.0, 3.0);
+            sdtx.color3b(180, 220, 255);
+            sdtx.puts(world_hdr);
+
+            // World stats under header
+            var wbuf: [64:0]u8 = undefined;
+            var wslice = std.fmt.bufPrint(wbuf[0 .. wbuf.len - 1], "regions: {d}", .{regions_count}) catch "regions: ?";
+            wbuf[wslice.len] = 0;
+            var wline: [:0]const u8 = wbuf[0..wslice.len :0];
+            sdtx.pos(1.0, 4.0);
+            sdtx.color3b(180, 220, 255);
+            sdtx.puts(wline);
+
+            wslice = std.fmt.bufPrint(wbuf[0 .. wbuf.len - 1], "chunks: {d}", .{chunks_count}) catch "chunks: ?";
+            wbuf[wslice.len] = 0;
+            wline = wbuf[0..wslice.len :0];
+            sdtx.pos(1.0, 5.0);
+            sdtx.color3b(180, 220, 255);
+            sdtx.puts(wline);
+
+            wslice = std.fmt.bufPrint(wbuf[0 .. wbuf.len - 1], "ready: {s}", .{if (self.ready) "true" else "false"}) catch "ready: ?";
+            wbuf[wslice.len] = 0;
+            wline = wbuf[0..wslice.len :0];
+            sdtx.pos(1.0, 6.0);
+            sdtx.color3b(180, 220, 255);
+            sdtx.puts(wline);
+
+            // Mesher group header
+            const mesher_hdr: [:0]const u8 = "Mesher";
+            sdtx.pos(1.0, 7.0);
+            sdtx.color3b(180, 255, 180);
+            sdtx.puts(mesher_hdr);
+
+            // Mesher stats under header
+            var mbuf: [72:0]u8 = undefined;
+            var mslice = std.fmt.bufPrint(mbuf[0 .. mbuf.len - 1], "jobs: {d}", .{jobs_len}) catch "jobs: ?";
+            mbuf[mslice.len] = 0;
+            var mline: [:0]const u8 = mbuf[0..mslice.len :0];
+            sdtx.pos(1.0, 8.0);
+            sdtx.color3b(180, 255, 180);
+            sdtx.puts(mline);
+
+            mslice = std.fmt.bufPrint(mbuf[0 .. mbuf.len - 1], "results: {d}", .{results_len}) catch "results: ?";
+            mbuf[mslice.len] = 0;
+            mline = mbuf[0..mslice.len :0];
+            sdtx.pos(1.0, 9.0);
+            sdtx.color3b(180, 255, 180);
+            sdtx.puts(mline);
+
+            mslice = std.fmt.bufPrint(mbuf[0 .. mbuf.len - 1], "inflight: {d}", .{inflight_count}) catch "inflight: ?";
+            mbuf[mslice.len] = 0;
+            mline = mbuf[0..mslice.len :0];
+            sdtx.pos(1.0, 10.0);
+            sdtx.color3b(180, 255, 180);
+            sdtx.puts(mline);
+
+            mslice = std.fmt.bufPrint(mbuf[0 .. mbuf.len - 1], "rcache: {d}", .{rcache_count}) catch "rcache: ?";
+            mbuf[mslice.len] = 0;
+            mline = mbuf[0..mslice.len :0];
+            sdtx.pos(1.0, 11.0);
+            sdtx.color3b(180, 255, 180);
+            sdtx.puts(mline);
+
+            mslice = std.fmt.bufPrint(mbuf[0 .. mbuf.len - 1], "scheduled: {d}", .{self.dbg_last_scheduled}) catch "scheduled: ?";
+            mbuf[mslice.len] = 0;
+            mline = mbuf[0..mslice.len :0];
+            sdtx.pos(1.0, 12.0);
+            sdtx.color3b(180, 255, 180);
+            sdtx.puts(mline);
+
+            mslice = std.fmt.bufPrint(mbuf[0 .. mbuf.len - 1], "adopted: {d}", .{self.dbg_last_adopted}) catch "adopted: ?";
+            mbuf[mslice.len] = 0;
+            mline = mbuf[0..mslice.len :0];
+            sdtx.pos(1.0, 13.0);
+            sdtx.color3b(180, 255, 180);
+            sdtx.puts(mline);
+
+            mslice = std.fmt.bufPrint(mbuf[0 .. mbuf.len - 1], "threads: {d}", .{self.mesher_threads.items.len}) catch "threads: ?";
+            mbuf[mslice.len] = 0;
+            mline = mbuf[0..mslice.len :0];
+            sdtx.pos(1.0, 14.0);
+            sdtx.color3b(180, 255, 180);
+            sdtx.puts(mline);
+
+            mslice = std.fmt.bufPrint(mbuf[0 .. mbuf.len - 1], "running: {s}", .{if (self.mesher_running) "true" else "false"}) catch "running: ?";
+            mbuf[mslice.len] = 0;
+            mline = mbuf[0..mslice.len :0];
+            sdtx.pos(1.0, 15.0);
+            sdtx.color3b(180, 255, 180);
+            sdtx.puts(mline);
 
             sdtx.draw();
         }
@@ -1443,14 +1767,14 @@ pub const Client = struct {
         // Cross-chunk in X
         if (nx < 0) {
             cpos_x -= 1;
-            const rp_w = simulation.RegionPos{ .x = @divTrunc(cpos_x, 32), .z = @divTrunc(cpos_z, 32) };
+            const rp_w = simulation.RegionPos{ .x = @divFloor(cpos_x, 32), .z = @divFloor(cpos_z, 32) };
             const rsn = ws.regions.getPtr(rp_w) orelse return false;
             const idxn = rsn.chunk_index.get(.{ .x = cpos_x, .z = cpos_z }) orelse return false;
             chn = &rsn.chunks.items[idxn];
             nx += @as(i32, @intCast(constants.chunk_size_x));
         } else if (nx >= @as(i32, @intCast(constants.chunk_size_x))) {
             cpos_x += 1;
-            const rp_e = simulation.RegionPos{ .x = @divTrunc(cpos_x, 32), .z = @divTrunc(cpos_z, 32) };
+            const rp_e = simulation.RegionPos{ .x = @divFloor(cpos_x, 32), .z = @divFloor(cpos_z, 32) };
             const rsn2 = ws.regions.getPtr(rp_e) orelse return false;
             const idxn2 = rsn2.chunk_index.get(.{ .x = cpos_x, .z = cpos_z }) orelse return false;
             chn = &rsn2.chunks.items[idxn2];
@@ -1459,14 +1783,14 @@ pub const Client = struct {
         // Cross-chunk in Z
         if (nz < 0) {
             cpos_z -= 1;
-            const rp_n = simulation.RegionPos{ .x = @divTrunc(cpos_x, 32), .z = @divTrunc(cpos_z, 32) };
+            const rp_n = simulation.RegionPos{ .x = @divFloor(cpos_x, 32), .z = @divFloor(cpos_z, 32) };
             const rsn3 = ws.regions.getPtr(rp_n) orelse return false;
             const idxn3 = rsn3.chunk_index.get(.{ .x = cpos_x, .z = cpos_z }) orelse return false;
             chn = &rsn3.chunks.items[idxn3];
             nz += @as(i32, @intCast(constants.chunk_size_z));
         } else if (nz >= @as(i32, @intCast(constants.chunk_size_z))) {
             cpos_z += 1;
-            const rp_s = simulation.RegionPos{ .x = @divTrunc(cpos_x, 32), .z = @divTrunc(cpos_z, 32) };
+            const rp_s = simulation.RegionPos{ .x = @divFloor(cpos_x, 32), .z = @divFloor(cpos_z, 32) };
             const rsn4 = ws.regions.getPtr(rp_s) orelse return false;
             const idxn4 = rsn4.chunk_index.get(.{ .x = cpos_x, .z = cpos_z }) orelse return false;
             chn = &rsn4.chunks.items[idxn4];
@@ -1669,28 +1993,14 @@ pub const Client = struct {
     }
 
     // Build a single region mesh (one buffer) by concatenating all section vertices of all chunks in the region
-    fn ensureRegionMesh(self: *Client, ws: *const simulation.WorldState, rpos: simulation.RegionPos, rs: *const simulation.RegionState) void {
-        if (self.region_mesh_cache.getPtr(rpos)) |existing| {
-            // Rebuild if chunk count changed (new chunks streamed in)
-            if (existing.built_chunk_count == rs.chunks.items.len and existing.vbuf.id != 0) return;
-            // otherwise, destroy and rebuild below
-            if (existing.vbuf.id != 0) sg.destroyBuffer(existing.vbuf);
-            self.allocator.free(existing.draws);
-            _ = self.region_mesh_cache.remove(rpos);
-        }
-        // Enforce a cap on live region buffers
-        if (self.regionMeshCacheCount() >= REGION_MESH_BUDGET) return;
-
-        var draws = self.allocator.alloc(SectionDraw, rs.chunks.items.len * @as(usize, @intCast(ws.section_count_y))) catch return;
+    fn buildRegionMeshNow(self: *Client, ws: *const simulation.WorldState, rs: *const simulation.RegionState) RegionMesh {
+        var draws = self.allocator.alloc(SectionDraw, rs.chunks.items.len * @as(usize, @intCast(ws.section_count_y))) catch return .{ .vbuf = .{}, .draws = &[_]SectionDraw{}, .built_chunk_count = 0, .dirty = false, .inflight = false, .last_built_frame = self.frame_index };
         var draws_len: usize = 0;
-
         var verts = std.ArrayList(Vertex).initCapacity(self.allocator, 0) catch {
             self.allocator.free(draws);
-            return;
+            return .{ .vbuf = .{}, .draws = &[_]SectionDraw{}, .built_chunk_count = 0, .dirty = false, .inflight = false, .last_built_frame = self.frame_index };
         };
         defer verts.deinit(self.allocator);
-
-        // Iterate all chunks in region and build their sections into the shared vertex list
         for (rs.chunks.items) |ch| {
             const base_x: f32 = @floatFromInt(ch.pos.x * @as(i32, @intCast(constants.chunk_size_x)));
             const base_z: f32 = @floatFromInt(ch.pos.z * @as(i32, @intCast(constants.chunk_size_z)));
@@ -1705,49 +2015,525 @@ pub const Client = struct {
                 }
             }
         }
-
-        // Shrink draws array to actual length
         if (draws_len < draws.len) {
             const new_draws = self.allocator.alloc(SectionDraw, draws_len) catch {
                 self.allocator.free(draws);
-                return;
+                return .{ .vbuf = .{}, .draws = &[_]SectionDraw{}, .built_chunk_count = 0, .dirty = false, .inflight = false, .last_built_frame = self.frame_index };
             };
             @memcpy(new_draws[0..draws_len], draws[0..draws_len]);
             self.allocator.free(draws);
             draws = new_draws;
         }
-
         var buf: sg.Buffer = .{};
         if (verts.items.len > 0) {
             buf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true }, .data = sg.asRange(verts.items) });
         }
+        return .{ .vbuf = buf, .draws = draws, .built_chunk_count = rs.chunks.items.len, .dirty = false, .inflight = false, .last_built_frame = self.frame_index };
+    }
 
-        _ = self.region_mesh_cache.put(rpos, .{ .vbuf = buf, .draws = draws, .built_chunk_count = rs.chunks.items.len }) catch {
-            if (buf.id != 0) sg.destroyBuffer(buf);
-            self.allocator.free(draws);
+    // Under world lock: capture slice refs for a region (no heavy copies)
+    fn buildRegionRefsUnderLock(self: *Client, alloc: std.mem.Allocator, ws: *const simulation.WorldState, rs: *const simulation.RegionState, rpos: simulation.RegionPos) RegionSliceRefs {
+        _ = self;
+        var refs: RegionSliceRefs = .{ .rpos = rpos, .section_count_y = ws.section_count_y, .base_cx = rpos.x * 32, .base_cz = rpos.z * 32, .chunks = &[_]ChunkSliceRefs{} };
+        const count: usize = rs.chunks.items.len;
+        if (count == 0) return refs;
+        var chunks = alloc.alloc(ChunkSliceRefs, count) catch return refs;
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const ch = rs.chunks.items[i];
+            const sec_count = ch.sections.len;
+            var secs: []SectionSliceRefs = &[_]SectionSliceRefs{};
+            if (sec_count > 0) secs = alloc.alloc(SectionSliceRefs, sec_count) catch &[_]SectionSliceRefs{};
+            var sy: usize = 0;
+            while (sy < secs.len) : (sy += 1) {
+                const s = ch.sections[sy];
+                secs[sy] = .{ .pal_ptr = s.palette.ptr, .pal_len = s.palette.len, .bits_ptr = s.blocks_indices_bits.ptr, .bits_len = s.blocks_indices_bits.len };
+            }
+            chunks[i] = .{ .pos = ch.pos, .sections = secs };
+        }
+        refs.chunks = chunks;
+        return refs;
+    }
+
+    fn freeRegionRefs(self: *Client, alloc: std.mem.Allocator, refs: *RegionSliceRefs) void {
+        _ = self;
+        var i: usize = 0;
+        while (i < refs.chunks.len) : (i += 1) {
+            const ch = refs.chunks[i];
+            if (ch.sections.len > 0) alloc.free(ch.sections);
+        }
+        if (refs.chunks.len > 0) alloc.free(refs.chunks);
+        refs.* = .{ .rpos = refs.rpos, .section_count_y = refs.section_count_y, .base_cx = refs.base_cx, .base_cz = refs.base_cz, .chunks = &[_]ChunkSliceRefs{} };
+    }
+
+    // Outside world lock: copy refs into an owned RegionSnapshot
+    fn copySnapshotFromRefs(self: *Client, alloc: std.mem.Allocator, refs: *const RegionSliceRefs) RegionSnapshot {
+        _ = self;
+        var snap: RegionSnapshot = .{
+            .rpos = refs.rpos,
+            .base_cx = refs.base_cx,
+            .base_cz = refs.base_cz,
+            .section_count_y = refs.section_count_y,
+            .chunks = &[_]ChunkSnapshot{},
+            .grid_map = &[_]i32{},
+        };
+        const count: usize = refs.chunks.len;
+        if (count == 0) return snap;
+        var chunks = alloc.alloc(ChunkSnapshot, count) catch return snap;
+        var grid = alloc.alloc(i32, 32 * 32) catch {
+            alloc.free(chunks);
+            return snap;
+        };
+        var gi: usize = 0;
+        while (gi < grid.len) : (gi += 1) grid[gi] = -1;
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const chref = refs.chunks[i];
+            const pos = chref.pos;
+            const lx: i32 = pos.x - snap.base_cx;
+            const lz: i32 = pos.z - snap.base_cz;
+            if (!(lx >= 0 and lx < 32 and lz >= 0 and lz < 32)) {
+                chunks[i] = .{ .pos = pos, .sections = &[_]SectionSnapshot{} };
+                continue;
+            }
+            const m_idx: usize = @intCast(@as(usize, @intCast(lz)) * 32 + @as(usize, @intCast(lx)));
+            grid[m_idx] = @intCast(i);
+            var secs: []SectionSnapshot = &[_]SectionSnapshot{};
+            if (chref.sections.len > 0) secs = alloc.alloc(SectionSnapshot, chref.sections.len) catch &[_]SectionSnapshot{};
+            var sy: usize = 0;
+            while (sy < secs.len) : (sy += 1) {
+                const sref = chref.sections[sy];
+                var pal: []u32 = &[_]u32{};
+                var bits: []u32 = &[_]u32{};
+                if (sref.pal_len > 0) {
+                    pal = alloc.alloc(u32, sref.pal_len) catch &[_]u32{};
+                    if (pal.len == sref.pal_len) @memcpy(pal[0..pal.len], sref.pal_ptr[0..sref.pal_len]);
+                }
+                if (sref.bits_len > 0) {
+                    bits = alloc.alloc(u32, sref.bits_len) catch &[_]u32{};
+                    if (bits.len == sref.bits_len) @memcpy(bits[0..bits.len], sref.bits_ptr[0..sref.bits_len]);
+                }
+                secs[sy] = .{ .palette = pal, .blocks_indices_bits = bits };
+            }
+            chunks[i] = .{ .pos = pos, .sections = secs };
+        }
+        snap.chunks = chunks;
+        snap.grid_map = grid;
+        return snap;
+    }
+
+    fn freeRegionSnapshot(self: *Client, alloc: std.mem.Allocator, snap: *RegionSnapshot) void {
+        _ = self;
+        // free sections and their arrays
+        var i: usize = 0;
+        while (i < snap.chunks.len) : (i += 1) {
+            const ch = snap.chunks[i];
+            var sy: usize = 0;
+            while (sy < ch.sections.len) : (sy += 1) {
+                const s = ch.sections[sy];
+                if (s.palette.len > 0) alloc.free(s.palette);
+                if (s.blocks_indices_bits.len > 0) alloc.free(s.blocks_indices_bits);
+            }
+            if (ch.sections.len > 0) alloc.free(ch.sections);
+        }
+        if (snap.chunks.len > 0) alloc.free(snap.chunks);
+        if (snap.grid_map.len > 0) alloc.free(snap.grid_map);
+        // reset
+        snap.* = .{ .rpos = snap.rpos, .base_cx = snap.base_cx, .base_cz = snap.base_cz, .section_count_y = snap.section_count_y, .chunks = &[_]ChunkSnapshot{}, .grid_map = &[_]i32{} };
+    }
+
+    fn snapGetChunkIndex(snap: *const RegionSnapshot, cx: i32, cz: i32) ?usize {
+        const lx: i32 = cx - snap.base_cx;
+        const lz: i32 = cz - snap.base_cz;
+        if (!(lx >= 0 and lx < 32 and lz >= 0 and lz < 32)) return null;
+        const idx: usize = @intCast(@as(usize, @intCast(lz)) * 32 + @as(usize, @intCast(lx)));
+        const val: i32 = snap.grid_map[idx];
+        if (val < 0) return null;
+        return @intCast(val);
+    }
+
+    fn isSolidAtSnapshot(self: *Client, snap: *const RegionSnapshot, start_cx: i32, start_cz: i32, lx_in: i32, abs_y_in: i32, lz_in: i32) bool {
+        var lx = lx_in;
+        var lz = lz_in;
+        var cx = start_cx;
+        var cz = start_cz;
+        // cross-chunk X
+        if (lx < 0) {
+            cx -= 1;
+            lx += @as(i32, @intCast(constants.chunk_size_x));
+        } else if (lx >= @as(i32, @intCast(constants.chunk_size_x))) {
+            cx += 1;
+            lx -= @as(i32, @intCast(constants.chunk_size_x));
+        }
+        // cross-chunk Z
+        if (lz < 0) {
+            cz -= 1;
+            lz += @as(i32, @intCast(constants.chunk_size_z));
+        } else if (lz >= @as(i32, @intCast(constants.chunk_size_z))) {
+            cz += 1;
+            lz -= @as(i32, @intCast(constants.chunk_size_z));
+        }
+        const idx_opt = snapGetChunkIndex(snap, cx, cz);
+        if (idx_opt == null) return true; // outside snapshot => treat as solid to avoid seams
+        const ch = snap.chunks[idx_opt.?];
+        const total_y: i32 = @as(i32, @intCast(snap.section_count_y)) * @as(i32, @intCast(constants.section_height));
+        const ny = abs_y_in;
+        if (ny < 0 or ny >= total_y) return false;
+        const sy: usize = @intCast(@divTrunc(ny, @as(i32, @intCast(constants.section_height))));
+        const ly: usize = @intCast(@mod(ny, @as(i32, @intCast(constants.section_height))));
+        if (sy >= ch.sections.len) return false;
+        const s = ch.sections[sy];
+        const bpi: u6 = bitsFor(s.palette.len);
+        const idx3d: usize = @as(usize, @intCast(lz)) * (constants.chunk_size_x * constants.section_height) + @as(usize, @intCast(lx)) * constants.section_height + ly;
+        const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx3d, bpi));
+        if (pidx >= s.palette.len) return false;
+        const bid: u32 = s.palette[pidx];
+        if (bid == 0) return false;
+        if (bid < self.sim.reg.blocks.items.len) return self.sim.reg.blocks.items[@intCast(bid)].full_block_collision;
+        return true;
+    }
+
+    fn buildSectionVerticesFromSnapshot(self: *Client, snap: *const RegionSnapshot, ch: *const ChunkSnapshot, sy: usize, base_x: f32, base_z: f32, out: *std.ArrayList(Vertex), alloc: std.mem.Allocator) void {
+        const s = ch.sections[sy];
+        const pal_len = s.palette.len;
+        const bpi: u6 = bitsFor(pal_len);
+        const PalInfo = struct {
+            draw: bool,
+            solid: bool,
+            top_tx: AtlasTransform,
+            side_tx: AtlasTransform,
+        };
+        var pal_info = std.ArrayList(PalInfo).initCapacity(self.allocator, pal_len) catch {
             return;
         };
+        defer pal_info.deinit(self.allocator);
+        var pi: usize = 0;
+        while (pi < pal_len) : (pi += 1) {
+            const bid: u32 = s.palette[pi];
+            var pinfo: PalInfo = .{
+                .draw = true,
+                .solid = true,
+                .top_tx = .{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale },
+                .side_tx = .{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale },
+            };
+            if (bid < self.sim.reg.blocks.items.len) {
+                pinfo.solid = self.sim.reg.blocks.items[@intCast(bid)].full_block_collision;
+            }
+            if (bid == 0) {
+                pinfo.draw = false;
+                pinfo.solid = false;
+            } else {
+                const name = self.sim.reg.getBlockName(@intCast(bid));
+                if (self.sim.reg.resources.get(name)) |res| switch (res) {
+                    .Void => {
+                        pinfo.draw = false;
+                        pinfo.solid = false;
+                    },
+                    .Uniform => |u| {
+                        const tx: AtlasTransform = self.atlas_uv_by_path.get(u.all_path) orelse AtlasTransform{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale };
+                        pinfo.top_tx = tx;
+                        pinfo.side_tx = tx;
+                    },
+                    .Facing => |f| {
+                        const top_tx: AtlasTransform = self.atlas_uv_by_path.get(f.face_path) orelse AtlasTransform{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale };
+                        const side_tx: AtlasTransform = self.atlas_uv_by_path.get(f.other_path) orelse AtlasTransform{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale };
+                        pinfo.top_tx = top_tx;
+                        pinfo.side_tx = side_tx;
+                    },
+                };
+            }
+            pal_info.appendAssumeCapacity(pinfo);
+        }
+
+        // Greedy top faces per Y-slice
+        const FaceMat = struct { off: [2]f32, sc: [2]f32 };
+        const Mat = struct {
+            fn eq(a: FaceMat, b: FaceMat) bool {
+                return a.off[0] == b.off[0] and a.off[1] == b.off[1] and a.sc[0] == b.sc[0] and a.sc[1] == b.sc[1];
+            }
+        };
+        const section_base_y: i32 = @intCast(sy * constants.section_height);
+        var ly_top: usize = 0;
+        while (ly_top < constants.section_height) : (ly_top += 1) {
+            const abs_y: i32 = section_base_y + @as(i32, @intCast(ly_top));
+            var mask: [constants.chunk_size_z * constants.chunk_size_x]struct { present: bool, m: FaceMat } = undefined;
+            // fill mask
+            var mz: usize = 0;
+            while (mz < constants.chunk_size_z) : (mz += 1) {
+                var mx: usize = 0;
+                while (mx < constants.chunk_size_x) : (mx += 1) {
+                    const idxm: usize = mz * constants.chunk_size_x + mx;
+                    mask[idxm].present = false;
+                    const src_idx: usize = mz * (constants.chunk_size_x * constants.section_height) + mx * constants.section_height + ly_top;
+                    const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, src_idx, bpi));
+                    if (pidx >= pal_info.items.len) continue;
+                    const info = pal_info.items[pidx];
+                    if (!info.draw) continue;
+                    if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(mx)), abs_y + 1, @as(i32, @intCast(mz)))) {
+                        mask[idxm] = .{ .present = true, .m = .{ .off = info.top_tx.offset, .sc = info.top_tx.scale } };
+                    }
+                }
+            }
+            // rectangles
+            mz = 0;
+            while (mz < constants.chunk_size_z) : (mz += 1) {
+                var mx: usize = 0;
+                while (mx < constants.chunk_size_x) : (mx += 1) {
+                    const base_idx: usize = mz * constants.chunk_size_x + mx;
+                    if (!mask[base_idx].present) continue;
+                    const mkey: FaceMat = mask[base_idx].m;
+                    // width
+                    var w: usize = 1;
+                    while ((mx + w) < constants.chunk_size_x) : (w += 1) {
+                        const idx2 = mz * constants.chunk_size_x + (mx + w);
+                        if (!(mask[idx2].present and Mat.eq(mask[idx2].m, mkey))) break;
+                    }
+                    // height
+                    var h: usize = 1;
+                    outer: while ((mz + h) < constants.chunk_size_z) : (h += 1) {
+                        var kx: usize = 0;
+                        while (kx < w) : (kx += 1) {
+                            const idx3 = (mz + h) * constants.chunk_size_x + (mx + kx);
+                            if (!(mask[idx3].present and Mat.eq(mask[idx3].m, mkey))) break :outer;
+                        }
+                    }
+                    // emit quad
+                    const wx0: f32 = base_x + @as(f32, @floatFromInt(mx));
+                    const wz0: f32 = base_z + @as(f32, @floatFromInt(mz));
+                    const wx1: f32 = base_x + @as(f32, @floatFromInt(mx + w));
+                    const wz1: f32 = base_z + @as(f32, @floatFromInt(mz + h));
+                    const wy1: f32 = @as(f32, @floatFromInt(abs_y + 1));
+                    const uv00: [2]f32 = .{ 0, 0 };
+                    const uv0h: [2]f32 = .{ 0, @as(f32, @floatFromInt(h)) };
+                    const uvwh: [2]f32 = .{ @as(f32, @floatFromInt(w)), @as(f32, @floatFromInt(h)) };
+                    const uvw0: [2]f32 = .{ @as(f32, @floatFromInt(w)), 0 };
+                    emitQuad(alloc, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv0h, uvwh, uvw0, mkey.sc, mkey.off);
+                    // clear mask
+                    var zz: usize = 0;
+                    while (zz < h) : (zz += 1) {
+                        var xx: usize = 0;
+                        while (xx < w) : (xx += 1) mask[(mz + zz) * constants.chunk_size_x + (mx + xx)].present = false;
+                    }
+                }
+            }
+        }
+
+        // Remaining faces per-voxel
+        for (0..constants.chunk_size_z) |lz| {
+            for (0..constants.chunk_size_x) |lx| {
+                for (0..constants.section_height) |ly| {
+                    const idx: usize = lz * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
+                    const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx, bpi));
+                    if (pidx >= pal_info.items.len) continue;
+                    const info = pal_info.items[pidx];
+                    if (!info.draw) continue;
+
+                    const wx0: f32 = base_x + @as(f32, @floatFromInt(lx));
+                    const wy0: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(sy * constants.section_height)) + @as(i32, @intCast(ly))));
+                    const wz0: f32 = base_z + @as(f32, @floatFromInt(lz));
+                    const wx1: f32 = wx0 + 1.0;
+                    const wy1: f32 = wy0 + 1.0;
+                    const wz1: f32 = wz0 + 1.0;
+
+                    const abs_y_this: i32 = section_base_y + @as(i32, @intCast(ly));
+                    const uv00: [2]f32 = .{ 0, 0 };
+                    const uv01: [2]f32 = .{ 0, 1 };
+                    const uv11: [2]f32 = .{ 1, 1 };
+                    const uv10: [2]f32 = .{ 1, 0 };
+
+                    if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this + 1, @as(i32, @intCast(lz)))) {
+                        emitQuad(alloc, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv01, uv11, uv10, info.top_tx.scale, info.top_tx.offset);
+                    }
+                    if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this - 1, @as(i32, @intCast(lz)))) {
+                        emitQuad(alloc, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
+                    }
+                    if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) - 1, abs_y_this, @as(i32, @intCast(lz)))) {
+                        emitQuad(alloc, out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
+                    }
+                    if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) + 1, abs_y_this, @as(i32, @intCast(lz)))) {
+                        emitQuad(alloc, out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
+                    }
+                    if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) - 1)) {
+                        emitQuad(alloc, out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
+                    }
+                    if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) + 1)) {
+                        emitQuad(alloc, out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
+                    }
+                }
+            }
+        }
+    }
+
+    fn meshRegionFromSnapshot(self: *Client, alloc: std.mem.Allocator, snap: *const RegionSnapshot) MeshingResult {
+        var draws = self.allocator.alloc(SectionDraw, snap.chunks.len * @as(usize, @intCast(snap.section_count_y))) catch return .{ .rpos = snap.rpos, .built_chunk_count = 0, .verts = &[_]Vertex{}, .draws = &[_]SectionDraw{} };
+        var draws_len: usize = 0;
+        var verts = std.ArrayList(Vertex).initCapacity(alloc, 0) catch {
+            self.allocator.free(draws);
+            return .{ .rpos = snap.rpos, .built_chunk_count = 0, .verts = &[_]Vertex{}, .draws = &[_]SectionDraw{} };
+        };
+        defer verts.deinit(alloc);
+        for (snap.chunks) |ch| {
+            const base_x: f32 = @floatFromInt(ch.pos.x * @as(i32, @intCast(constants.chunk_size_x)));
+            const base_z: f32 = @floatFromInt(ch.pos.z * @as(i32, @intCast(constants.chunk_size_z)));
+            var sy: usize = 0;
+            while (sy < ch.sections.len) : (sy += 1) {
+                const start: usize = verts.items.len;
+                self.buildSectionVerticesFromSnapshot(snap, &ch, sy, base_x, base_z, &verts, alloc);
+                const count: usize = verts.items.len - start;
+                if (count > 0) {
+                    draws[draws_len] = .{ .chunk_pos = ch.pos, .sy = @intCast(sy), .first = @intCast(start), .count = @intCast(count) };
+                    draws_len += 1;
+                }
+            }
+        }
+        // shrink draws
+        if (draws_len < draws.len) {
+            const new_draws = self.allocator.alloc(SectionDraw, draws_len) catch {
+                // keep existing draws oversized
+                return .{ .rpos = snap.rpos, .built_chunk_count = snap.chunks.len, .verts = blk: {
+                    if (verts.items.len == 0) break :blk &[_]Vertex{};
+                    const owned = alloc.alloc(Vertex, verts.items.len) catch break :blk &[_]Vertex{};
+                    @memcpy(owned[0..verts.items.len], verts.items[0..verts.items.len]);
+                    break :blk owned;
+                }, .draws = draws };
+            };
+            @memcpy(new_draws[0..draws_len], draws[0..draws_len]);
+            self.allocator.free(draws);
+            draws = new_draws;
+        }
+        // copy verts into owned slice
+        var verts_owned: []Vertex = &[_]Vertex{};
+        if (verts.items.len > 0) {
+            verts_owned = alloc.alloc(Vertex, verts.items.len) catch &[_]Vertex{};
+            if (verts_owned.len == verts.items.len) @memcpy(verts_owned[0..verts.items.len], verts.items[0..verts.items.len]);
+        }
+        return .{ .rpos = snap.rpos, .built_chunk_count = snap.chunks.len, .verts = verts_owned, .draws = draws };
+    }
+
+    fn adoptMesherResults(self: *Client) void {
+        var processed: u32 = 0;
+        while (processed < self.adopt_budget_per_frame) {
+            // fetch one result
+            self.mesher_mutex.lock();
+            if (self.mesher_results.items.len == 0) {
+                self.mesher_mutex.unlock();
+                break;
+            }
+            const mr = self.mesher_results.items[self.mesher_results.items.len - 1];
+            _ = self.mesher_results.pop();
+            self.mesher_mutex.unlock();
+
+            // Upload GPU buffer
+            var buf: sg.Buffer = .{};
+            if (mr.verts.len > 0) {
+                buf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true }, .data = sg.asRange(mr.verts) });
+            }
+
+            // Swap into cache
+            if (self.region_mesh_cache.getPtr(mr.rpos)) |existing| {
+                const old = existing.*;
+                existing.* = .{ .vbuf = buf, .draws = mr.draws, .built_chunk_count = mr.built_chunk_count, .dirty = false, .inflight = false, .last_built_frame = self.frame_index };
+                if (old.vbuf.id != 0) sg.destroyBuffer(old.vbuf);
+                self.allocator.free(old.draws);
+            } else {
+                if (self.regionMeshCacheCount() < REGION_MESH_BUDGET) {
+                    const rm: RegionMesh = .{ .vbuf = buf, .draws = mr.draws, .built_chunk_count = mr.built_chunk_count, .dirty = false, .inflight = false, .last_built_frame = self.frame_index };
+                    _ = self.region_mesh_cache.put(mr.rpos, rm) catch {
+                        if (rm.vbuf.id != 0) sg.destroyBuffer(rm.vbuf);
+                        self.allocator.free(mr.draws);
+                    };
+                } else {
+                    // over budget: drop result
+                    if (buf.id != 0) sg.destroyBuffer(buf);
+                    self.allocator.free(mr.draws);
+                }
+            }
+
+            // free CPU verts
+            if (mr.verts.len > 0) std.heap.page_allocator.free(mr.verts);
+            processed += 1;
+        }
+        self.dbg_last_adopted = processed;
+    }
+
+    fn ensureRegionMesh(self: *Client, rpos: simulation.RegionPos, expected_chunk_count: usize) void {
+        // If nothing to build yet, avoid scheduling and clear any stale inflight
+        if (expected_chunk_count == 0) {
+            if (self.region_mesh_cache.getPtr(rpos)) |existing0| {
+                existing0.built_chunk_count = 0;
+                existing0.inflight = false;
+            }
+            return;
+        }
+        // If cache entry exists and is up-to-date, nothing to do
+        if (self.region_mesh_cache.getPtr(rpos)) |existing| {
+            if (existing.built_chunk_count == expected_chunk_count and existing.vbuf.id != 0) return;
+            // If a rebuild is already in-flight but appears stuck, allow reschedule after cooldown
+            if (existing.inflight) {
+                if ((self.frame_index - existing.last_built_frame) < self.rebuild_cooldown_frames) return;
+                // Reset and fall through to schedule a fresh job
+                existing.inflight = false;
+            }
+            // Throttle job issuance
+            if (self.rebuilds_issued_this_frame >= self.rebuild_budget_per_frame) return;
+            if ((self.frame_index - existing.last_built_frame) < self.rebuild_cooldown_frames) return;
+            // Mark inflight and enqueue job
+            existing.inflight = true;
+            self.mesher_mutex.lock();
+            self.mesher_jobs.append(self.allocator, .{ .rpos = rpos }) catch {};
+            self.mesher_cv.broadcast();
+            self.mesher_mutex.unlock();
+            self.rebuilds_issued_this_frame += 1;
+            return;
+        }
+        // No cache entry: if under budget, insert placeholder and schedule build
+        if (self.rebuilds_issued_this_frame >= self.rebuild_budget_per_frame) return;
+        if (self.regionMeshCacheCount() >= REGION_MESH_BUDGET) return;
+        const placeholder: RegionMesh = .{ .vbuf = .{}, .draws = &[_]SectionDraw{}, .built_chunk_count = 0, .dirty = false, .inflight = true, .last_built_frame = self.frame_index };
+        _ = self.region_mesh_cache.put(rpos, placeholder) catch return;
+        self.mesher_mutex.lock();
+        self.mesher_jobs.append(self.allocator, .{ .rpos = rpos }) catch {};
+        self.mesher_cv.broadcast();
+        self.mesher_mutex.unlock();
+        self.rebuilds_issued_this_frame += 1;
     }
 
     fn renderWorldCached(self: *Client, vs_in: *const shd_mod.VsParams) void {
+        // Adopt up to N meshing results per frame on the render thread
+        self.adoptMesherResults();
         const wk = "minecraft:overworld";
+        // Snapshot region positions and chunk counts under world lock
+        var regions = std.ArrayList(struct { rpos: simulation.RegionPos, chunk_count: usize }).initCapacity(self.allocator, 0) catch return;
+        defer regions.deinit(self.allocator);
         self.sim.worlds_mutex.lock();
-        defer self.sim.worlds_mutex.unlock();
-        const ws = self.sim.worlds_state.getPtr(wk) orelse return;
+        const ws = self.sim.worlds_state.getPtr(wk);
+        if (ws) |ws_ptr| {
+            var reg_it = ws_ptr.regions.iterator();
+            while (reg_it.next()) |rentry| {
+                const rpos = rentry.key_ptr.*;
+                const rs_ptr = rentry.value_ptr;
+                const count = rs_ptr.chunks.items.len;
+                regions.append(self.allocator, .{ .rpos = rpos, .chunk_count = count }) catch {};
+            }
+        }
+        self.sim.worlds_mutex.unlock();
 
         // constants for padding
         const pad_u: f32 = if (self.atlas_w > 0) (1.0 / @as(f32, @floatFromInt(self.atlas_w))) else 0.0;
         const pad_v: f32 = if (self.atlas_h > 0) (1.0 / @as(f32, @floatFromInt(self.atlas_h))) else 0.0;
         var vs_loc: shd_mod.VsParams = .{ .mvp = vs_in.mvp, .atlas_pad = .{ pad_u, pad_v } };
 
-        var reg_it = ws.regions.iterator();
-        while (reg_it.next()) |rentry| {
-            const rpos = rentry.key_ptr.*;
-            const rs_ptr = rentry.value_ptr;
+        // reset per-frame rebuild counter
+        self.rebuilds_issued_this_frame = 0;
 
-            // Build region mesh on demand
-            self.ensureRegionMesh(ws, rpos, rs_ptr);
-            const rmesh = self.region_mesh_cache.getPtr(rpos) orelse continue;
+        // Iterate regions without holding world lock
+        var i: usize = 0;
+        while (i < regions.items.len) : (i += 1) {
+            const rp = regions.items[i].rpos;
+            const expected_chunks = regions.items[i].chunk_count;
+            // Ensure mesh scheduled or up-to-date
+            self.ensureRegionMesh(rp, expected_chunks);
+            const rmesh = self.region_mesh_cache.getPtr(rp) orelse continue;
             if (rmesh.vbuf.id == 0 or rmesh.draws.len == 0) continue;
 
             // Bind region buffer once
@@ -1763,18 +2549,17 @@ pub const Client = struct {
                 if (self.frustum_valid) {
                     const base_x: f32 = @floatFromInt(d.chunk_pos.x * @as(i32, @intCast(constants.chunk_size_x)));
                     const base_z: f32 = @floatFromInt(d.chunk_pos.z * @as(i32, @intCast(constants.chunk_size_z)));
-                    const minp_s: [3]f32 = .{ base_x, @as(f32, @floatFromInt(@as(usize, d.sy) * constants.section_height)), base_z };
-                    const maxp_s: [3]f32 = .{ base_x + 16.0, @as(f32, @floatFromInt((@as(usize, d.sy) + 1) * constants.section_height)), base_z + 16.0 };
+                    const minp_s: [3]f32 = .{ base_x, @as(f32, @floatFromInt((@as(usize, d.sy) * constants.section_height))), base_z };
+                    const maxp_s: [3]f32 = .{ base_x + 16.0, @as(f32, @floatFromInt(((@as(usize, d.sy) + 1) * constants.section_height))), base_z + 16.0 };
                     const cam = self.camera.pos;
                     const vis_sec = aabbContainsPoint(minp_s, maxp_s, cam) or aabbInFrustum(self.frustum_planes, minp_s, maxp_s, 0.5);
                     if (!vis_sec) continue;
                 }
                 sg.applyUniforms(0, sg.asRange(&vs_loc));
                 sg.draw(d.first, d.count, 1);
-                // Mark chunk seen this frame (used by heuristic elsewhere)
                 _ = self.last_visible_frame_chunk.put(d.chunk_pos, self.frame_index) catch {};
             }
-            _ = self.last_visible_frame_region.put(rpos, self.frame_index) catch {};
+            _ = self.last_visible_frame_region.put(rp, self.frame_index) catch {};
         }
 
         // Evict old or excess region meshes to bound pool usage

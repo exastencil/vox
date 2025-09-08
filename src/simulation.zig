@@ -290,8 +290,8 @@ pub const Simulation = struct {
                     if (self_ptr.entity_by_player.get(pd.id)) |idx| {
                         if (idx < self_ptr.dynamic_entities.items.len) {
                             const e = self_ptr.dynamic_entities.items[idx];
-                            const cx: i32 = @divTrunc(@as(i32, @intFromFloat(e.pos[0])), @as(i32, constants.chunk_size_x));
-                            const cz: i32 = @divTrunc(@as(i32, @intFromFloat(e.pos[2])), @as(i32, constants.chunk_size_z));
+                            const cx: i32 = @divFloor(@as(i32, @intFromFloat(@floor(e.pos[0]))), @as(i32, @intCast(constants.chunk_size_x)));
+                            const cz: i32 = @divFloor(@as(i32, @intFromFloat(@floor(e.pos[2]))), @as(i32, @intCast(constants.chunk_size_z)));
                             const r = self_ptr.gen_radius_chunks;
                             var dz: i32 = -r;
                             while (dz <= r) : (dz += 1) {
@@ -319,7 +319,7 @@ pub const Simulation = struct {
                 const wd = self_ptr.reg.worlds.get(world_key) orelse continue;
 
                 // locate region
-                const rpos = RegionPos{ .x = @divTrunc(pos.x, 32), .z = @divTrunc(pos.z, 32) };
+                const rpos = RegionPos{ .x = @divFloor(pos.x, 32), .z = @divFloor(pos.z, 32) };
 
                 // check if chunk already finalized
                 var missing = false;
@@ -458,15 +458,15 @@ pub const Simulation = struct {
             fn call(sim: *Simulation, x: f32, z: f32) ?f32 {
                 const xi: i32 = @intFromFloat(@floor(x));
                 const zi: i32 = @intFromFloat(@floor(z));
-                const cx: i32 = @divTrunc(xi, @as(i32, @intCast(constants.chunk_size_x)));
-                const cz: i32 = @divTrunc(zi, @as(i32, @intCast(constants.chunk_size_z)));
+                const cx: i32 = @divFloor(xi, @as(i32, @intCast(constants.chunk_size_x)));
+                const cz: i32 = @divFloor(zi, @as(i32, @intCast(constants.chunk_size_z)));
                 const lx: i32 = @mod(xi, @as(i32, @intCast(constants.chunk_size_x)));
                 const lz: i32 = @mod(zi, @as(i32, @intCast(constants.chunk_size_z)));
 
                 sim.worlds_mutex.lock();
                 defer sim.worlds_mutex.unlock();
                 const ws = sim.worlds_state.getPtr(world_key) orelse return null;
-                const rp = RegionPos{ .x = @divTrunc(cx, 32), .z = @divTrunc(cz, 32) };
+                const rp = RegionPos{ .x = @divFloor(cx, 32), .z = @divFloor(cz, 32) };
                 const rs = ws.regions.getPtr(rp) orelse return null;
                 const idx_opt = rs.chunk_index.get(.{ .x = cx, .z = cz });
                 if (idx_opt == null) return null;
@@ -618,8 +618,8 @@ pub const Simulation = struct {
         const params: registry.WorldGen.Params = .{ .blocks = wd.gen_blocks, .biomes = wd.gen_biomes };
         const lookup: registry.WorldGen.BlockLookup = .{ .ctx = self.reg, .call = blockLookupCall };
 
-        const cx: i32 = @divTrunc(x, @as(i32, @intCast(constants.chunk_size_x)));
-        const cz: i32 = @divTrunc(z, @as(i32, @intCast(constants.chunk_size_z)));
+        const cx: i32 = @divFloor(x, @as(i32, @intCast(constants.chunk_size_x)));
+        const cz: i32 = @divFloor(z, @as(i32, @intCast(constants.chunk_size_z)));
         const chunk_pos = gs.ChunkPos{ .x = cx, .z = cz };
         const ch = worldgen.generateChunk(self.allocator, wd.section_count_y, chunk_pos, self.world_seed, wg_def, params, lookup) catch return .{ .x = x, .y = 0, .z = z };
         defer worldgen.deinitChunk(self.allocator, &ch);
@@ -649,7 +649,7 @@ pub const Simulation = struct {
         self.worlds_mutex.lock();
         defer self.worlds_mutex.unlock();
         const ws = self.worlds_state.getPtr(world_key) orelse return false;
-        const rpos = RegionPos{ .x = @divTrunc(pos.x, 32), .z = @divTrunc(pos.z, 32) };
+        const rpos = RegionPos{ .x = @divFloor(pos.x, 32), .z = @divFloor(pos.z, 32) };
         const rs = ws.regions.getPtr(rpos) orelse return false;
         return rs.chunk_index.get(pos) != null;
     }
