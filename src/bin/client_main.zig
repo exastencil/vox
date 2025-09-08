@@ -9,7 +9,13 @@ const sdtx = sokol.debugtext;
 
 fn loadOrFallback(allocator: std.mem.Allocator, path: []const u8) sg.Image {
     const png = vox.png;
-    const loaded = png.loadFileRGBA8(allocator, path) catch null;
+    const loaded: ?png.Image = blk: {
+        const res = png.loadFileRGBA8(allocator, path) catch |e| {
+            std.log.warn("texture: failed to load '{s}': {s}", .{ path, @errorName(e) });
+            break :blk null;
+        };
+        break :blk res;
+    };
     if (loaded) |img| {
         defer allocator.free(img.pixels);
         return sg.makeImage(.{

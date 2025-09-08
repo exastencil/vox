@@ -10,7 +10,13 @@ const shd_mod = @import("shaders/chunk_shd.zig");
 
 fn loadOrFallback(allocator: std.mem.Allocator, path: []const u8) sg.Image {
     const png = @import("png.zig");
-    const loaded = png.loadFileRGBA8(allocator, path) catch null;
+    const loaded: ?png.Image = blk: {
+        const res = png.loadFileRGBA8(allocator, path) catch |e| {
+            std.log.warn("texture: failed to load '{s}': {s}", .{ path, @errorName(e) });
+            break :blk null;
+        };
+        break :blk res;
+    };
     if (loaded) |img| {
         defer allocator.free(img.pixels);
         return sg.makeImage(.{
@@ -196,7 +202,13 @@ fn buildAtlasFromPaths(allocator: std.mem.Allocator, paths: []const []const u8) 
     var max_h: u32 = 0;
     var i: usize = 0;
     while (i < N) : (i += 1) {
-        const img = png.loadFileRGBA8(allocator, paths[i]) catch null;
+        const img: ?png.Image = blk: {
+            const res = png.loadFileRGBA8(allocator, paths[i]) catch |e| {
+                std.log.warn("texture: failed to load '{s}': {s}", .{ paths[i], @errorName(e) });
+                break :blk null;
+            };
+            break :blk res;
+        };
         if (img) |im| {
             loaded[i].w = im.width;
             loaded[i].h = im.height;
@@ -291,6 +303,8 @@ fn buildTextureAtlas(self: *Client) void {
         // Nothing to do: create a 1x1 fallback atlas
         var one = [_]u8{ 255, 0, 255, 255 };
         self.grass_img = sg.makeImage(.{ .width = 1, .height = 1, .pixel_format = .RGBA8, .data = .{ .subimage = .{ .{ sg.asRange(one[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} } } } });
+        self.atlas_w = 1;
+        self.atlas_h = 1;
         self.atlas_uv_scale = .{ 1, 1 };
         self.atlas_uv_offset = .{ 0, 0 };
         // Set per-face defaults to match the selected default region
@@ -306,6 +320,8 @@ fn buildTextureAtlas(self: *Client) void {
         // Fallback as above on failure
         var one = [_]u8{ 255, 0, 255, 255 };
         self.grass_img = sg.makeImage(.{ .width = 1, .height = 1, .pixel_format = .RGBA8, .data = .{ .subimage = .{ .{ sg.asRange(one[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} } } } });
+        self.atlas_w = 1;
+        self.atlas_h = 1;
         self.atlas_uv_scale = .{ 1, 1 };
         self.atlas_uv_offset = .{ 0, 0 };
         self.atlas_uv_top_scale = self.atlas_uv_scale;
@@ -332,6 +348,8 @@ fn buildTextureAtlas(self: *Client) void {
             .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
         } },
     });
+    self.atlas_w = built.atlas_w;
+    self.atlas_h = built.atlas_h;
 
     // Choose a default atlas region to use for the current single-material demo mesh.
     // Prefer minecraft:dirt (uniform), otherwise fall back to grass_block face, then stone, then first tile.
@@ -459,19 +477,25 @@ pub const Client = struct {
     pass_action: sg.PassAction = .{},
     ui_scale: f32 = 2.0,
     show_debug: bool = true,
+    show_atlas_overlay: bool = false,
 
     // Minimal chunk renderer state
     shd: sg.Shader = .{},
     pip: sg.Pipeline = .{},
+    quad_pip: sg.Pipeline = .{},
     vbuf: sg.Buffer = .{},
+    ui_vbuf: sg.Buffer = .{},
     bind: sg.Bindings = .{},
     // We reuse grass_* for the atlas image/view binding for now
     grass_img: sg.Image = .{},
     grass_view: sg.View = .{},
     sampler: sg.Sampler = .{},
+    atlas_w: u32 = 1,
+    atlas_h: u32 = 1,
 
     // GPU buffer capacity tracking
     vbuf_capacity_bytes: usize = 0,
+    ui_vbuf_capacity_bytes: usize = 0,
 
     // Camera mirrored from player entity (position only; orientation is client-local)
     camera: Camera = .{},
@@ -582,12 +606,31 @@ pub const Client = struct {
         pdesc.color_count = 1;
         pdesc.colors[0].pixel_format = desc.environment.defaults.color_format;
         self.pip = sg.makePipeline(pdesc);
+        // dedicated 2D quad pipeline for overlay (no depth test, no culling)
+        var qdesc: sg.PipelineDesc = .{};
+        qdesc.label = "quad-pipeline";
+        qdesc.shader = self.shd;
+        qdesc.layout.attrs[0].format = .FLOAT3;
+        qdesc.layout.attrs[1].format = .FLOAT2;
+        qdesc.primitive_type = .TRIANGLES;
+        qdesc.cull_mode = .NONE;
+        qdesc.face_winding = .CCW;
+        qdesc.depth = .{ .compare = .ALWAYS, .write_enabled = false };
+        qdesc.color_count = 1;
+        qdesc.colors[0].pixel_format = desc.environment.defaults.color_format;
+        self.quad_pip = sg.makePipeline(qdesc);
+
         // dynamic vertex buffer; start with a generous capacity (e.g., 16384 verts)
         const initial_vcount: usize = 16 * 16 * 16; // plenty for top + sides on flat worlds
         const initial_bytes: usize = initial_vcount * @sizeOf(Vertex);
         self.vbuf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true, .stream_update = true }, .size = @intCast(initial_bytes) });
         self.vbuf_capacity_bytes = initial_bytes;
         self.bind.vertex_buffers[0] = self.vbuf;
+        // separate small dynamic vertex buffer for UI/overlay (e.g., 6 verts for a quad)
+        const ui_initial_vcount: usize = 6;
+        const ui_initial_bytes: usize = ui_initial_vcount * @sizeOf(Vertex);
+        self.ui_vbuf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true, .stream_update = true }, .size = @intCast(ui_initial_bytes) });
+        self.ui_vbuf_capacity_bytes = ui_initial_bytes;
         self.pass_action.depth = .{ .load_action = .CLEAR, .clear_value = 1.0 };
 
         // Build texture atlas from registry resource paths
@@ -595,7 +638,7 @@ pub const Client = struct {
 
         // create a view and sampler for the atlas (reusing grass_* fields)
         self.grass_view = sg.makeView(.{ .texture = .{ .image = self.grass_img } });
-        self.sampler = sg.makeSampler(.{ .min_filter = .NEAREST, .mag_filter = .NEAREST, .mipmap_filter = .NEAREST, .wrap_u = .REPEAT, .wrap_v = .REPEAT });
+        self.sampler = sg.makeSampler(.{ .min_filter = .NEAREST, .mag_filter = .NEAREST, .mipmap_filter = .NEAREST, .wrap_u = .CLAMP_TO_EDGE, .wrap_v = .CLAMP_TO_EDGE });
         // shader expects VIEW_tex_texture at slot 1 and SMP_tex_sampler at slot 2
         self.bind.views[1] = self.grass_view;
         self.bind.samplers[2] = self.sampler;
@@ -612,6 +655,9 @@ pub const Client = struct {
         const uv_offset_top = self.atlas_uv_top_offset;
         const uv_scale_side = self.atlas_uv_side_scale;
         const uv_offset_side = self.atlas_uv_side_offset;
+        // Pad in atlas units to avoid cross-tile sampling (use full 1.0 texel)
+        const pad_u: f32 = if (self.atlas_w > 0) (1.0 / @as(f32, @floatFromInt(self.atlas_w))) else 0.0;
+        const pad_v: f32 = if (self.atlas_h > 0) (1.0 / @as(f32, @floatFromInt(self.atlas_h))) else 0.0;
         // Render all loaded chunks in the overworld
         const wk = "minecraft:overworld";
         self.sim.worlds_mutex.lock();
@@ -620,12 +666,30 @@ pub const Client = struct {
 
         // Helpers to append a quad (two triangles) with CCW winding
         const addQuad = struct {
-            fn call(list: *std.ArrayList(Vertex), v0: [3]f32, v1: [3]f32, v2: [3]f32, v3: [3]f32, uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32, uv_scale_p: [2]f32, uv_offset_p: [2]f32) void {
-                // Apply atlas transform
-                const t0 = .{ uv0[0] * uv_scale_p[0] + uv_offset_p[0], uv0[1] * uv_scale_p[1] + uv_offset_p[1] };
-                const t1 = .{ uv1[0] * uv_scale_p[0] + uv_offset_p[0], uv1[1] * uv_scale_p[1] + uv_offset_p[1] };
-                const t2 = .{ uv2[0] * uv_scale_p[0] + uv_offset_p[0], uv2[1] * uv_scale_p[1] + uv_offset_p[1] };
-                const t3 = .{ uv3[0] * uv_scale_p[0] + uv_offset_p[0], uv3[1] * uv_scale_p[1] + uv_offset_p[1] };
+            fn wrap01(v: f32) f32 {
+                const f = v - std.math.floor(v);
+                // keep upper edge at 1.0 instead of wrapping to 0.0 when v is an exact integer > 0
+                return if (f == 0.0 and v > 0.0) 1.0 else f;
+            }
+            fn call(list: *std.ArrayList(Vertex), v0: [3]f32, v1: [3]f32, v2: [3]f32, v3: [3]f32, uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32, uv_scale_p: [2]f32, uv_offset_p: [2]f32, pad_u_in: f32, pad_v_in: f32) void {
+                // Wrap UVs into [0,1] (inclusive upper edge) per tile
+                const w0x: f32 = wrap01(uv0[0]);
+                const w0y: f32 = wrap01(uv0[1]);
+                const w1x: f32 = wrap01(uv1[0]);
+                const w1y: f32 = wrap01(uv1[1]);
+                const w2x: f32 = wrap01(uv2[0]);
+                const w2y: f32 = wrap01(uv2[1]);
+                const w3x: f32 = wrap01(uv3[0]);
+                const w3y: f32 = wrap01(uv3[1]);
+                // inset by full texel in atlas space to avoid bleeding, and clamp scale accordingly
+                const min_u = uv_offset_p[0] + pad_u_in;
+                const min_v = uv_offset_p[1] + pad_v_in;
+                const range_u = @max(0.0, uv_scale_p[0] - 2.0 * pad_u_in);
+                const range_v = @max(0.0, uv_scale_p[1] - 2.0 * pad_v_in);
+                const t0 = .{ min_u + w0x * range_u, min_v + w0y * range_v };
+                const t1 = .{ min_u + w1x * range_u, min_v + w1y * range_v };
+                const t2 = .{ min_u + w2x * range_u, min_v + w2y * range_v };
+                const t3 = .{ min_u + w3x * range_u, min_v + w3y * range_v };
                 // Emit triangles with standard CCW winding (v0->v1->v2, v0->v2->v3)
                 list.appendAssumeCapacity(.{ .pos = v0, .uv = t0 });
                 list.appendAssumeCapacity(.{ .pos = v1, .uv = t1 });
@@ -684,76 +748,106 @@ pub const Client = struct {
                             .{ 1, 0 },
                             uv_scale_top,
                             uv_offset_top,
+                            pad_u,
+                            pad_v,
                         );
                         // Sides if neighbor lower (within the same chunk). For inter-chunk gaps, we'll
                         // handle neighbors later — this renders a simple "wall" at chunk borders for now.
                         const h_w = getH(&hm, xi - 1, zi);
                         if (h_w < h) {
-                            const y0: f32 = @floatFromInt(h_w + 1);
-                            addQuad(
-                                out,
-                                .{ x0, y0, z1 },
-                                .{ x0, y_top, z1 },
-                                .{ x0, y_top, z0 },
-                                .{ x0, y0, z0 }, // -X face
-                                .{ 0, 0 },
-                                .{ 0, (y_top - y0) },
-                                .{ 1, (y_top - y0) },
-                                .{ 1, 0 },
-                                uv_scale_side,
-                                uv_offset_side,
-                            );
+                            var yb: i32 = h_w + 1;
+                            const yt: i32 = h;
+                            while (yb <= yt) : (yb += 1) {
+                                const y0s: f32 = @floatFromInt(yb);
+                                const y1s: f32 = y0s + 1.0;
+                                addQuad(
+                                    out,
+                                    .{ x0, y0s, z1 },
+                                    .{ x0, y1s, z1 },
+                                    .{ x0, y1s, z0 },
+                                    .{ x0, y0s, z0 }, // -X face (one-block tall)
+                                    .{ 0, 0 },
+                                    .{ 0, 1 },
+                                    .{ 1, 1 },
+                                    .{ 1, 0 },
+                                    uv_scale_side,
+                                    uv_offset_side,
+                                    pad_u,
+                                    pad_v,
+                                );
+                            }
                         }
                         const h_e = getH(&hm, xi + 1, zi);
                         if (h_e < h) {
-                            const y0: f32 = @floatFromInt(h_e + 1);
-                            addQuad(
-                                out,
-                                .{ x1, y0, z0 },
-                                .{ x1, y_top, z0 },
-                                .{ x1, y_top, z1 },
-                                .{ x1, y0, z1 }, // +X face
-                                .{ 0, 0 },
-                                .{ 0, (y_top - y0) },
-                                .{ 1, (y_top - y0) },
-                                .{ 1, 0 },
-                                uv_scale_side,
-                                uv_offset_side,
-                            );
+                            var yb: i32 = h_e + 1;
+                            const yt: i32 = h;
+                            while (yb <= yt) : (yb += 1) {
+                                const y0s: f32 = @floatFromInt(yb);
+                                const y1s: f32 = y0s + 1.0;
+                                addQuad(
+                                    out,
+                                    .{ x1, y0s, z0 },
+                                    .{ x1, y1s, z0 },
+                                    .{ x1, y1s, z1 },
+                                    .{ x1, y0s, z1 }, // +X face (one-block tall)
+                                    .{ 0, 0 },
+                                    .{ 0, 1 },
+                                    .{ 1, 1 },
+                                    .{ 1, 0 },
+                                    uv_scale_side,
+                                    uv_offset_side,
+                                    pad_u,
+                                    pad_v,
+                                );
+                            }
                         }
                         const h_n = getH(&hm, xi, zi - 1);
                         if (h_n < h) {
-                            const y0: f32 = @floatFromInt(h_n + 1);
-                            addQuad(
-                                out,
-                                .{ x0, y0, z0 },
-                                .{ x0, y_top, z0 },
-                                .{ x1, y_top, z0 },
-                                .{ x1, y0, z0 }, // -Z face (outward -Z)
-                                .{ 0, 0 },
-                                .{ 0, (y_top - y0) },
-                                .{ 1, (y_top - y0) },
-                                .{ 1, 0 },
-                                uv_scale_side,
-                                uv_offset_side,
-                            );
+                            var yb: i32 = h_n + 1;
+                            const yt: i32 = h;
+                            while (yb <= yt) : (yb += 1) {
+                                const y0s: f32 = @floatFromInt(yb);
+                                const y1s: f32 = y0s + 1.0;
+                                addQuad(
+                                    out,
+                                    .{ x0, y0s, z0 },
+                                    .{ x0, y1s, z0 },
+                                    .{ x1, y1s, z0 },
+                                    .{ x1, y0s, z0 }, // -Z face (one-block tall)
+                                    .{ 0, 0 },
+                                    .{ 0, 1 },
+                                    .{ 1, 1 },
+                                    .{ 1, 0 },
+                                    uv_scale_side,
+                                    uv_offset_side,
+                                    pad_u,
+                                    pad_v,
+                                );
+                            }
                         }
                         const h_s = getH(&hm, xi, zi + 1);
                         if (h_s < h) {
-                            const y0: f32 = @floatFromInt(h_s + 1);
-                            addQuad(
-                                out,
-                                .{ x1, y0, z1 },
-                                .{ x1, y_top, z1 },
-                                .{ x0, y_top, z1 },
-                                .{ x0, y0, z1 }, // +Z face (outward +Z)
-                                .{ 0, 0 },
-                                .{ 0, (y_top - y0) },
-                                .{ 1, (y_top - y0) },
-                                .{ 1, 0 },
-                                uv_scale_side,
-                                uv_offset_side,
-                            );
+                            var yb: i32 = h_s + 1;
+                            const yt: i32 = h;
+                            while (yb <= yt) : (yb += 1) {
+                                const y0s: f32 = @floatFromInt(yb);
+                                const y1s: f32 = y0s + 1.0;
+                                addQuad(
+                                    out,
+                                    .{ x1, y0s, z1 },
+                                    .{ x1, y1s, z1 },
+                                    .{ x0, y1s, z1 },
+                                    .{ x0, y0s, z1 }, // +Z face (one-block tall)
+                                    .{ 0, 0 },
+                                    .{ 0, 1 },
+                                    .{ 1, 1 },
+                                    .{ 1, 0 },
+                                    uv_scale_side,
+                                    uv_offset_side,
+                                    pad_u,
+                                    pad_v,
+                                );
+                            }
                         }
                     }
                 }
@@ -884,6 +978,11 @@ pub const Client = struct {
             sg.draw(0, @intCast(vert_list.items.len), 1);
         }
 
+        // Optional atlas overlay (top-left UI origin)
+        if (self.show_atlas_overlay and self.grass_img.id != 0) {
+            self.drawAtlasOverlay();
+        }
+
         if (self.show_debug) {
             const scale: f32 = self.ui_scale;
             const w_px_dbg: f32 = @floatFromInt(sapp.width());
@@ -946,6 +1045,7 @@ pub const Client = struct {
         switch (ev.type) {
             .KEY_UP => {
                 if (ev.key_code == .F3) self.show_debug = !self.show_debug;
+                if (ev.key_code == .F5) self.show_atlas_overlay = !self.show_atlas_overlay;
                 if (ev.key_code == .ESCAPE) {
                     // Release mouse when ESC is pressed
                     sapp.lockMouse(false);
@@ -1244,6 +1344,66 @@ pub const Client = struct {
         m[11] = -1.0;
         m[14] = (2.0 * zfar * znear) / (znear - zfar);
         return m;
+    }
+
+    fn makeOrthoTopLeft(width_px: f32, height_px: f32) [16]f32 {
+        var m: [16]f32 = [_]f32{0} ** 16;
+        // map x: [0..W] -> [-1..+1]
+        m[0] = if (width_px != 0) (2.0 / width_px) else 0.0;
+        // map y: [0..H] (top-down) -> [+1..-1]
+        m[5] = if (height_px != 0) (-2.0 / height_px) else 0.0;
+        m[10] = 1.0;
+        m[15] = 1.0;
+        // translation to top-left origin
+        m[12] = -1.0;
+        m[13] = 1.0;
+        return m;
+    }
+
+    fn drawAtlasOverlay(self: *Client) void {
+        const w_px: f32 = @floatFromInt(sapp.width());
+        const h_px: f32 = @floatFromInt(sapp.height());
+        const margin: f32 = 8.0;
+        const aw: f32 = @floatFromInt(self.atlas_w);
+        const ah: f32 = @floatFromInt(self.atlas_h);
+        if (!(aw > 0 and ah > 0)) return;
+        const max_w: f32 = w_px * 0.5;
+        const max_h: f32 = h_px * 0.5;
+        var scale: f32 = 1.0;
+        const sx = if (aw != 0) (max_w / aw) else 1.0;
+        const sy = if (ah != 0) (max_h / ah) else 1.0;
+        scale = @min(sx, sy);
+        if (scale > 1.0) scale = 1.0;
+        const dw: f32 = aw * scale;
+        const dh: f32 = ah * scale;
+        const x0: f32 = margin;
+        const y0: f32 = margin;
+        const x1: f32 = x0 + dw;
+        const y1: f32 = y0 + dh;
+        var quad: [6]Vertex = .{
+            .{ .pos = .{ x0, y0, 0 }, .uv = .{ 0, 0 } },
+            .{ .pos = .{ x1, y0, 0 }, .uv = .{ 1, 0 } },
+            .{ .pos = .{ x1, y1, 0 }, .uv = .{ 1, 1 } },
+            .{ .pos = .{ x0, y0, 0 }, .uv = .{ 0, 0 } },
+            .{ .pos = .{ x1, y1, 0 }, .uv = .{ 1, 1 } },
+            .{ .pos = .{ x0, y1, 0 }, .uv = .{ 0, 1 } },
+        };
+        const ortho = makeOrthoTopLeft(w_px, h_px);
+        var vs_params: shd_mod.VsParams = .{ .mvp = ortho };
+        sg.applyPipeline(self.quad_pip);
+        // use a separate UI vertex buffer to avoid multiple updates to the same buffer in one frame
+        var bind_ui = self.bind;
+        bind_ui.vertex_buffers[0] = self.ui_vbuf;
+        sg.applyBindings(bind_ui);
+        sg.applyUniforms(0, sg.asRange(&vs_params));
+        const needed_bytes: usize = quad.len * @sizeOf(Vertex);
+        if (self.ui_vbuf_capacity_bytes < needed_bytes) {
+            if (self.ui_vbuf.id != 0) sg.destroyBuffer(self.ui_vbuf);
+            self.ui_vbuf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true, .stream_update = true }, .size = @intCast(needed_bytes) });
+            self.ui_vbuf_capacity_bytes = needed_bytes;
+        }
+        sg.updateBuffer(self.ui_vbuf, sg.asRange(&quad));
+        sg.draw(0, @intCast(quad.len), 1);
     }
 
     fn makeViewConv(eye: [3]f32, forward: [3]f32, up_in: [3]f32, conventional: bool) [16]f32 {
