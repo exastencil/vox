@@ -136,6 +136,43 @@ const Camera = struct {
 
 const Vertex = struct { pos: [3]f32, uv: [2]f32 };
 
+inline fn wrap01m(v: f32) f32 {
+    const f = v - std.math.floor(v);
+    return if (f == 0.0 and v > 0.0) 1.0 else f;
+}
+
+inline fn emitQuad(allocator: std.mem.Allocator, list: *std.ArrayList(Vertex), v0: [3]f32, v1: [3]f32, v2: [3]f32, v3: [3]f32, uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32, uv_scale_p: [2]f32, uv_offset_p: [2]f32, pad_u_in: f32, pad_v_in: f32) void {
+    const w0x: f32 = wrap01m(uv0[0]);
+    const w0y: f32 = wrap01m(uv0[1]);
+    const w1x: f32 = wrap01m(uv1[0]);
+    const w1y: f32 = wrap01m(uv1[1]);
+    const w2x: f32 = wrap01m(uv2[0]);
+    const w2y: f32 = wrap01m(uv2[1]);
+    const w3x: f32 = wrap01m(uv3[0]);
+    const w3y: f32 = wrap01m(uv3[1]);
+    const min_u = uv_offset_p[0] + pad_u_in;
+    const min_v = uv_offset_p[1] + pad_v_in;
+    const range_u = @max(0.0, uv_scale_p[0] - 2.0 * pad_u_in);
+    const range_v = @max(0.0, uv_scale_p[1] - 2.0 * pad_v_in);
+    const t0 = .{ min_u + w0x * range_u, min_v + w0y * range_v };
+    const t1 = .{ min_u + w1x * range_u, min_v + w1y * range_v };
+    const t2 = .{ min_u + w2x * range_u, min_v + w2y * range_v };
+    const t3 = .{ min_u + w3x * range_u, min_v + w3y * range_v };
+    list.append(allocator, .{ .pos = v0, .uv = t0 }) catch return;
+    list.append(allocator, .{ .pos = v1, .uv = t1 }) catch return;
+    list.append(allocator, .{ .pos = v2, .uv = t2 }) catch return;
+    list.append(allocator, .{ .pos = v0, .uv = t0 }) catch return;
+    list.append(allocator, .{ .pos = v2, .uv = t2 }) catch return;
+    list.append(allocator, .{ .pos = v3, .uv = t3 }) catch return;
+}
+
+// Cached mesh types (region-level aggregation)
+const SectionMesh = struct { first: u32 = 0, count: u32 = 0 };
+const SectionDraw = struct { chunk_pos: gs.ChunkPos, sy: u16, first: u32, count: u32 };
+const RegionMesh = struct { vbuf: sg.Buffer = .{}, draws: []SectionDraw, built_chunk_count: usize = 0 };
+
+const REGION_MESH_BUDGET: usize = 128; // generous, regions are fewer than chunks
+
 const AtlasTransform = struct {
     offset: [2]f32,
     scale: [2]f32,
@@ -542,9 +579,22 @@ pub const Client = struct {
     // Atlas UV transforms per texture path
     atlas_uv_by_path: std.StringHashMap(AtlasTransform) = undefined,
 
+    // Cached region meshes keyed by region position
+    region_mesh_cache: std.AutoHashMap(simulation.RegionPos, RegionMesh) = undefined,
+
     // GPU buffer capacity tracking
     vbuf_capacity_bytes: usize = 0,
     ui_vbuf_capacity_bytes: usize = 0,
+
+    // View frustum (derived each frame from MVP) for culling
+    frustum_planes: [6][4]f32 = [_][4]f32{.{ 0, 0, 0, 0 }} ** 6,
+    frustum_valid: bool = false,
+    prev_frustum_planes: [6][4]f32 = [_][4]f32{.{ 0, 0, 0, 0 }} ** 6,
+    prev_frustum_valid: bool = false,
+    // Last visible frame for chunks and regions
+    last_visible_frame_chunk: std.AutoHashMap(gs.ChunkPos, u32) = undefined,
+    last_visible_frame_region: std.AutoHashMap(simulation.RegionPos, u32) = undefined,
+    frame_index: u32 = 0,
 
     // Camera mirrored from player entity (position only; orientation is client-local)
     camera: Camera = .{},
@@ -580,6 +630,12 @@ pub const Client = struct {
     },
     last_seen_tick: u64 = 0,
 
+    // FPS measurement
+    fps_last_ns: i128 = 0,
+    fps_accum_ns: i128 = 0,
+    fps_accum_frames: u32 = 0,
+    fps_value: f32 = 0.0,
+
     pub fn init(allocator: std.mem.Allocator, sim: *simulation.Simulation, player_id: player.PlayerId, account_name: []const u8) !Client {
         const acc = try allocator.dupe(u8, account_name);
         return .{
@@ -588,6 +644,9 @@ pub const Client = struct {
             .player_id = player_id,
             .account_name = acc,
             .atlas_uv_by_path = std.StringHashMap(AtlasTransform).init(allocator),
+            .region_mesh_cache = std.AutoHashMap(simulation.RegionPos, RegionMesh).init(allocator),
+            .last_visible_frame_chunk = std.AutoHashMap(gs.ChunkPos, u32).init(allocator),
+            .last_visible_frame_region = std.AutoHashMap(simulation.RegionPos, u32).init(allocator),
         };
     }
 
@@ -612,7 +671,17 @@ pub const Client = struct {
         if (self.shd.id != 0) sg.destroyShader(self.shd);
 
         // Deinitialize atlas map (values only; keys are borrowed from registry)
+        // Destroy cached region meshes
+        var it = self.region_mesh_cache.valueIterator();
+        while (it.next()) |rm| {
+            if (rm.vbuf.id != 0) sg.destroyBuffer(rm.vbuf);
+            self.allocator.free(rm.draws);
+        }
+        self.region_mesh_cache.deinit();
+
         self.atlas_uv_by_path.deinit();
+        self.last_visible_frame_chunk.deinit();
+        self.last_visible_frame_region.deinit();
 
         // Owned string
         self.allocator.free(self.account_name);
@@ -956,6 +1025,25 @@ pub const Client = struct {
     pub fn frame(self: *Client) void {
         // Keep camera mirrored to player each frame for now
         self.updateCameraFromPlayer();
+        // Bump frame index (used for culling hysteresis)
+        self.frame_index +%= 1;
+
+        // FPS timing
+        const t_now: i128 = std.time.nanoTimestamp();
+        if (self.fps_last_ns != 0) {
+            const dt_ns: i128 = t_now - self.fps_last_ns;
+            if (dt_ns > 0) {
+                self.fps_accum_ns += dt_ns;
+                self.fps_accum_frames += 1;
+                if (self.fps_accum_ns >= 500_000_000) { // 0.5s window
+                    const seconds: f32 = @as(f32, @floatFromInt(self.fps_accum_ns)) / 1_000_000_000.0;
+                    self.fps_value = @as(f32, @floatFromInt(self.fps_accum_frames)) / seconds;
+                    self.fps_accum_ns = 0;
+                    self.fps_accum_frames = 0;
+                }
+            }
+        }
+        self.fps_last_ns = t_now;
 
         sg.beginPass(.{ .action = self.pass_action, .swapchain = sglue.swapchain() });
 
@@ -1011,41 +1099,26 @@ pub const Client = struct {
         // Send local look to simulation at most once per tick
         self.maybeSendLookToSim();
 
-        // Build chunk surface mesh into a dynamic list
-        var vert_list = std.ArrayList(Vertex).initCapacity(self.allocator, 0) catch return;
-        defer vert_list.deinit(self.allocator);
-        _ = self.buildChunkBlockMesh(&vert_list);
-
-        // Prepare MVP
+        // Prepare MVP and frustum before building the mesh (used for culling)
         const w_px: f32 = @floatFromInt(sapp.width());
         const h_px: f32 = @floatFromInt(sapp.height());
         const aspect_wh: f32 = if (h_px > 0) (w_px / h_px) else 1.0;
         const proj = makePerspective(60.0 * std.math.pi / 180.0, aspect_wh, 0.1, 1000.0);
-        // Horizon lock (no-roll) view: strictly horizontal right and world +Y up
         const view = self.makeViewNoRoll(self.camera.pos, self.camera.yaw, self.camera.pitch);
         const mvp = matMul(proj, view);
+        self.updateFrustum(mvp);
         var vs_params: shd_mod.VsParams = .{ .mvp = mvp };
+
+        // Render cached meshes (build on demand)
+        if (self.grass_img.id != 0) {
+            sg.applyPipeline(self.pip);
+            sg.applyUniforms(0, sg.asRange(&vs_params));
+            self.renderWorldCached(&vs_params);
+        }
 
         // Optional continuous probe logging
 
-        if (vert_list.items.len > 0 and self.grass_img.id != 0) {
-            sg.applyPipeline(self.pip);
-            sg.applyBindings(self.bind);
-            sg.applyUniforms(0, sg.asRange(&vs_params));
-
-            // Ensure vertex buffer capacity
-            const needed_bytes: usize = vert_list.items.len * @sizeOf(Vertex);
-            if (self.vbuf_capacity_bytes < needed_bytes) {
-                if (self.vbuf.id != 0) sg.destroyBuffer(self.vbuf);
-                self.vbuf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true, .stream_update = true }, .size = @intCast(needed_bytes) });
-                self.vbuf_capacity_bytes = needed_bytes;
-                self.bind.vertex_buffers[0] = self.vbuf;
-            }
-
-            // Upload and draw
-            sg.updateBuffer(self.vbuf, sg.asRange(vert_list.items));
-            sg.draw(0, @intCast(vert_list.items.len), 1);
-        }
+        // Cached rendering handled above
 
         // Optional atlas overlay (top-left UI origin)
         if (self.show_atlas_overlay and self.grass_img.id != 0) {
@@ -1062,7 +1135,7 @@ pub const Client = struct {
 
             const snap = self.pollSnapshot().*;
             var buf: [96:0]u8 = undefined;
-            const text_slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "Tick: {d}  TPS: {d:.2}", .{ snap.tick, snap.rolling_tps }) catch "Ticks: ?";
+            const text_slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "Tick: {d}  TPS: {d:.2}  FPS: {d:.1}", .{ snap.tick, snap.rolling_tps, self.fps_value }) catch "Ticks: ?";
             buf[text_slice.len] = 0;
             const text: [:0]const u8 = buf[0..text_slice.len :0];
             const cols_f: f32 = (w_px / scale) / 8.0;
@@ -1427,6 +1500,218 @@ pub const Client = struct {
         return true;
     }
 
+    fn buildSectionVertices(self: *Client, ws: *const simulation.WorldState, ch: *const gs.Chunk, sy: usize, base_x: f32, base_z: f32, pad_u: f32, pad_v: f32, out: *std.ArrayList(Vertex)) void {
+        const s = ch.sections[sy];
+        const pal_len = s.palette.len;
+        const bpi: u6 = bitsFor(pal_len);
+        // Build per-palette info (draw, solid, top/side transforms)
+        const PalInfo = struct {
+            draw: bool,
+            solid: bool,
+            top_tx: AtlasTransform,
+            side_tx: AtlasTransform,
+        };
+        var pal_info = std.ArrayList(PalInfo).initCapacity(self.allocator, pal_len) catch {
+            return;
+        };
+        defer pal_info.deinit(self.allocator);
+        var pi: usize = 0;
+        while (pi < pal_len) : (pi += 1) {
+            const bid: u32 = s.palette[pi];
+            var pinfo: PalInfo = .{
+                .draw = true,
+                .solid = true,
+                .top_tx = .{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale },
+                .side_tx = .{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale },
+            };
+            if (bid < self.sim.reg.blocks.items.len) {
+                pinfo.solid = self.sim.reg.blocks.items[@intCast(bid)].full_block_collision;
+            }
+            if (bid == 0) {
+                pinfo.draw = false;
+                pinfo.solid = false;
+            } else {
+                const name = self.sim.reg.getBlockName(@intCast(bid));
+                if (self.sim.reg.resources.get(name)) |res| switch (res) {
+                    .Void => {
+                        pinfo.draw = false;
+                        pinfo.solid = false;
+                    },
+                    .Uniform => |u| {
+                        const tx: AtlasTransform = self.atlas_uv_by_path.get(u.all_path) orelse AtlasTransform{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale };
+                        pinfo.top_tx = tx;
+                        pinfo.side_tx = tx;
+                    },
+                    .Facing => |f| {
+                        const top_tx: AtlasTransform = self.atlas_uv_by_path.get(f.face_path) orelse AtlasTransform{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale };
+                        const side_tx: AtlasTransform = self.atlas_uv_by_path.get(f.other_path) orelse AtlasTransform{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale };
+                        pinfo.top_tx = top_tx;
+                        pinfo.side_tx = side_tx;
+                    },
+                };
+            }
+            pal_info.appendAssumeCapacity(pinfo);
+        }
+
+        const section_base_y: i32 = @intCast(sy * constants.section_height);
+        for (0..constants.chunk_size_z) |lz| {
+            for (0..constants.chunk_size_x) |lx| {
+                for (0..constants.section_height) |ly| {
+                    const idx: usize = lz * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
+                    const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx, bpi));
+                    if (pidx >= pal_info.items.len) continue;
+                    const info = pal_info.items[pidx];
+                    if (!info.draw) continue;
+
+                    const wx0: f32 = base_x + @as(f32, @floatFromInt(lx));
+                    const wy0: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(sy * constants.section_height)) + @as(i32, @intCast(ly))));
+                    const wz0: f32 = base_z + @as(f32, @floatFromInt(lz));
+                    const wx1: f32 = wx0 + 1.0;
+                    const wy1: f32 = wy0 + 1.0;
+                    const wz1: f32 = wz0 + 1.0;
+
+                    const abs_y_this: i32 = section_base_y + @as(i32, @intCast(ly));
+
+                    const uv00: [2]f32 = .{ 0, 0 };
+                    const uv01: [2]f32 = .{ 0, 1 };
+                    const uv11: [2]f32 = .{ 1, 1 };
+                    const uv10: [2]f32 = .{ 1, 0 };
+
+                    if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this + 1, @as(i32, @intCast(lz)))) {
+                        emitQuad(self.allocator, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv01, uv11, uv10, info.top_tx.scale, info.top_tx.offset, pad_u, pad_v);
+                    }
+                    if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this - 1, @as(i32, @intCast(lz)))) {
+                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
+                    }
+                    if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) - 1, abs_y_this, @as(i32, @intCast(lz)))) {
+                        emitQuad(self.allocator, out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
+                    }
+                    if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) + 1, abs_y_this, @as(i32, @intCast(lz)))) {
+                        emitQuad(self.allocator, out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
+                    }
+                    if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) - 1)) {
+                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
+                    }
+                    if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) + 1)) {
+                        emitQuad(self.allocator, out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
+                    }
+                }
+            }
+        }
+    }
+
+    // Build a single region mesh (one buffer) by concatenating all section vertices of all chunks in the region
+    fn ensureRegionMesh(self: *Client, ws: *const simulation.WorldState, rpos: simulation.RegionPos, rs: *const simulation.RegionState, pad_u: f32, pad_v: f32) void {
+        if (self.region_mesh_cache.getPtr(rpos)) |existing| {
+            // Rebuild if chunk count changed (new chunks streamed in)
+            if (existing.built_chunk_count == rs.chunks.items.len and existing.vbuf.id != 0) return;
+            // otherwise, destroy and rebuild below
+            if (existing.vbuf.id != 0) sg.destroyBuffer(existing.vbuf);
+            self.allocator.free(existing.draws);
+            _ = self.region_mesh_cache.remove(rpos);
+        }
+        // Enforce a cap on live region buffers
+        if (self.regionMeshCacheCount() >= REGION_MESH_BUDGET) return;
+
+        var draws = self.allocator.alloc(SectionDraw, rs.chunks.items.len * @as(usize, @intCast(ws.section_count_y))) catch return;
+        var draws_len: usize = 0;
+
+        var verts = std.ArrayList(Vertex).initCapacity(self.allocator, 0) catch {
+            self.allocator.free(draws);
+            return;
+        };
+        defer verts.deinit(self.allocator);
+
+        // Iterate all chunks in region and build their sections into the shared vertex list
+        for (rs.chunks.items) |ch| {
+            const base_x: f32 = @floatFromInt(ch.pos.x * @as(i32, @intCast(constants.chunk_size_x)));
+            const base_z: f32 = @floatFromInt(ch.pos.z * @as(i32, @intCast(constants.chunk_size_z)));
+            var sy: usize = 0;
+            while (sy < ch.sections.len) : (sy += 1) {
+                const start: usize = verts.items.len;
+                self.buildSectionVertices(ws, &ch, sy, base_x, base_z, pad_u, pad_v, &verts);
+                const count: usize = verts.items.len - start;
+                if (count > 0) {
+                    draws[draws_len] = .{ .chunk_pos = ch.pos, .sy = @intCast(sy), .first = @intCast(start), .count = @intCast(count) };
+                    draws_len += 1;
+                }
+            }
+        }
+
+        // Shrink draws array to actual length
+        if (draws_len < draws.len) {
+            const new_draws = self.allocator.alloc(SectionDraw, draws_len) catch {
+                self.allocator.free(draws);
+                return;
+            };
+            @memcpy(new_draws[0..draws_len], draws[0..draws_len]);
+            self.allocator.free(draws);
+            draws = new_draws;
+        }
+
+        var buf: sg.Buffer = .{};
+        if (verts.items.len > 0) {
+            buf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true }, .data = sg.asRange(verts.items) });
+        }
+
+        _ = self.region_mesh_cache.put(rpos, .{ .vbuf = buf, .draws = draws, .built_chunk_count = rs.chunks.items.len }) catch {
+            if (buf.id != 0) sg.destroyBuffer(buf);
+            self.allocator.free(draws);
+            return;
+        };
+    }
+
+    fn renderWorldCached(self: *Client, vs_params: *const shd_mod.VsParams) void {
+        const wk = "minecraft:overworld";
+        self.sim.worlds_mutex.lock();
+        defer self.sim.worlds_mutex.unlock();
+        const ws = self.sim.worlds_state.getPtr(wk) orelse return;
+
+        // constants for padding
+        const pad_u: f32 = if (self.atlas_w > 0) (1.0 / @as(f32, @floatFromInt(self.atlas_w))) else 0.0;
+        const pad_v: f32 = if (self.atlas_h > 0) (1.0 / @as(f32, @floatFromInt(self.atlas_h))) else 0.0;
+
+        var reg_it = ws.regions.iterator();
+        while (reg_it.next()) |rentry| {
+            const rpos = rentry.key_ptr.*;
+            const rs_ptr = rentry.value_ptr;
+
+            // Build region mesh on demand
+            self.ensureRegionMesh(ws, rpos, rs_ptr, pad_u, pad_v);
+            const rmesh = self.region_mesh_cache.getPtr(rpos) orelse continue;
+            if (rmesh.vbuf.id == 0 or rmesh.draws.len == 0) continue;
+
+            // Bind region buffer once
+            var b = self.bind;
+            b.vertex_buffers[0] = rmesh.vbuf;
+            sg.applyBindings(b);
+
+            // Draw visible sections in this region
+            var di: usize = 0;
+            while (di < rmesh.draws.len) : (di += 1) {
+                const d = rmesh.draws[di];
+                // Section-level culling
+                if (self.frustum_valid) {
+                    const base_x: f32 = @floatFromInt(d.chunk_pos.x * @as(i32, @intCast(constants.chunk_size_x)));
+                    const base_z: f32 = @floatFromInt(d.chunk_pos.z * @as(i32, @intCast(constants.chunk_size_z)));
+                    const minp_s: [3]f32 = .{ base_x, @as(f32, @floatFromInt(@as(usize, d.sy) * constants.section_height)), base_z };
+                    const maxp_s: [3]f32 = .{ base_x + 16.0, @as(f32, @floatFromInt((@as(usize, d.sy) + 1) * constants.section_height)), base_z + 16.0 };
+                    const cam = self.camera.pos;
+                    const vis_sec = aabbContainsPoint(minp_s, maxp_s, cam) or aabbInFrustum(self.frustum_planes, minp_s, maxp_s, 0.5);
+                    if (!vis_sec) continue;
+                }
+                sg.applyUniforms(0, sg.asRange(vs_params));
+                sg.draw(d.first, d.count, 1);
+                // Mark chunk seen this frame (used by heuristic elsewhere)
+                _ = self.last_visible_frame_chunk.put(d.chunk_pos, self.frame_index) catch {};
+            }
+            _ = self.last_visible_frame_region.put(rpos, self.frame_index) catch {};
+        }
+
+        // Evict old or excess region meshes to bound pool usage
+        self.evictRegionMeshes(REGION_MESH_BUDGET, 10);
+    }
+
     fn buildChunkBlockMesh(self: *Client, out: *std.ArrayList(Vertex)) usize {
         // Helpers for UV padding and wrapping
         const pad_u: f32 = if (self.atlas_w > 0) (1.0 / @as(f32, @floatFromInt(self.atlas_w))) else 0.0;
@@ -1453,12 +1738,12 @@ pub const Client = struct {
                 const t1 = .{ min_u + w1x * range_u, min_v + w1y * range_v };
                 const t2 = .{ min_u + w2x * range_u, min_v + w2y * range_v };
                 const t3 = .{ min_u + w3x * range_u, min_v + w3y * range_v };
-                list.appendAssumeCapacity(.{ .pos = v0, .uv = t0 });
-                list.appendAssumeCapacity(.{ .pos = v1, .uv = t1 });
-                list.appendAssumeCapacity(.{ .pos = v2, .uv = t2 });
-                list.appendAssumeCapacity(.{ .pos = v0, .uv = t0 });
-                list.appendAssumeCapacity(.{ .pos = v2, .uv = t2 });
-                list.appendAssumeCapacity(.{ .pos = v3, .uv = t3 });
+                list.append(self.allocator, .{ .pos = v0, .uv = t0 }) catch return;
+                list.append(self.allocator, .{ .pos = v1, .uv = t1 }) catch return;
+                list.append(self.allocator, .{ .pos = v2, .uv = t2 }) catch return;
+                list.append(self.allocator, .{ .pos = v0, .uv = t0 }) catch return;
+                list.append(self.allocator, .{ .pos = v2, .uv = t2 }) catch return;
+                list.append(self.allocator, .{ .pos = v3, .uv = t3 }) catch return;
             }
         }.call;
 
@@ -1477,6 +1762,33 @@ pub const Client = struct {
                 const ch = ch_ptr.*; // copy for convenience
                 const base_x: f32 = @floatFromInt(ch.pos.x * @as(i32, @intCast(constants.chunk_size_x)));
                 const base_z: f32 = @floatFromInt(ch.pos.z * @as(i32, @intCast(constants.chunk_size_z)));
+
+                // Frustum culling per-chunk AABB
+                if (self.frustum_valid) {
+                    const minp: [3]f32 = .{ base_x, 0.0, base_z };
+                    const maxp: [3]f32 = .{
+                        base_x + @as(f32, @floatFromInt(constants.chunk_size_x)),
+                        @as(f32, @floatFromInt(ch.sections.len * constants.section_height)),
+                        base_z + @as(f32, @floatFromInt(constants.chunk_size_z)),
+                    };
+                    const cull_margin: f32 = 0.5; // tighter margin; hysteresis handles stability
+                    // Always keep the chunk containing the camera
+                    const cam = self.camera.pos;
+                    var visible = aabbContainsPoint(minp, maxp, cam);
+                    if (!visible) {
+                        visible = aabbInFrustum(self.frustum_planes, minp, maxp, cull_margin);
+                        if (!visible) {
+                            // Per-chunk linger: keep if seen within the last 2 frames
+                            if (self.last_visible_frame.get(ch.pos)) |last_f| {
+                                const delta = self.frame_index - last_f;
+                                if (delta <= 2) visible = true;
+                            }
+                        }
+                    }
+                    if (!visible) continue;
+                    // Update last visible frame index
+                    _ = self.last_visible_frame.put(ch.pos, self.frame_index) catch {};
+                }
 
                 // Rough upper bound capacity: worst-case 6 faces per voxel (very high), but we reserve moderately
                 const cur_len: usize = out.items.len;
@@ -1641,6 +1953,72 @@ pub const Client = struct {
         return r;
     }
 
+    // Extract 6 view-frustum planes from a column-major MVP matrix.
+    // Plane order: left, right, bottom, top, near, far. Each plane is (a,b,c,d) with outward normal.
+    fn extractFrustumPlanes(m: [16]f32) [6][4]f32 {
+        // rows in column-major storage
+        const r0 = [4]f32{ m[0], m[4], m[8], m[12] };
+        const r1 = [4]f32{ m[1], m[5], m[9], m[13] };
+        const r2 = [4]f32{ m[2], m[6], m[10], m[14] };
+        const r3 = [4]f32{ m[3], m[7], m[11], m[15] };
+        var planes: [6][4]f32 = undefined;
+        // left = r3 + r0
+        planes[0] = .{ r3[0] + r0[0], r3[1] + r0[1], r3[2] + r0[2], r3[3] + r0[3] };
+        // right = r3 - r0
+        planes[1] = .{ r3[0] - r0[0], r3[1] - r0[1], r3[2] - r0[2], r3[3] - r0[3] };
+        // bottom = r3 + r1
+        planes[2] = .{ r3[0] + r1[0], r3[1] + r1[1], r3[2] + r1[2], r3[3] + r1[3] };
+        // top = r3 - r1
+        planes[3] = .{ r3[0] - r1[0], r3[1] - r1[1], r3[2] - r1[2], r3[3] - r1[3] };
+        // near = r3 + r2
+        planes[4] = .{ r3[0] + r2[0], r3[1] + r2[1], r3[2] + r2[2], r3[3] + r2[3] };
+        // far = r3 - r2
+        planes[5] = .{ r3[0] - r2[0], r3[1] - r2[1], r3[2] - r2[2], r3[3] - r2[3] };
+        // normalize planes
+        var pi: usize = 0;
+        while (pi < 6) : (pi += 1) {
+            const a = planes[pi][0];
+            const b = planes[pi][1];
+            const c = planes[pi][2];
+            const inv_len = 1.0 / @max(0.000001, @sqrt(a * a + b * b + c * c));
+            planes[pi][0] = a * inv_len;
+            planes[pi][1] = b * inv_len;
+            planes[pi][2] = c * inv_len;
+            planes[pi][3] = planes[pi][3] * inv_len;
+        }
+        return planes;
+    }
+
+    fn aabbInFrustum(planes: [6][4]f32, min: [3]f32, max: [3]f32, margin: f32) bool {
+        var p: [3]f32 = undefined;
+        var i: usize = 0;
+        while (i < 6) : (i += 1) {
+            const a = planes[i][0];
+            const b = planes[i][1];
+            const c = planes[i][2];
+            const d = planes[i][3];
+            p[0] = if (a >= 0) max[0] else min[0];
+            p[1] = if (b >= 0) max[1] else min[1];
+            p[2] = if (c >= 0) max[2] else min[2];
+            const dist = a * p[0] + b * p[1] + c * p[2] + d;
+            if (dist < -margin) return false;
+        }
+        return true;
+    }
+
+    fn updateFrustum(self: *Client, mvp: [16]f32) void {
+        if (self.frustum_valid) {
+            self.prev_frustum_planes = self.frustum_planes;
+            self.prev_frustum_valid = true;
+        }
+        self.frustum_planes = extractFrustumPlanes(mvp);
+        self.frustum_valid = true;
+    }
+
+    fn aabbContainsPoint(min: [3]f32, max: [3]f32, p: [3]f32) bool {
+        return p[0] >= min[0] and p[0] <= max[0] and p[1] >= min[1] and p[1] <= max[1] and p[2] >= min[2] and p[2] <= max[2];
+    }
+
     fn makePerspective(fovy_radians: f32, aspect: f32, znear: f32, zfar: f32) [16]f32 {
         const f: f32 = 1.0 / @tan(fovy_radians / 2.0);
         var m: [16]f32 = [_]f32{0} ** 16;
@@ -1789,5 +2167,74 @@ pub const Client = struct {
         const s: [3]f32 = .{ -sy, 0, cy };
         const u: [3]f32 = .{ 0, 1, 0 };
         return makeViewFromBasis(eye, s, u, f);
+    }
+
+    fn regionMeshCacheCount(self: *Client) usize {
+        var cnt: usize = 0;
+        var it = self.region_mesh_cache.keyIterator();
+        while (it.next()) |_| cnt += 1;
+        return cnt;
+    }
+
+    fn evictRegionMeshes(self: *Client, max_count: usize, ttl_frames: u32) void {
+        // Collect stale regions (older than ttl_frames)
+        var to_remove = std.ArrayList(simulation.RegionPos).initCapacity(self.allocator, 0) catch {
+            return;
+        };
+        defer to_remove.deinit(self.allocator);
+        var it = self.region_mesh_cache.iterator();
+        while (it.next()) |entry| {
+            const pos = entry.key_ptr.*;
+            const last_opt = self.last_visible_frame_region.get(pos);
+            const last_seen: u32 = last_opt orelse 0;
+            const age = self.frame_index - last_seen;
+            if (age > ttl_frames) {
+                to_remove.append(self.allocator, pos) catch {};
+            }
+        }
+        // Remove stale
+        var i: usize = 0;
+        while (i < to_remove.items.len) : (i += 1) {
+            const pos = to_remove.items[i];
+            if (self.region_mesh_cache.get(pos)) |rm| {
+                if (rm.vbuf.id != 0) sg.destroyBuffer(rm.vbuf);
+                self.allocator.free(rm.draws);
+            }
+            _ = self.region_mesh_cache.remove(pos);
+        }
+
+        // If still over budget, remove oldest until under limit
+        var count = self.regionMeshCacheCount();
+        if (count <= max_count) return;
+
+        var candidates = std.ArrayList(struct { pos: simulation.RegionPos, last: u32 }).initCapacity(self.allocator, 0) catch {
+            return;
+        };
+        defer candidates.deinit(self.allocator);
+        var it2 = self.region_mesh_cache.iterator();
+        while (it2.next()) |entry| {
+            const pos = entry.key_ptr.*;
+            const last = self.last_visible_frame_region.get(pos) orelse 0;
+            candidates.append(self.allocator, .{ .pos = pos, .last = last }) catch {};
+        }
+        while (count > max_count and candidates.items.len > 0) {
+            var min_idx: usize = 0;
+            var min_last: u32 = candidates.items[0].last;
+            var j: usize = 1;
+            while (j < candidates.items.len) : (j += 1) {
+                if (candidates.items[j].last < min_last) {
+                    min_last = candidates.items[j].last;
+                    min_idx = j;
+                }
+            }
+            const pos = candidates.items[min_idx].pos;
+            if (self.region_mesh_cache.get(pos)) |rm| {
+                if (rm.vbuf.id != 0) sg.destroyBuffer(rm.vbuf);
+                self.allocator.free(rm.draws);
+            }
+            _ = self.region_mesh_cache.remove(pos);
+            _ = candidates.swapRemove(min_idx);
+            count -= 1;
+        }
     }
 };
