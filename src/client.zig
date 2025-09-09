@@ -259,7 +259,7 @@ const firstPersonHorizontalScheme: ControlScheme = .{
     .makeViewProj = cs_fph_makeViewProj,
 };
 
-const Vertex = struct { pos: [3]f32, uv: [2]f32, uv_off: [2]f32, uv_scale: [2]f32 };
+const Vertex = struct { pos: [3]f32, uv: [2]f32, layer: f32 };
 
 // ThirdPersonIsometric control scheme
 fn cs_iso_onMouseMove(ctx: *anyopaque, ev: sapp.Event) void {
@@ -395,16 +395,14 @@ inline fn wrap01m(v: f32) f32 {
     return if (f == 0.0 and v > 0.0) 1.0 else f;
 }
 
-inline fn emitQuad(allocator: std.mem.Allocator, list: *std.ArrayList(Vertex), v0: [3]f32, v1: [3]f32, v2: [3]f32, v3: [3]f32, uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32, uv_scale_p: [2]f32, uv_offset_p: [2]f32) void {
-    // Store tile-local UVs (may be >1) and atlas transform; shader applies fract and transform
-    const off = uv_offset_p;
-    const sc = uv_scale_p;
-    list.append(allocator, .{ .pos = v0, .uv = uv0, .uv_off = off, .uv_scale = sc }) catch return;
-    list.append(allocator, .{ .pos = v1, .uv = uv1, .uv_off = off, .uv_scale = sc }) catch return;
-    list.append(allocator, .{ .pos = v2, .uv = uv2, .uv_off = off, .uv_scale = sc }) catch return;
-    list.append(allocator, .{ .pos = v0, .uv = uv0, .uv_off = off, .uv_scale = sc }) catch return;
-    list.append(allocator, .{ .pos = v2, .uv = uv2, .uv_off = off, .uv_scale = sc }) catch return;
-    list.append(allocator, .{ .pos = v3, .uv = uv3, .uv_off = off, .uv_scale = sc }) catch return;
+inline fn emitQuad(allocator: std.mem.Allocator, list: *std.ArrayList(Vertex), v0: [3]f32, v1: [3]f32, v2: [3]f32, v3: [3]f32, uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32, layer: f32) void {
+    // Store tile-local UVs (may be >1) and the texture-array layer index; shader applies fract
+    list.append(allocator, .{ .pos = v0, .uv = uv0, .layer = layer }) catch return;
+    list.append(allocator, .{ .pos = v1, .uv = uv1, .layer = layer }) catch return;
+    list.append(allocator, .{ .pos = v2, .uv = uv2, .layer = layer }) catch return;
+    list.append(allocator, .{ .pos = v0, .uv = uv0, .layer = layer }) catch return;
+    list.append(allocator, .{ .pos = v2, .uv = uv2, .layer = layer }) catch return;
+    list.append(allocator, .{ .pos = v3, .uv = uv3, .layer = layer }) catch return;
 }
 
 // Cached mesh types (region-level aggregation)
@@ -451,10 +449,8 @@ const RegionSliceRefs = struct { rpos: simulation.RegionPos, section_count_y: u1
 
 const REGION_MESH_BUDGET: usize = 128; // generous, regions are fewer than chunks
 
-const AtlasTransform = struct {
-    offset: [2]f32,
-    scale: [2]f32,
-};
+// Texture-array layer identifier
+const LayerId = u16;
 
 fn bitsFor(n: usize) u6 {
     if (n <= 1) return 1;
@@ -516,12 +512,12 @@ fn buildQuadVerts(out: []Vertex, x0: f32, y0: f32, size: f32) usize {
     if (out.len < 6) return 0;
     const x1: f32 = x0 + size;
     const y1: f32 = y0 + size;
-    out[0] = .{ .pos = .{ x0, y0 }, .uv = .{ 0, 0 } };
-    out[1] = .{ .pos = .{ x1, y0 }, .uv = .{ 1, 0 } };
-    out[2] = .{ .pos = .{ x1, y1 }, .uv = .{ 1, 1 } };
-    out[3] = .{ .pos = .{ x0, y0 }, .uv = .{ 0, 0 } };
-    out[4] = .{ .pos = .{ x1, y1 }, .uv = .{ 1, 1 } };
-    out[5] = .{ .pos = .{ x0, y1 }, .uv = .{ 0, 1 } };
+    out[0] = .{ .pos = .{ x0, y0 }, .uv = .{ 0, 0 }, .layer = 0 };
+    out[1] = .{ .pos = .{ x1, y0 }, .uv = .{ 1, 0 }, .layer = 0 };
+    out[2] = .{ .pos = .{ x1, y1 }, .uv = .{ 1, 1 }, .layer = 0 };
+    out[3] = .{ .pos = .{ x0, y0 }, .uv = .{ 0, 0 }, .layer = 0 };
+    out[4] = .{ .pos = .{ x1, y1 }, .uv = .{ 1, 1 }, .layer = 0 };
+    out[5] = .{ .pos = .{ x0, y1 }, .uv = .{ 0, 1 }, .layer = 0 };
     return 6;
 }
 
@@ -557,18 +553,16 @@ fn makeFallbackTile(allocator: std.mem.Allocator, size: usize) !struct { w: u32,
     return .{ .w = @intCast(w), .h = @intCast(h), .pixels = pixels };
 }
 
-fn buildAtlasFromPaths(allocator: std.mem.Allocator, paths: []const []const u8) !struct {
-    atlas_pixels: []u8,
-    atlas_w: u32,
-    atlas_h: u32,
-    rects: []UvRect,
+fn buildTextureArrayFromPaths(allocator: std.mem.Allocator, paths: []const []const u8) !struct {
+    pixels: []u8, // concatenated slices (N * w * h * 4)
+    w: u32,
+    h: u32,
 } {
     const png = @import("png.zig");
     // Load all images (or fallback tiles) and record dims
     const N = paths.len;
     var loaded = try allocator.alloc(struct { w: u32, h: u32, pixels: []u8 }, N);
     errdefer {
-        // free any allocated pixels
         var j: usize = 0;
         while (j < loaded.len) : (j += 1) {
             if (loaded[j].pixels.len > 0) allocator.free(loaded[j].pixels);
@@ -603,48 +597,27 @@ fn buildAtlasFromPaths(allocator: std.mem.Allocator, paths: []const []const u8) 
     const tile_w: u32 = if (max_w == 0) 16 else max_w;
     const tile_h: u32 = if (max_h == 0) 16 else max_h;
 
-    // Simple grid packing: smallest cols where cols*cols >= N
-    var cols: u32 = 1;
-    while (@as(usize, cols) * @as(usize, cols) < N) cols += 1;
-    const rows: u32 = @intCast((N + cols - 1) / cols);
-    const atlas_w: u32 = cols * tile_w;
-    const atlas_h: u32 = rows * tile_h;
-    var atlas_pixels = try allocator.alloc(u8, @as(usize, atlas_w) * @as(usize, atlas_h) * 4);
-    @memset(atlas_pixels, 0);
-
-    var rects = try allocator.alloc(UvRect, N);
-
-    // Blit each tile
+    // Concatenate slices (each slice is tightly packed w*h*4)
+    var all_pixels = try allocator.alloc(u8, @as(usize, N) * @as(usize, tile_w) * @as(usize, tile_h) * 4);
+    @memset(all_pixels, 0);
     i = 0;
     while (i < N) : (i += 1) {
-        const c: u32 = @intCast(i % cols);
-        const r: u32 = @intCast(i / cols);
-        const dst_x: u32 = c * tile_w;
-        const dst_y: u32 = r * tile_h;
-        // Copy row by row
         var py: u32 = 0;
         while (py < loaded[i].h) : (py += 1) {
             const src_off: usize = @as(usize, py) * @as(usize, loaded[i].w) * 4;
-            const dst_row_off: usize = (@as(usize, dst_y + py) * @as(usize, atlas_w) + @as(usize, dst_x)) * 4;
+            const dst_slice_base: usize = i * (@as(usize, tile_w) * @as(usize, tile_h) * 4);
+            const dst_row_off: usize = dst_slice_base + (@as(usize, py) * @as(usize, tile_w) * 4);
             const copy_bytes: usize = @as(usize, loaded[i].w) * 4;
-            @memcpy(atlas_pixels[dst_row_off .. dst_row_off + copy_bytes], loaded[i].pixels[src_off .. src_off + copy_bytes]);
+            @memcpy(all_pixels[dst_row_off .. dst_row_off + copy_bytes], loaded[i].pixels[src_off .. src_off + copy_bytes]);
         }
-        rects[i] = .{
-            .u0 = @as(f32, @floatFromInt(dst_x)) / @as(f32, @floatFromInt(atlas_w)),
-            .v0 = @as(f32, @floatFromInt(dst_y)) / @as(f32, @floatFromInt(atlas_h)),
-            .u1 = @as(f32, @floatFromInt(dst_x + loaded[i].w)) / @as(f32, @floatFromInt(atlas_w)),
-            .v1 = @as(f32, @floatFromInt(dst_y + loaded[i].h)) / @as(f32, @floatFromInt(atlas_h)),
-            .w = loaded[i].w,
-            .h = loaded[i].h,
-        };
     }
 
-    // Free individual tiles; keep atlas_pixels and rects
+    // Free individual tiles; keep concatenated pixels
     i = 0;
     while (i < N) : (i += 1) allocator.free(loaded[i].pixels);
     allocator.free(loaded);
 
-    return .{ .atlas_pixels = atlas_pixels, .atlas_w = atlas_w, .atlas_h = atlas_h, .rects = rects };
+    return .{ .pixels = all_pixels, .w = tile_w, .h = tile_h };
 }
 
 fn addUniquePath(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), s: []const u8) !void {
@@ -653,13 +626,13 @@ fn addUniquePath(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8),
     try list.append(allocator, s);
 }
 
-fn findRectForPath(paths: []const []const u8, rects: []const UvRect, s: []const u8) ?UvRect {
+fn findIndexForPath(paths: []const []const u8, s: []const u8) ?usize {
     var i: usize = 0;
-    while (i < paths.len) : (i += 1) if (std.mem.eql(u8, paths[i], s)) return rects[i];
+    while (i < paths.len) : (i += 1) if (std.mem.eql(u8, paths[i], s)) return i;
     return null;
 }
 
-fn buildTextureAtlas(self: *Client) void {
+fn buildTextureArray(self: *Client) void {
     // Collect unique paths from resource registry
     var paths = std.ArrayList([]const u8).initCapacity(self.allocator, 0) catch {
         self.textures_ready = true;
@@ -678,50 +651,75 @@ fn buildTextureAtlas(self: *Client) void {
         }
     }
     if (paths.items.len == 0) {
-        // Nothing to do: create a 1x1 fallback atlas
+        // Nothing to do: create a 1x1x1 fallback array texture
         var one = [_]u8{ 255, 0, 255, 255 };
-        self.grass_img = sg.makeImage(.{ .width = 1, .height = 1, .pixel_format = .RGBA8, .data = .{ .subimage = .{ .{ sg.asRange(one[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} } } } });
-        self.atlas_w = 1;
-        self.atlas_h = 1;
-        self.atlas_uv_scale = .{ 1, 1 };
-        self.atlas_uv_offset = .{ 0, 0 };
-        // Set per-face defaults to match the selected default region
-        self.atlas_uv_top_scale = self.atlas_uv_scale;
-        self.atlas_uv_top_offset = self.atlas_uv_offset;
-        self.atlas_uv_side_scale = self.atlas_uv_scale;
-        self.atlas_uv_side_offset = self.atlas_uv_offset;
+        self.grass_img = sg.makeImage(.{
+            .type = .ARRAY,
+            .width = 1,
+            .height = 1,
+            .num_slices = 1,
+            .pixel_format = .RGBA8,
+            .num_mipmaps = 1,
+            .data = .{
+                .subimage = .{
+                    .{ sg.asRange(one[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                },
+            },
+        });
+        self.default_layer = 0;
+        self.top_layer = 0;
+        self.side_layer = 0;
         self.textures_ready = true;
         return;
     }
 
-    // Clear any previous atlas map entries
-    self.atlas_uv_by_path.clearRetainingCapacity();
+    // Clear any previous layer map entries
+    self.layers_by_path.clearRetainingCapacity();
 
-    const built = buildAtlasFromPaths(self.allocator, paths.items) catch {
+    const built = buildTextureArrayFromPaths(self.allocator, paths.items) catch {
         // Fallback as above on failure
         var one = [_]u8{ 255, 0, 255, 255 };
-        self.grass_img = sg.makeImage(.{ .width = 1, .height = 1, .pixel_format = .RGBA8, .data = .{ .subimage = .{ .{ sg.asRange(one[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} } } } });
-        self.atlas_w = 1;
-        self.atlas_h = 1;
-        self.atlas_uv_scale = .{ 1, 1 };
-        self.atlas_uv_offset = .{ 0, 0 };
-        self.atlas_uv_top_scale = self.atlas_uv_scale;
-        self.atlas_uv_top_offset = self.atlas_uv_offset;
-        self.atlas_uv_side_scale = self.atlas_uv_scale;
-        self.atlas_uv_side_offset = self.atlas_uv_offset;
+        self.grass_img = sg.makeImage(.{
+            .type = .ARRAY,
+            .width = 1,
+            .height = 1,
+            .num_slices = 1,
+            .pixel_format = .RGBA8,
+            .num_mipmaps = 1,
+            .data = .{
+                .subimage = .{
+                    .{ sg.asRange(one[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                },
+            },
+        });
+        self.default_layer = 0;
+        self.top_layer = 0;
+        self.side_layer = 0;
         self.textures_ready = true;
         return;
     };
-    defer self.allocator.free(built.atlas_pixels);
-    defer self.allocator.free(built.rects);
+    defer self.allocator.free(built.pixels);
 
-    // Upload atlas image to GPU
+    // Upload array image to GPU (slices concatenated in built.pixels)
     self.grass_img = sg.makeImage(.{
-        .width = @intCast(built.atlas_w),
-        .height = @intCast(built.atlas_h),
+        .type = .ARRAY,
+        .width = @intCast(built.w),
+        .height = @intCast(built.h),
+        .num_slices = @intCast(paths.items.len),
+        .num_mipmaps = 1,
         .pixel_format = .RGBA8,
         .data = .{ .subimage = .{
-            .{ sg.asRange(built.atlas_pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+            .{ sg.asRange(built.pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
             .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
             .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
             .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
@@ -729,26 +727,19 @@ fn buildTextureAtlas(self: *Client) void {
             .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
         } },
     });
-    self.atlas_w = built.atlas_w;
-    self.atlas_h = built.atlas_h;
 
-    // Populate atlas UV map for each source path
+    // Populate layer map for each source path
     var i_paths: usize = 0;
     while (i_paths < paths.items.len) : (i_paths += 1) {
-        const rc = built.rects[i_paths];
-        const tx: AtlasTransform = .{ .offset = .{ rc.u0, rc.v0 }, .scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 } };
-        // Note: keys are owned by registry; we do not dup or free them here
-        _ = self.atlas_uv_by_path.put(paths.items[i_paths], tx) catch {};
+        _ = self.layers_by_path.put(paths.items[i_paths], @intCast(i_paths)) catch {};
     }
 
-    // Choose a default atlas region to use for the current single-material demo mesh.
-    // Prefer minecraft:dirt (uniform), otherwise fall back to grass_block face, then stone, then first tile.
+    // Choose defaults: prefer minecraft:dirt, then grass face, then stone, then 0
     var chosen: bool = false;
     if (!chosen) {
         if (self.sim.reg.resources.get("minecraft:dirt")) |r_dirt| switch (r_dirt) {
-            .Uniform => |u| if (findRectForPath(paths.items, built.rects, u.all_path)) |rc| {
-                self.atlas_uv_offset = .{ rc.u0, rc.v0 };
-                self.atlas_uv_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
+            .Uniform => |u| if (findIndexForPath(paths.items, u.all_path)) |idx| {
+                self.default_layer = @intCast(idx);
                 chosen = true;
             },
             else => {},
@@ -756,14 +747,12 @@ fn buildTextureAtlas(self: *Client) void {
     }
     if (!chosen) {
         if (self.sim.reg.resources.get("minecraft:grass")) |res| switch (res) {
-            .Facing => |f| if (findRectForPath(paths.items, built.rects, f.face_path)) |rc| {
-                self.atlas_uv_offset = .{ rc.u0, rc.v0 };
-                self.atlas_uv_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
+            .Facing => |f| if (findIndexForPath(paths.items, f.face_path)) |idx| {
+                self.default_layer = @intCast(idx);
                 chosen = true;
             },
-            .Uniform => |u| if (findRectForPath(paths.items, built.rects, u.all_path)) |rc| {
-                self.atlas_uv_offset = .{ rc.u0, rc.v0 };
-                self.atlas_uv_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
+            .Uniform => |u| if (findIndexForPath(paths.items, u.all_path)) |idx| {
+                self.default_layer = @intCast(idx);
                 chosen = true;
             },
             .Void => {},
@@ -771,28 +760,24 @@ fn buildTextureAtlas(self: *Client) void {
     }
     if (!chosen) {
         if (self.sim.reg.resources.get("minecraft:stone")) |r_stone| switch (r_stone) {
-            .Uniform => |u| if (findRectForPath(paths.items, built.rects, u.all_path)) |rc| {
-                self.atlas_uv_offset = .{ rc.u0, rc.v0 };
-                self.atlas_uv_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
+            .Uniform => |u| if (findIndexForPath(paths.items, u.all_path)) |idx| {
+                self.default_layer = @intCast(idx);
                 chosen = true;
             },
             else => {},
         };
     }
-    if (!chosen and built.rects.len > 0) {
-        const rc = built.rects[0];
-        self.atlas_uv_offset = .{ rc.u0, rc.v0 };
-        self.atlas_uv_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
+    if (!chosen) {
+        self.default_layer = 0;
     }
 
-    // Compute per-face transforms
-    // Top: prefer grass_block face, fallback to dirt, then stone, then default
+    // Per-face defaults
+    // Top: prefer grass_block face; otherwise dirt; otherwise default
     var top_set = false;
     if (!top_set) {
         if (self.sim.reg.resources.get("minecraft:grass_block")) |res| switch (res) {
-            .Facing => |f| if (findRectForPath(paths.items, built.rects, f.face_path)) |rc| {
-                self.atlas_uv_top_offset = .{ rc.u0, rc.v0 };
-                self.atlas_uv_top_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
+            .Facing => |f| if (findIndexForPath(paths.items, f.face_path)) |idx| {
+                self.top_layer = @intCast(idx);
                 top_set = true;
             },
             else => {},
@@ -800,26 +785,21 @@ fn buildTextureAtlas(self: *Client) void {
     }
     if (!top_set) {
         if (self.sim.reg.resources.get("minecraft:dirt")) |r_dirt2| switch (r_dirt2) {
-            .Uniform => |u| if (findRectForPath(paths.items, built.rects, u.all_path)) |rc| {
-                self.atlas_uv_top_offset = .{ rc.u0, rc.v0 };
-                self.atlas_uv_top_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
+            .Uniform => |u| if (findIndexForPath(paths.items, u.all_path)) |idx| {
+                self.top_layer = @intCast(idx);
                 top_set = true;
             },
             else => {},
         };
     }
-    if (!top_set) {
-        self.atlas_uv_top_offset = self.atlas_uv_offset;
-        self.atlas_uv_top_scale = self.atlas_uv_scale;
-    }
+    if (!top_set) self.top_layer = self.default_layer;
 
-    // Side: prefer grass_block other (dirt), fallback to dirt, then stone, then default
+    // Side: prefer grass_block other (dirt), fallback to dirt, then default
     var side_set = false;
     if (!side_set) {
         if (self.sim.reg.resources.get("minecraft:grass_block")) |res2| switch (res2) {
-            .Facing => |f| if (findRectForPath(paths.items, built.rects, f.other_path)) |rc| {
-                self.atlas_uv_side_offset = .{ rc.u0, rc.v0 };
-                self.atlas_uv_side_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
+            .Facing => |f| if (findIndexForPath(paths.items, f.other_path)) |idx| {
+                self.side_layer = @intCast(idx);
                 side_set = true;
             },
             else => {},
@@ -827,18 +807,14 @@ fn buildTextureAtlas(self: *Client) void {
     }
     if (!side_set) {
         if (self.sim.reg.resources.get("minecraft:dirt")) |r_dirt3| switch (r_dirt3) {
-            .Uniform => |u| if (findRectForPath(paths.items, built.rects, u.all_path)) |rc| {
-                self.atlas_uv_side_offset = .{ rc.u0, rc.v0 };
-                self.atlas_uv_side_scale = .{ rc.u1 - rc.u0, rc.v1 - rc.v0 };
+            .Uniform => |u| if (findIndexForPath(paths.items, u.all_path)) |idx| {
+                self.side_layer = @intCast(idx);
                 side_set = true;
             },
             else => {},
         };
     }
-    if (!side_set) {
-        self.atlas_uv_side_offset = self.atlas_uv_offset;
-        self.atlas_uv_side_scale = self.atlas_uv_scale;
-    }
+    if (!side_set) self.side_layer = self.default_layer;
 
     self.textures_ready = true;
 }
@@ -852,16 +828,12 @@ pub const Client = struct {
     // Connection/ready state
     ready: bool = false,
 
-    // Texture/atlas preloading state
+    // Texture/array preloading state
     textures_ready: bool = false,
-    // UV transform defaults for the current demo material
-    atlas_uv_scale: [2]f32 = .{ 1, 1 },
-    atlas_uv_offset: [2]f32 = .{ 0, 0 },
-    // Per-face transforms for the simple terrain surface (top uses grass top; sides use dirt)
-    atlas_uv_top_scale: [2]f32 = .{ 1, 1 },
-    atlas_uv_top_offset: [2]f32 = .{ 0, 0 },
-    atlas_uv_side_scale: [2]f32 = .{ 1, 1 },
-    atlas_uv_side_offset: [2]f32 = .{ 0, 0 },
+    // Default layer choices for current demo material
+    default_layer: LayerId = 0,
+    top_layer: LayerId = 0,
+    side_layer: LayerId = 0,
 
     // UI / rendering state
     pass_action: sg.PassAction = .{},
@@ -886,19 +858,17 @@ pub const Client = struct {
     // dedicated dynamic buffer for outline (lines) to avoid multiple updates per buffer per frame
     outline_vbuf: sg.Buffer = .{},
     bind: sg.Bindings = .{},
-    // We reuse grass_* for the atlas image/view binding for now
+    // We reuse grass_* for the texture array image/view binding for now
     grass_img: sg.Image = .{},
     grass_view: sg.View = .{},
     sampler: sg.Sampler = .{},
-    // Debug solid-color textures
+    // Debug solid-color textures (as 1-slice arrays)
     green_img: sg.Image = .{},
     green_view: sg.View = .{},
     black_img: sg.Image = .{},
     black_view: sg.View = .{},
-    atlas_w: u32 = 1,
-    atlas_h: u32 = 1,
-    // Atlas UV transforms per texture path
-    atlas_uv_by_path: std.StringHashMap(AtlasTransform) = undefined,
+    // Layer map per texture path
+    layers_by_path: std.StringHashMap(LayerId) = undefined,
 
     // Cached region meshes keyed by region position
     region_mesh_cache: std.AutoHashMap(simulation.RegionPos, RegionMesh) = undefined,
@@ -1012,7 +982,7 @@ pub const Client = struct {
             .sim = sim,
             .player_id = player_id,
             .account_name = acc,
-            .atlas_uv_by_path = std.StringHashMap(AtlasTransform).init(allocator),
+            .layers_by_path = std.StringHashMap(LayerId).init(allocator),
             .region_mesh_cache = std.AutoHashMap(simulation.RegionPos, RegionMesh).init(allocator),
             .last_visible_frame_chunk = std.AutoHashMap(gs.ChunkPos, u32).init(allocator),
             .last_visible_frame_region = std.AutoHashMap(simulation.RegionPos, u32).init(allocator),
@@ -1138,7 +1108,7 @@ pub const Client = struct {
         }
         self.region_mesh_cache.deinit();
 
-        self.atlas_uv_by_path.deinit();
+        self.layers_by_path.deinit();
         self.last_visible_frame_chunk.deinit();
         self.last_visible_frame_region.deinit();
 
@@ -1195,8 +1165,9 @@ pub const Client = struct {
         var pdesc: sg.PipelineDesc = .{};
         pdesc.label = "chunk-pipeline";
         pdesc.shader = self.shd;
-        pdesc.layout.attrs[0].format = .FLOAT3;
-        pdesc.layout.attrs[1].format = .FLOAT2;
+        pdesc.layout.attrs[0].format = .FLOAT3; // pos
+        pdesc.layout.attrs[1].format = .FLOAT2; // uv
+        pdesc.layout.attrs[2].format = .FLOAT; // layer
         pdesc.primitive_type = .TRIANGLES;
         pdesc.cull_mode = .BACK;
         // Front-face winding should match our emitted CCW triangles
@@ -1206,8 +1177,6 @@ pub const Client = struct {
         const desc = sg.queryDesc();
         pdesc.color_count = 1;
         pdesc.colors[0].pixel_format = desc.environment.defaults.color_format;
-        pdesc.layout.attrs[2].format = .FLOAT2;
-        pdesc.layout.attrs[3].format = .FLOAT2;
         self.pip = sg.makePipeline(pdesc);
 
         // A separate pipeline for line rendering (block outlines)
@@ -1248,13 +1217,13 @@ pub const Client = struct {
         self.outline_vbuf_capacity_bytes = outline_initial_bytes;
         self.pass_action.depth = .{ .load_action = .CLEAR, .clear_value = 1.0 };
 
-        // Build texture atlas from registry resource paths (map already initialized in init)
-        buildTextureAtlas(self);
+        // Build texture array from registry resource paths (map already initialized in init)
+        buildTextureArray(self);
 
-        // create a view and sampler for the atlas (reusing grass_* fields)
+        // create a view and sampler for the array (reusing grass_* fields)
         self.grass_view = sg.makeView(.{ .texture = .{ .image = self.grass_img } });
         self.sampler = sg.makeSampler(.{ .min_filter = .NEAREST, .mag_filter = .NEAREST, .mipmap_filter = .NEAREST, .wrap_u = .CLAMP_TO_EDGE, .wrap_v = .CLAMP_TO_EDGE });
-        // shader expects VIEW_tex_texture at slot 1 and SMP_tex_sampler at slot 2
+        // shader expects VIEW_tex_array at slot 1 and SMP_tex_sampler at slot 2
         self.bind.views[1] = self.grass_view;
         self.bind.samplers[2] = self.sampler;
 
@@ -1262,8 +1231,11 @@ pub const Client = struct {
         {
             var green = [_]u8{ 0, 255, 0, 255 };
             self.green_img = sg.makeImage(.{
+                .type = .ARRAY,
                 .width = 1,
                 .height = 1,
+                .num_slices = 1,
+                .num_mipmaps = 1,
                 .pixel_format = .RGBA8,
                 .data = .{ .subimage = .{ .{ sg.asRange(green[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} } } },
             });
@@ -1279,224 +1251,24 @@ pub const Client = struct {
         {
             var black = [_]u8{ 0, 0, 0, 255 };
             self.black_img = sg.makeImage(.{
+                .type = .ARRAY,
                 .width = 1,
                 .height = 1,
+                .num_slices = 1,
+                .num_mipmaps = 1,
                 .pixel_format = .RGBA8,
                 .data = .{ .subimage = .{ .{ sg.asRange(black[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} } } },
             });
             self.black_view = sg.makeView(.{ .texture = .{ .image = self.black_img } });
         }
-    }
 
-    fn buildChunkSurfaceMesh(self: *Client, out: *std.ArrayList(Vertex)) usize {
-        const uv_scale_top = self.atlas_uv_top_scale;
-        const uv_offset_top = self.atlas_uv_top_offset;
-        const uv_scale_side = self.atlas_uv_side_scale;
-        const uv_offset_side = self.atlas_uv_side_offset;
-        // Pad in atlas units to avoid cross-tile sampling (use full 1.0 texel)
-        const pad_u: f32 = if (self.atlas_w > 0) (1.0 / @as(f32, @floatFromInt(self.atlas_w))) else 0.0;
-        const pad_v: f32 = if (self.atlas_h > 0) (1.0 / @as(f32, @floatFromInt(self.atlas_h))) else 0.0;
-        // Render all loaded chunks in the overworld
-        const wk = "minecraft:overworld";
-        self.sim.worlds_mutex.lock();
-        defer self.sim.worlds_mutex.unlock();
-        const ws = self.sim.worlds_state.getPtr(wk) orelse return 0;
-
-        // Helpers to append a quad (two triangles) with CCW winding
-        const addQuad = struct {
-            fn wrap01(v: f32) f32 {
-                const f = v - std.math.floor(v);
-                // keep upper edge at 1.0 instead of wrapping to 0.0 when v is an exact integer > 0
-                return if (f == 0.0 and v > 0.0) 1.0 else f;
-            }
-            fn call(list: *std.ArrayList(Vertex), v0: [3]f32, v1: [3]f32, v2: [3]f32, v3: [3]f32, uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32, uv_scale_p: [2]f32, uv_offset_p: [2]f32, pad_u_in: f32, pad_v_in: f32) void {
-                // Wrap UVs into [0,1] (inclusive upper edge) per tile
-                const w0x: f32 = wrap01(uv0[0]);
-                const w0y: f32 = wrap01(uv0[1]);
-                const w1x: f32 = wrap01(uv1[0]);
-                const w1y: f32 = wrap01(uv1[1]);
-                const w2x: f32 = wrap01(uv2[0]);
-                const w2y: f32 = wrap01(uv2[1]);
-                const w3x: f32 = wrap01(uv3[0]);
-                const w3y: f32 = wrap01(uv3[1]);
-                // inset by full texel in atlas space to avoid bleeding, and clamp scale accordingly
-                const min_u = uv_offset_p[0] + pad_u_in;
-                const min_v = uv_offset_p[1] + pad_v_in;
-                const range_u = @max(0.0, uv_scale_p[0] - 2.0 * pad_u_in);
-                const range_v = @max(0.0, uv_scale_p[1] - 2.0 * pad_v_in);
-                const t0 = .{ min_u + w0x * range_u, min_v + w0y * range_v };
-                const t1 = .{ min_u + w1x * range_u, min_v + w1y * range_v };
-                const t2 = .{ min_u + w2x * range_u, min_v + w2y * range_v };
-                const t3 = .{ min_u + w3x * range_u, min_v + w3y * range_v };
-                // Emit triangles with standard CCW winding (v0->v1->v2, v0->v2->v3)
-                list.appendAssumeCapacity(.{ .pos = v0, .uv = t0 });
-                list.appendAssumeCapacity(.{ .pos = v1, .uv = t1 });
-                list.appendAssumeCapacity(.{ .pos = v2, .uv = t2 });
-                list.appendAssumeCapacity(.{ .pos = v0, .uv = t0 });
-                list.appendAssumeCapacity(.{ .pos = v2, .uv = t2 });
-                list.appendAssumeCapacity(.{ .pos = v3, .uv = t3 });
-            }
-        }.call;
-
-        // convenience to get heightmap value with bounds check (outside => -1)
-        const getH = struct {
-            fn call(hm: *const [16 * 16]i32, x: i32, z: i32) i32 {
-                if (x < 0 or x >= 16 or z < 0 or z >= 16) return -1;
-                return hm[@as(usize, @intCast(z)) * 16 + @as(usize, @intCast(x))];
-            }
-        }.call;
-
-        const verts_before: usize = out.items.len;
-
-        // Iterate all regions and their chunks
-        var reg_it = ws.regions.iterator();
-        while (reg_it.next()) |rentry| {
-            const rs_val = rentry.value_ptr.*; // copy for read-only access
-            for (rs_val.chunks.items) |ch| {
-                const base_x: f32 = @floatFromInt(ch.pos.x * 16);
-                const base_z: f32 = @floatFromInt(ch.pos.z * 16);
-
-                // Upper bound capacity per chunk (36 verts per column)
-                const cur_len: usize = out.items.len;
-                out.ensureTotalCapacity(self.allocator, cur_len + 16 * 16 * 6 * 6) catch {};
-
-                // Build top faces and simple side faces from heightmap
-                const hm = ch.heightmaps.world_surface;
-                for (0..16) |z| {
-                    for (0..16) |x| {
-                        const xi: i32 = @intCast(x);
-                        const zi: i32 = @intCast(z);
-                        const h = hm[z * 16 + x];
-                        // Allow negative tops when the world has sections below 0; still skip if world has no below sections
-                        if (h < 0 and ws.sections_below == 0) continue; // empty column in worlds with no below-zero terrain
-                        const y_top: f32 = @floatFromInt(h + 1);
-                        const x0: f32 = base_x + @as(f32, @floatFromInt(x));
-                        const x1: f32 = x0 + 1.0;
-                        const z0: f32 = base_z + @as(f32, @floatFromInt(z));
-                        const z1: f32 = z0 + 1.0;
-                        // Top face (upward normal), CCW seen from +Y
-                        addQuad(
-                            out,
-                            .{ x0, y_top, z0 },
-                            .{ x0, y_top, z1 },
-                            .{ x1, y_top, z1 },
-                            .{ x1, y_top, z0 },
-                            .{ 0, 0 },
-                            .{ 0, 1 },
-                            .{ 1, 1 },
-                            .{ 1, 0 },
-                            uv_scale_top,
-                            uv_offset_top,
-                            pad_u,
-                            pad_v,
-                        );
-                        // Sides if neighbor lower (within the same chunk). For inter-chunk gaps, we'll
-                        // handle neighbors later — this renders a simple "wall" at chunk borders for now.
-                        const h_w = getH(&hm, xi - 1, zi);
-                        if (h_w < h) {
-                            var yb: i32 = h_w + 1;
-                            const yt: i32 = h;
-                            while (yb <= yt) : (yb += 1) {
-                                const y0s: f32 = @floatFromInt(yb);
-                                const y1s: f32 = y0s + 1.0;
-                                addQuad(
-                                    out,
-                                    .{ x0, y0s, z1 },
-                                    .{ x0, y1s, z1 },
-                                    .{ x0, y1s, z0 },
-                                    .{ x0, y0s, z0 }, // -X face (one-block tall)
-                                    .{ 0, 0 },
-                                    .{ 0, 1 },
-                                    .{ 1, 1 },
-                                    .{ 1, 0 },
-                                    uv_scale_side,
-                                    uv_offset_side,
-                                    pad_u,
-                                    pad_v,
-                                );
-                            }
-                        }
-                        const h_e = getH(&hm, xi + 1, zi);
-                        if (h_e < h) {
-                            var yb: i32 = h_e + 1;
-                            const yt: i32 = h;
-                            while (yb <= yt) : (yb += 1) {
-                                const y0s: f32 = @floatFromInt(yb);
-                                const y1s: f32 = y0s + 1.0;
-                                addQuad(
-                                    out,
-                                    .{ x1, y0s, z0 },
-                                    .{ x1, y1s, z0 },
-                                    .{ x1, y1s, z1 },
-                                    .{ x1, y0s, z1 }, // +X face (one-block tall)
-                                    .{ 0, 0 },
-                                    .{ 0, 1 },
-                                    .{ 1, 1 },
-                                    .{ 1, 0 },
-                                    uv_scale_side,
-                                    uv_offset_side,
-                                    pad_u,
-                                    pad_v,
-                                );
-                            }
-                        }
-                        const h_n = getH(&hm, xi, zi - 1);
-                        if (h_n < h) {
-                            var yb: i32 = h_n + 1;
-                            const yt: i32 = h;
-                            while (yb <= yt) : (yb += 1) {
-                                const y0s: f32 = @floatFromInt(yb);
-                                const y1s: f32 = y0s + 1.0;
-                                addQuad(
-                                    out,
-                                    .{ x0, y0s, z0 },
-                                    .{ x0, y1s, z0 },
-                                    .{ x1, y1s, z0 },
-                                    .{ x1, y0s, z0 }, // -Z face (one-block tall)
-                                    .{ 0, 0 },
-                                    .{ 0, 1 },
-                                    .{ 1, 1 },
-                                    .{ 1, 0 },
-                                    uv_scale_side,
-                                    uv_offset_side,
-                                    pad_u,
-                                    pad_v,
-                                );
-                            }
-                        }
-                        const h_s = getH(&hm, xi, zi + 1);
-                        if (h_s < h) {
-                            var yb: i32 = h_s + 1;
-                            const yt: i32 = h;
-                            while (yb <= yt) : (yb += 1) {
-                                const y0s: f32 = @floatFromInt(yb);
-                                const y1s: f32 = y0s + 1.0;
-                                addQuad(
-                                    out,
-                                    .{ x1, y0s, z1 },
-                                    .{ x1, y1s, z1 },
-                                    .{ x0, y1s, z1 },
-                                    .{ x0, y0s, z1 }, // +Z face (one-block tall)
-                                    .{ 0, 0 },
-                                    .{ 0, 1 },
-                                    .{ 1, 1 },
-                                    .{ 1, 0 },
-                                    uv_scale_side,
-                                    uv_offset_side,
-                                    pad_u,
-                                    pad_v,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return out.items.len - verts_before;
+        // end initGfx
     }
 
     fn checkReady(self: *Client) void {
-        if (self.ready) return;
+        if (self.ready) {
+            return;
+        }
         // Determine the player's current chunk and require a 5x5 area around it to be loaded
         const wk = "minecraft:overworld";
         // Read player position under the connections mutex
@@ -1681,7 +1453,7 @@ pub const Client = struct {
         // standard MVP (proj*view)
         const mvp: [16]f32 = matMul(vp.proj, view_adj);
         self.updateFrustum(mvp);
-        var vs_params: shd_mod.VsParams = .{ .mvp = mvp, .atlas_pad = .{ 0, 0 } };
+        var vs_params: shd_mod.VsParams = .{ .mvp = mvp };
 
         // Render cached meshes (build on demand)
         if (self.grass_img.id != 0) {
@@ -2334,7 +2106,7 @@ pub const Client = struct {
         var vi: usize = 0;
         const make_vert = struct {
             fn call(p: [3]f32) Vertex {
-                return .{ .pos = p, .uv = .{ 0, 0 }, .uv_off = .{ 0, 0 }, .uv_scale = .{ 0, 0 } };
+                return .{ .pos = p, .uv = .{ 0, 0 }, .layer = 0 };
             }
         }.call;
         const normalize3 = struct {
@@ -2393,7 +2165,7 @@ pub const Client = struct {
 
         // Use outline triangle pipeline and black texture; renders through geometry (depth compare: ALWAYS)
         sg.applyPipeline(self.pip_outline);
-        var vs_params: shd_mod.VsParams = .{ .mvp = vs_in.mvp, .atlas_pad = .{ 0, 0 } };
+        var vs_params: shd_mod.VsParams = .{ .mvp = vs_in.mvp };
         sg.applyUniforms(0, sg.asRange(&vs_params));
         var b = self.bind;
         b.vertex_buffers[0] = self.outline_vbuf;
@@ -2714,8 +2486,8 @@ pub const Client = struct {
         const PalInfo = struct {
             draw: bool,
             solid: bool,
-            top_tx: AtlasTransform,
-            side_tx: AtlasTransform,
+            top_layer: LayerId,
+            side_layer: LayerId,
         };
         var pal_info = std.ArrayList(PalInfo).initCapacity(self.allocator, pal_len) catch {
             return;
@@ -2727,8 +2499,8 @@ pub const Client = struct {
             var pinfo: PalInfo = .{
                 .draw = true,
                 .solid = true,
-                .top_tx = .{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale },
-                .side_tx = .{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale },
+                .top_layer = self.top_layer,
+                .side_layer = self.side_layer,
             };
             if (bid < self.sim.reg.blocks.items.len) {
                 pinfo.solid = self.sim.reg.blocks.items[@intCast(bid)].full_block_collision;
@@ -2744,15 +2516,15 @@ pub const Client = struct {
                         pinfo.solid = false;
                     },
                     .Uniform => |u| {
-                        const tx: AtlasTransform = self.atlas_uv_by_path.get(u.all_path) orelse AtlasTransform{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale };
-                        pinfo.top_tx = tx;
-                        pinfo.side_tx = tx;
+                        const layer: LayerId = self.layers_by_path.get(u.all_path) orelse self.default_layer;
+                        pinfo.top_layer = layer;
+                        pinfo.side_layer = layer;
                     },
                     .Facing => |f| {
-                        const top_tx: AtlasTransform = self.atlas_uv_by_path.get(f.face_path) orelse AtlasTransform{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale };
-                        const side_tx: AtlasTransform = self.atlas_uv_by_path.get(f.other_path) orelse AtlasTransform{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale };
-                        pinfo.top_tx = top_tx;
-                        pinfo.side_tx = side_tx;
+                        const top_layer: LayerId = self.layers_by_path.get(f.face_path) orelse self.default_layer;
+                        const side_layer: LayerId = self.layers_by_path.get(f.other_path) orelse self.default_layer;
+                        pinfo.top_layer = top_layer;
+                        pinfo.side_layer = side_layer;
                     },
                 };
             }
@@ -2760,10 +2532,10 @@ pub const Client = struct {
         }
 
         // Greedy meshing for +Y (top) faces per Y-slice to drastically reduce vertex count
-        const FaceMat = struct { off: [2]f32, sc: [2]f32 };
+        const FaceMat = struct { layer: LayerId };
         const Mat = struct {
             fn eq(a: FaceMat, b: FaceMat) bool {
-                return a.off[0] == b.off[0] and a.off[1] == b.off[1] and a.sc[0] == b.sc[0] and a.sc[1] == b.sc[1];
+                return a.layer == b.layer;
             }
         };
         const MaskCell = struct { present: bool, m: FaceMat };
@@ -2787,7 +2559,7 @@ pub const Client = struct {
                     if (!info.draw) continue;
                     // top visible if neighbor above not solid
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(mx)), abs_y + 1, @as(i32, @intCast(mz)))) {
-                        mask[idx] = .{ .present = true, .m = .{ .off = info.top_tx.offset, .sc = info.top_tx.scale } };
+                        mask[idx] = .{ .present = true, .m = .{ .layer = info.top_layer } };
                     }
                 }
             }
@@ -2825,7 +2597,7 @@ pub const Client = struct {
                     const uv0h: [2]f32 = .{ 0, @as(f32, @floatFromInt(h)) };
                     const uvwh: [2]f32 = .{ @as(f32, @floatFromInt(w)), @as(f32, @floatFromInt(h)) };
                     const uvw0: [2]f32 = .{ @as(f32, @floatFromInt(w)), 0 };
-                    emitQuad(self.allocator, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv0h, uvwh, uvw0, mkey.sc, mkey.off);
+                    emitQuad(self.allocator, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv0h, uvwh, uvw0, @floatFromInt(mkey.layer));
                     // clear mask for used cells
                     var zz: usize = 0;
                     while (zz < h) : (zz += 1) {
@@ -2864,19 +2636,19 @@ pub const Client = struct {
 
                     if (false) {}
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this - 1, @as(i32, @intCast(lz)))) {
-                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
+                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
                     }
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) - 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                        emitQuad(self.allocator, out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
+                        emitQuad(self.allocator, out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
                     }
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) + 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                        emitQuad(self.allocator, out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
+                        emitQuad(self.allocator, out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
                     }
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) - 1)) {
-                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
+                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
                     }
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) + 1)) {
-                        emitQuad(self.allocator, out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
+                        emitQuad(self.allocator, out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
                     }
                 }
             }
@@ -3130,8 +2902,8 @@ pub const Client = struct {
         const PalInfo = struct {
             draw: bool,
             solid: bool,
-            top_tx: AtlasTransform,
-            side_tx: AtlasTransform,
+            top_layer: LayerId,
+            side_layer: LayerId,
         };
         var pal_info = std.ArrayList(PalInfo).initCapacity(self.allocator, pal_len) catch {
             return;
@@ -3143,8 +2915,8 @@ pub const Client = struct {
             var pinfo: PalInfo = .{
                 .draw = true,
                 .solid = true,
-                .top_tx = .{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale },
-                .side_tx = .{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale },
+                .top_layer = self.top_layer,
+                .side_layer = self.side_layer,
             };
             if (bid < self.sim.reg.blocks.items.len) {
                 pinfo.solid = self.sim.reg.blocks.items[@intCast(bid)].full_block_collision;
@@ -3160,15 +2932,15 @@ pub const Client = struct {
                         pinfo.solid = false;
                     },
                     .Uniform => |u| {
-                        const tx: AtlasTransform = self.atlas_uv_by_path.get(u.all_path) orelse AtlasTransform{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale };
-                        pinfo.top_tx = tx;
-                        pinfo.side_tx = tx;
+                        const layer: LayerId = self.layers_by_path.get(u.all_path) orelse self.default_layer;
+                        pinfo.top_layer = layer;
+                        pinfo.side_layer = layer;
                     },
                     .Facing => |f| {
-                        const top_tx: AtlasTransform = self.atlas_uv_by_path.get(f.face_path) orelse AtlasTransform{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale };
-                        const side_tx: AtlasTransform = self.atlas_uv_by_path.get(f.other_path) orelse AtlasTransform{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale };
-                        pinfo.top_tx = top_tx;
-                        pinfo.side_tx = side_tx;
+                        const top_layer: LayerId = self.layers_by_path.get(f.face_path) orelse self.default_layer;
+                        const side_layer: LayerId = self.layers_by_path.get(f.other_path) orelse self.default_layer;
+                        pinfo.top_layer = top_layer;
+                        pinfo.side_layer = side_layer;
                     },
                 };
             }
@@ -3176,10 +2948,10 @@ pub const Client = struct {
         }
 
         // Greedy top faces per Y-slice
-        const FaceMat = struct { off: [2]f32, sc: [2]f32 };
+        const FaceMat = struct { layer: LayerId };
         const Mat = struct {
             fn eq(a: FaceMat, b: FaceMat) bool {
-                return a.off[0] == b.off[0] and a.off[1] == b.off[1] and a.sc[0] == b.sc[0] and a.sc[1] == b.sc[1];
+                return a.layer == b.layer;
             }
         };
         const section_base_y: i32 = @as(i32, @intCast(sy * constants.section_height)) - @as(i32, @intCast(snap.sections_below)) * @as(i32, @intCast(constants.section_height));
@@ -3200,7 +2972,7 @@ pub const Client = struct {
                     const info = pal_info.items[pidx];
                     if (!info.draw) continue;
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(mx)), abs_y + 1, @as(i32, @intCast(mz)))) {
-                        mask[idxm] = .{ .present = true, .m = .{ .off = info.top_tx.offset, .sc = info.top_tx.scale } };
+                        mask[idxm] = .{ .present = true, .m = .{ .layer = info.top_layer } };
                     }
                 }
             }
@@ -3237,7 +3009,7 @@ pub const Client = struct {
                     const uv0h: [2]f32 = .{ 0, @as(f32, @floatFromInt(h)) };
                     const uvwh: [2]f32 = .{ @as(f32, @floatFromInt(w)), @as(f32, @floatFromInt(h)) };
                     const uvw0: [2]f32 = .{ @as(f32, @floatFromInt(w)), 0 };
-                    emitQuad(alloc, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv0h, uvwh, uvw0, mkey.sc, mkey.off);
+                    emitQuad(alloc, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv0h, uvwh, uvw0, @floatFromInt(mkey.layer));
                     // clear mask
                     var zz: usize = 0;
                     while (zz < h) : (zz += 1) {
@@ -3272,22 +3044,22 @@ pub const Client = struct {
                     const uv10: [2]f32 = .{ 1, 0 };
 
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this + 1, @as(i32, @intCast(lz)))) {
-                        emitQuad(alloc, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv01, uv11, uv10, info.top_tx.scale, info.top_tx.offset);
+                        emitQuad(alloc, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.top_layer));
                     }
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this - 1, @as(i32, @intCast(lz)))) {
-                        emitQuad(alloc, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
+                        emitQuad(alloc, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
                     }
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) - 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                        emitQuad(alloc, out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
+                        emitQuad(alloc, out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
                     }
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) + 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                        emitQuad(alloc, out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
+                        emitQuad(alloc, out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
                     }
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) - 1)) {
-                        emitQuad(alloc, out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
+                        emitQuad(alloc, out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
                     }
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) + 1)) {
-                        emitQuad(alloc, out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset);
+                        emitQuad(alloc, out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
                     }
                 }
             }
@@ -3461,10 +3233,7 @@ pub const Client = struct {
         }
         self.sim.worlds_mutex.unlock();
 
-        // constants for padding
-        const pad_u: f32 = if (self.atlas_w > 0) (1.0 / @as(f32, @floatFromInt(self.atlas_w))) else 0.0;
-        const pad_v: f32 = if (self.atlas_h > 0) (1.0 / @as(f32, @floatFromInt(self.atlas_h))) else 0.0;
-        var vs_loc: shd_mod.VsParams = .{ .mvp = vs_in.mvp, .atlas_pad = .{ pad_u, pad_v } };
+        var vs_loc: shd_mod.VsParams = .{ .mvp = vs_in.mvp };
 
         // reset per-frame rebuild counter
         self.rebuilds_issued_this_frame = 0;
@@ -3508,212 +3277,6 @@ pub const Client = struct {
 
         // Evict old or excess region meshes to bound pool usage
         self.evictRegionMeshes(REGION_MESH_BUDGET, 10);
-    }
-
-    fn buildChunkBlockMesh(self: *Client, out: *std.ArrayList(Vertex)) usize {
-        // Helpers for UV padding and wrapping
-        const pad_u: f32 = if (self.atlas_w > 0) (1.0 / @as(f32, @floatFromInt(self.atlas_w))) else 0.0;
-        const pad_v: f32 = if (self.atlas_h > 0) (1.0 / @as(f32, @floatFromInt(self.atlas_h))) else 0.0;
-        const addQuad = struct {
-            fn wrap01(v: f32) f32 {
-                const f = v - std.math.floor(v);
-                return if (f == 0.0 and v > 0.0) 1.0 else f;
-            }
-            fn call(list: *std.ArrayList(Vertex), v0: [3]f32, v1: [3]f32, v2: [3]f32, v3: [3]f32, uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32, uv_scale_p: [2]f32, uv_offset_p: [2]f32, pad_u_in: f32, pad_v_in: f32) void {
-                const w0x: f32 = wrap01(uv0[0]);
-                const w0y: f32 = wrap01(uv0[1]);
-                const w1x: f32 = wrap01(uv1[0]);
-                const w1y: f32 = wrap01(uv1[1]);
-                const w2x: f32 = wrap01(uv2[0]);
-                const w2y: f32 = wrap01(uv2[1]);
-                const w3x: f32 = wrap01(uv3[0]);
-                const w3y: f32 = wrap01(uv3[1]);
-                const min_u = uv_offset_p[0] + pad_u_in;
-                const min_v = uv_offset_p[1] + pad_v_in;
-                const range_u = @max(0.0, uv_scale_p[0] - 2.0 * pad_u_in);
-                const range_v = @max(0.0, uv_scale_p[1] - 2.0 * pad_v_in);
-                const t0 = .{ min_u + w0x * range_u, min_v + w0y * range_v };
-                const t1 = .{ min_u + w1x * range_u, min_v + w1y * range_v };
-                const t2 = .{ min_u + w2x * range_u, min_v + w2y * range_v };
-                const t3 = .{ min_u + w3x * range_u, min_v + w3y * range_v };
-                list.append(self.allocator, .{ .pos = v0, .uv = t0 }) catch return;
-                list.append(self.allocator, .{ .pos = v1, .uv = t1 }) catch return;
-                list.append(self.allocator, .{ .pos = v2, .uv = t2 }) catch return;
-                list.append(self.allocator, .{ .pos = v0, .uv = t0 }) catch return;
-                list.append(self.allocator, .{ .pos = v2, .uv = t2 }) catch return;
-                list.append(self.allocator, .{ .pos = v3, .uv = t3 }) catch return;
-            }
-        }.call;
-
-        // Mesh all loaded chunks in the single overworld for now
-        const wk = "minecraft:overworld";
-        self.sim.worlds_mutex.lock();
-        defer self.sim.worlds_mutex.unlock();
-        const ws = self.sim.worlds_state.getPtr(wk) orelse return 0;
-        const y_off_mesh: f32 = -@as(f32, @floatFromInt(@as(i32, @intCast(ws.sections_below)) * @as(i32, @intCast(constants.section_height))));
-
-        const verts_before: usize = out.items.len;
-
-        var reg_it = ws.regions.iterator();
-        while (reg_it.next()) |rentry| {
-            const rs_ptr = rentry.value_ptr; // keep pointer to access chunk_index
-            for (rs_ptr.chunks.items) |*ch_ptr| {
-                const ch = ch_ptr.*; // copy for convenience
-                const base_x: f32 = @floatFromInt(ch.pos.x * @as(i32, @intCast(constants.chunk_size_x)));
-                const base_z: f32 = @floatFromInt(ch.pos.z * @as(i32, @intCast(constants.chunk_size_z)));
-
-                // Frustum culling per-chunk AABB
-                if (self.frustum_valid) {
-                    const minp: [3]f32 = .{ base_x, y_off_mesh, base_z };
-                    const maxp: [3]f32 = .{
-                        base_x + @as(f32, @floatFromInt(constants.chunk_size_x)),
-                        y_off_mesh + @as(f32, @floatFromInt(ch.sections.len * constants.section_height)),
-                        base_z + @as(f32, @floatFromInt(constants.chunk_size_z)),
-                    };
-                    const cull_margin: f32 = 0.5; // tighter margin; hysteresis handles stability
-                    // Always keep the chunk containing the camera
-                    const cam = self.camera.pos;
-                    var visible = aabbContainsPoint(minp, maxp, cam);
-                    if (!visible) {
-                        visible = aabbInFrustum(self.frustum_planes, minp, maxp, cull_margin);
-                        if (!visible) {
-                            // Per-chunk linger: keep if seen within the last 2 frames
-                            if (self.last_visible_frame.get(ch.pos)) |last_f| {
-                                const delta = self.frame_index - last_f;
-                                if (delta <= 2) visible = true;
-                            }
-                        }
-                    }
-                    if (!visible) continue;
-                    // Update last visible frame index
-                    _ = self.last_visible_frame.put(ch.pos, self.frame_index) catch {};
-                }
-
-                // Rough upper bound capacity: worst-case 6 faces per voxel (very high), but we reserve moderately
-                const cur_len: usize = out.items.len;
-                out.ensureTotalCapacity(self.allocator, cur_len + 16 * 16 * 32 * 6) catch {};
-
-                // Iterate sections
-                const sections_len: usize = ch.sections.len;
-                var sy: usize = 0;
-                while (sy < sections_len) : (sy += 1) {
-                    const s = ch.sections[sy];
-                    const pal_len = s.palette.len;
-                    const bpi: u6 = bitsFor(pal_len);
-                    // Build per-palette info (draw, solid, top/side transforms)
-                    const PalInfo = struct {
-                        draw: bool,
-                        solid: bool,
-                        top_tx: AtlasTransform,
-                        side_tx: AtlasTransform,
-                    };
-                    var pal_info = std.ArrayList(PalInfo).initCapacity(self.allocator, pal_len) catch {
-                        // If alloc fails, skip this section gracefully
-                        continue;
-                    };
-                    defer pal_info.deinit(self.allocator);
-                    var pi: usize = 0;
-                    while (pi < pal_len) : (pi += 1) {
-                        const bid: u32 = s.palette[pi];
-                        var pinfo: PalInfo = .{
-                            .draw = true,
-                            .solid = true,
-                            .top_tx = .{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale },
-                            .side_tx = .{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale },
-                        };
-                        // Solid from registry collision flag
-                        if (bid < self.sim.reg.blocks.items.len) {
-                            pinfo.solid = self.sim.reg.blocks.items[@intCast(bid)].full_block_collision;
-                        }
-                        // Treat block 0 (air) as not drawn and not solid
-                        if (bid == 0) {
-                            pinfo.draw = false;
-                            pinfo.solid = false;
-                        } else {
-                            // Resource lookup by block name
-                            const name = self.sim.reg.getBlockName(@intCast(bid));
-                            if (self.sim.reg.resources.get(name)) |res| switch (res) {
-                                .Void => {
-                                    pinfo.draw = false;
-                                    pinfo.solid = false;
-                                },
-                                .Uniform => |u| {
-                                    const tx: AtlasTransform = self.atlas_uv_by_path.get(u.all_path) orelse AtlasTransform{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale };
-                                    pinfo.top_tx = tx;
-                                    pinfo.side_tx = tx;
-                                },
-                                .Facing => |f| {
-                                    const top_tx: AtlasTransform = self.atlas_uv_by_path.get(f.face_path) orelse AtlasTransform{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale };
-                                    const side_tx: AtlasTransform = self.atlas_uv_by_path.get(f.other_path) orelse AtlasTransform{ .offset = self.atlas_uv_offset, .scale = self.atlas_uv_scale };
-                                    pinfo.top_tx = top_tx;
-                                    pinfo.side_tx = side_tx;
-                                },
-                            };
-                        }
-                        pal_info.appendAssumeCapacity(pinfo);
-                    }
-
-                    // Precompute section base Y to avoid capturing mutable 'sy'
-                    const section_base_y: i32 = @intCast(sy * constants.section_height);
-
-                    // Iterate voxels: order used in worldgen is (lz, lx, ly) with ly fastest
-                    for (0..constants.chunk_size_z) |lz| {
-                        for (0..constants.chunk_size_x) |lx| {
-                            for (0..constants.section_height) |ly| {
-                                const idx: usize = lz * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
-                                const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx, bpi));
-                                if (pidx >= pal_info.items.len) continue;
-                                const info = pal_info.items[pidx];
-                                if (!info.draw) continue;
-
-                                // World coords for this block
-                                const wx0: f32 = base_x + @as(f32, @floatFromInt(lx));
-                                const wy0: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(sy * constants.section_height)) + @as(i32, @intCast(ly))));
-                                const wz0: f32 = base_z + @as(f32, @floatFromInt(lz));
-                                const wx1: f32 = wx0 + 1.0;
-                                const wy1: f32 = wy0 + 1.0;
-                                const wz1: f32 = wz0 + 1.0;
-
-                                // We'll use a helper that takes absolute Y and handles cross-chunk
-                                const abs_y_this: i32 = section_base_y + @as(i32, @intCast(ly));
-
-                                // Emit faces if neighbor is not solid
-                                const uv00: [2]f32 = .{ 0, 0 };
-                                const uv01: [2]f32 = .{ 0, 1 };
-                                const uv11: [2]f32 = .{ 1, 1 };
-                                const uv10: [2]f32 = .{ 1, 0 };
-
-                                // +Y (top)
-                                if (!self.isSolidAt(ws, &ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this + 1, @as(i32, @intCast(lz)))) {
-                                    addQuad(out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv01, uv11, uv10, info.top_tx.scale, info.top_tx.offset, pad_u, pad_v);
-                                }
-                                // -Y (bottom)
-                                if (!self.isSolidAt(ws, &ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this - 1, @as(i32, @intCast(lz)))) {
-                                    addQuad(out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
-                                }
-                                // -X (west)
-                                if (!self.isSolidAt(ws, &ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) - 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                                    addQuad(out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
-                                }
-                                // +X (east)
-                                if (!self.isSolidAt(ws, &ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) + 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                                    addQuad(out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
-                                }
-                                // -Z (north)
-                                if (!self.isSolidAt(ws, &ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) - 1)) {
-                                    addQuad(out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
-                                }
-                                // +Z (south)
-                                if (!self.isSolidAt(ws, &ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) + 1)) {
-                                    addQuad(out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, info.side_tx.scale, info.side_tx.offset, pad_u, pad_v);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return out.items.len - verts_before;
     }
 
     fn clearMovementInputs(self: *Client) void {
@@ -3962,15 +3525,13 @@ pub const Client = struct {
         const uv01 = [2]f32{ 0, 1 };
         const uv11 = [2]f32{ 1, 1 };
         const uv10 = [2]f32{ 1, 0 };
-        const off = [2]f32{ 0, 0 };
-        const sc = [2]f32{ 1, 1 };
         const addTri = struct {
             fn call(list: *[36]Vertex, idx: *usize, p0: [3]f32, p1: [3]f32, p2: [3]f32, t0: [2]f32, t1: [2]f32, t2: [2]f32) void {
-                list.*[idx.*] = .{ .pos = p0, .uv = t0, .uv_off = off, .uv_scale = sc };
+                list.*[idx.*] = .{ .pos = p0, .uv = t0, .layer = 0 };
                 idx.* += 1;
-                list.*[idx.*] = .{ .pos = p1, .uv = t1, .uv_off = off, .uv_scale = sc };
+                list.*[idx.*] = .{ .pos = p1, .uv = t1, .layer = 0 };
                 idx.* += 1;
-                list.*[idx.*] = .{ .pos = p2, .uv = t2, .uv_off = off, .uv_scale = sc };
+                list.*[idx.*] = .{ .pos = p2, .uv = t2, .layer = 0 };
                 idx.* += 1;
             }
         }.call;
@@ -3995,7 +3556,7 @@ pub const Client = struct {
         if (i != verts.len) return; // safety
         // Use the 3D pipeline (depth test on). Override binding to use green texture and UI buffer.
         sg.applyPipeline(self.pip);
-        var vs_params: shd_mod.VsParams = .{ .mvp = vs_in.mvp, .atlas_pad = .{ 0, 0 } };
+        var vs_params: shd_mod.VsParams = .{ .mvp = vs_in.mvp };
         sg.applyUniforms(0, sg.asRange(&vs_params));
         var b = self.bind;
         b.vertex_buffers[0] = self.aabb_vbuf;
