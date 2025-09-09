@@ -41,7 +41,8 @@ pub const RegionState = struct {
 
 pub const WorldState = struct {
     key: []const u8,
-    section_count_y: u16,
+    sections_below: u16,
+    sections_above: u16,
     regions: std.AutoHashMap(RegionPos, RegionState),
     spawn_point: gs.BlockPos,
 };
@@ -343,7 +344,7 @@ pub const Simulation = struct {
                 // Ensure proto-chunk exists
                 var proto_ptr = self_ptr.proto_chunks.getPtr(pos);
                 if (proto_ptr == null) {
-                    var proto = worldgen.protoInit(alloc, wd.section_count_y, pos) catch continue;
+                    var proto = worldgen.protoInit(alloc, wd.sections_below, wd.sections_above, pos) catch continue;
                     _ = self_ptr.proto_chunks.put(pos, proto) catch {
                         worldgen.protoDeinit(&proto);
                         continue;
@@ -594,7 +595,8 @@ pub const Simulation = struct {
         const spawn = self.computeSpawnAtColumn(wd, 0, 0);
         const ws = WorldState{
             .key = key_copy,
-            .section_count_y = wd.section_count_y,
+            .sections_below = wd.sections_below,
+            .sections_above = wd.sections_above,
             .regions = std.AutoHashMap(RegionPos, RegionState).init(self.allocator),
             .spawn_point = spawn,
         };
@@ -611,7 +613,8 @@ pub const Simulation = struct {
         const cx: i32 = @divFloor(x, @as(i32, @intCast(constants.chunk_size_x)));
         const cz: i32 = @divFloor(z, @as(i32, @intCast(constants.chunk_size_z)));
         const chunk_pos = gs.ChunkPos{ .x = cx, .z = cz };
-        const ch = worldgen.generateChunk(self.allocator, wd.section_count_y, chunk_pos, self.world_seed, wg_def, params, lookup) catch return .{ .x = x, .y = 0, .z = z };
+        const total_sections: u16 = wd.sections_below + wd.sections_above;
+        const ch = worldgen.generateChunk(self.allocator, total_sections, chunk_pos, self.world_seed, wg_def, params, lookup) catch return .{ .x = x, .y = 0, .z = z };
         defer worldgen.deinitChunk(self.allocator, &ch);
         // Local indices within chunk
         const lx_i: i32 = @mod(x, @as(i32, @intCast(constants.chunk_size_x)));

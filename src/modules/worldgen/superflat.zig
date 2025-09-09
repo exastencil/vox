@@ -8,7 +8,7 @@ const constants = @import("constants");
 fn hook_biomes(seed: u64, proto: *wapi.ProtoChunk, params: WorldGen.Params) !void {
     _ = seed;
     try wapi.ensureBiomesAllocated(proto);
-    const count = wapi.totalVoxels(proto.section_count_y);
+    const count = wapi.totalVoxels(proto.sections_below, proto.sections_above);
     const biome: ids.BiomeId = if (params.biomes.len > 0) params.biomes[0] else 0;
     var i: usize = 0;
     while (i < count) : (i += 1) proto.biomes_buf.?[i] = biome;
@@ -21,10 +21,10 @@ fn hook_noise(seed: u64, proto: *wapi.ProtoChunk, params: WorldGen.Params, looku
     const surface: ids.BlockStateId = if (params.blocks.len >= 1) params.blocks[0] else (lookup.call(lookup.ctx, "minecraft:grass") orelse 0);
     const depth: ids.BlockStateId = if (params.blocks.len >= 2) params.blocks[1] else (lookup.call(lookup.ctx, "minecraft:dirt") orelse 0);
 
-    const scy: usize = @intCast(proto.section_count_y);
+    const scy: usize = @intCast(proto.totalSections());
     var idx: usize = 0;
     for (0..scy) |sy| {
-        const y_base: i32 = @intCast(sy * constants.section_height);
+        const y_base: i32 = (@as(i32, @intCast(sy)) - @as(i32, @intCast(proto.sections_below))) * @as(i32, @intCast(constants.section_height));
         for (0..constants.chunk_size_z) |lz| {
             for (0..constants.chunk_size_x) |lx| {
                 for (0..constants.section_height) |ly| {

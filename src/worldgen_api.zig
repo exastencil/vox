@@ -15,28 +15,34 @@ pub const BlockLookup = struct {
 // Shared proto-chunk used during staged worldgen.
 pub const ProtoChunk = struct {
     allocator: std.mem.Allocator,
-    section_count_y: u16,
+    sections_below: u16,
+    sections_above: u16,
     pos: struct { x: i32, z: i32 },
     status: u4 = 0, // gs.ChunkStatus-like; 0==empty
     biomes_buf: ?[]ids.BiomeId = null,
     blocks_buf: ?[]ids.BlockStateId = null,
     tops: []i32, // per-column height tracking
+
+    pub fn totalSections(self: *const ProtoChunk) u16 {
+        return self.sections_below + self.sections_above;
+    }
 };
 
-pub fn totalVoxels(section_count_y: u16) usize {
-    return @as(usize, section_count_y) * constants.chunk_size_x * constants.section_height * constants.chunk_size_z;
+pub fn totalVoxels(sections_below: u16, sections_above: u16) usize {
+    const total: usize = @as(usize, sections_below) + @as(usize, sections_above);
+    return total * constants.chunk_size_x * constants.section_height * constants.chunk_size_z;
 }
 
 pub fn ensureBiomesAllocated(proto: *ProtoChunk) !void {
     if (proto.biomes_buf == null) {
-        const count = totalVoxels(proto.section_count_y);
+        const count = totalVoxels(proto.sections_below, proto.sections_above);
         proto.biomes_buf = try proto.allocator.alloc(ids.BiomeId, count);
     }
 }
 
 pub fn ensureBlocksAllocated(proto: *ProtoChunk) !void {
     if (proto.blocks_buf == null) {
-        const count = totalVoxels(proto.section_count_y);
+        const count = totalVoxels(proto.sections_below, proto.sections_above);
         proto.blocks_buf = try proto.allocator.alloc(ids.BlockStateId, count);
     }
 }

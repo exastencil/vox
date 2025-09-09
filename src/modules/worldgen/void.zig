@@ -7,7 +7,7 @@ const constants = @import("constants");
 fn hook_biomes(seed: u64, proto: *wapi.ProtoChunk, params: WorldGen.Params) !void {
     _ = seed;
     try wapi.ensureBiomesAllocated(proto);
-    const count = wapi.totalVoxels(proto.section_count_y);
+    const count = wapi.totalVoxels(proto.sections_below, proto.sections_above);
     const biome: u32 = if (params.biomes.len > 0) params.biomes[0] else 0;
     var i: usize = 0;
     while (i < count) : (i += 1) proto.biomes_buf.?[i] = @intCast(biome);
@@ -17,7 +17,7 @@ fn hook_noise(seed: u64, proto: *wapi.ProtoChunk, params: WorldGen.Params, looku
     _ = seed;
     _ = params;
     try wapi.ensureBlocksAllocated(proto);
-    const count = wapi.totalVoxels(proto.section_count_y);
+    const count = wapi.totalVoxels(proto.sections_below, proto.sections_above);
     const air: u32 = @intCast(lookup.call(lookup.ctx, "core:air") orelse 0);
     var i: usize = 0;
     while (i < count) : (i += 1) proto.blocks_buf.?[i] = @intCast(air);

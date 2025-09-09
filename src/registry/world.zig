@@ -10,7 +10,9 @@ pub const GenSpec = struct {
 pub const Def = struct {
     key: []const u8, // unique world key, e.g. "vox:overworld"
     display_name: []const u8, // localizable name, e.g. "The Overworld"
-    section_count_y: u16, // number of vertical sections per chunk
+    // Vertical section layout relative to Y=0 (world origin)
+    sections_below: u16, // sections with y<0
+    sections_above: u16, // sections with y>=0
     gen_key: []const u8,
     gen_blocks: []const ids.BlockStateId,
     gen_biomes: []const ids.BiomeId,
@@ -36,13 +38,13 @@ pub const Registry = struct {
         self.by_key.deinit();
     }
 
-    pub fn addWorld(self: *Registry, key: []const u8, display_name: []const u8, section_count_y: u16) !void {
+    pub fn addWorld(self: *Registry, key: []const u8, display_name: []const u8, sections_below: u16, sections_above: u16) !void {
         // default worldgen: core:void with no params
         const spec = GenSpec{ .key = "core:void" };
-        try self.addWorldWithGen(key, display_name, section_count_y, spec);
+        try self.addWorldWithGen(key, display_name, sections_below, sections_above, spec);
     }
 
-    pub fn addWorldWithGen(self: *Registry, key: []const u8, display_name: []const u8, section_count_y: u16, gen: GenSpec) !void {
+    pub fn addWorldWithGen(self: *Registry, key: []const u8, display_name: []const u8, sections_below: u16, sections_above: u16, gen: GenSpec) !void {
         if (self.by_key.get(key) != null) return; // ignore duplicates for now
         const k = try self.allocator.dupe(u8, key);
         const dn = try self.allocator.dupe(u8, display_name);
@@ -54,7 +56,8 @@ pub const Registry = struct {
         try self.by_key.put(k, .{
             .key = k,
             .display_name = dn,
-            .section_count_y = section_count_y,
+            .sections_below = sections_below,
+            .sections_above = sections_above,
             .gen_key = gk,
             .gen_blocks = blocks,
             .gen_biomes = biomes,

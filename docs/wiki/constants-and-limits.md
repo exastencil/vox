@@ -15,7 +15,7 @@ Quick reference for core constants, limits, and statuses. Status legend:
 
 - Chunk size (x,z): 16×16 blocks — decided
 - Section height (y): 32 blocks — decided
-- World build height: 32 × section_count_y — decided (section_count_y is per-world config)
+- World build height: 32 × (sections_below + sections_above) — decided (split per-world config around Y=0)
 - Chunk addressing: chunk_x = floor(x/16), chunk_z = floor(z/16); local x,z = x & 15, z & 15 — decided
 - Region grouping for saves: 32×32 chunks per region — provisional
 

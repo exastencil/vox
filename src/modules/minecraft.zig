@@ -72,6 +72,7 @@ fn init(ctx: ?*anyopaque) !void {
     regp.worlds.addWorldWithGen(
         "minecraft:overworld",
         "Overworld",
+        0,
         4,
         .{ .key = "core:superflat", .blocks = &[_]ids.BlockStateId{ dirt_id, stone_id }, .biomes = &[_]ids.BiomeId{plains_biome} },
     ) catch {};

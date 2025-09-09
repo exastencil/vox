@@ -104,7 +104,7 @@ pub const ChunkStatus = enum(u4) {
 
 pub const Chunk = struct {
     pos: ChunkPos,
-    sections: []const Section, // length == world.section_count_y
+    sections: []const Section, // length == (world.sections_below + world.sections_above)
     heightmaps: Heightmaps,
     entities: []const EntityRecord, // per-chunk ownership (<= constants.entity_soft_cap_per_chunk)
 };
@@ -117,7 +117,10 @@ pub const World = struct {
     world_id: u128,
     name: []const u8,
     seeds: Seeds,
-    section_count_y: u16,
+    // Vertical layout: number of sections below and above Y=0
+    // Total sections per chunk in this world is sections_below + sections_above
+    sections_below: u16,
+    sections_above: u16,
     time_ticks: u64,
     weather_state: Weather = .clear,
     spawn_point: BlockPos,

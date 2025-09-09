@@ -23,7 +23,7 @@ Naming conventions (public docs):
 - Positions:
   - BlockPos: (x, y, z) in world block coordinates.
   - ChunkPos: (chunk_x, chunk_z) in world chunk coordinates.
-  - Section index: section_y in [0 … world.section_count_y-1].
+- Section index: section_y in [0 … total_sections-1], where total_sections = world.sections_below + world.sections_above. World Y mapping for a voxel within a section: world_y = (section_y - world.sections_below) * section_height + local_y (0 ≤ local_y < section_height).
 
 ## Coordinate Conventions
 
@@ -42,7 +42,10 @@ Configurable per-world. Key fields:
   - world_seed: 64-bit seed used for deterministic worldgen and random ticks.
 - dimensions/config:
   - section_height_blocks: 32 (constant). Fixed height per Section.
-  - section_count_y: number of Sections stacked vertically. World build height = 32 \* section_count_y.
+  - sections_below: number of Sections whose Y-range lies below world Y=0.
+  - sections_above: number of Sections whose Y-range lies at or above world Y=0.
+  - total_sections = sections_below + sections_above. World build height = 32 × total_sections.
+  - World origin: Y=0 is the design origin (e.g., sea level). Section index sections_below corresponds to world Y ∈ [0, 31].
   - chunk_size_blocks_xz: always 16 for now (consistent with Minecraft’s 16×16 horizontal chunk size).
   - environment: skybox_id, ambient_light, time_scale, weather_rules, gravity, fluid rules.
 - runtime state:
@@ -58,8 +61,9 @@ Note: Simulation distance/config belongs to SIM, not GS. GS only stores the stat
 ## Chunk
 
 - key: (chunk_x, chunk_z)
-- geometry: 16 × (32 \* section_count_y) × 16 blocks.
-- sections: contiguous array sections[section_count_y] ordered bottom to top (section_y increasing with y).
+- geometry: 16 × (32 × total_sections) × 16 blocks, where total_sections = sections_below + sections_above.
+- sections: contiguous array sections[total_sections] ordered bottom to top (section_y increasing with y). World-space Y for a voxel at (section_y, local_y) is world_y = (section_y - sections_below) × 32 + local_y.
+- trimming: during worldgen, trailing all-air sections (palette == [0]) may be trimmed from the end to reduce memory and meshing work. A chunk’s sections.len can therefore be ≤ total_sections.
 - heightmaps: precomputed per-column values for terrain, motion blocking, and skylight heuristics.
 - entities: in-chunk storage of entities owned by this chunk; soft cap 256 entities per chunk. Entities transfer ownership when crossing chunk boundaries. An optional global read-only index may exist for queries, but GS ownership is per-chunk.
 - dirty flags: fine-grained flags for persistence and remeshing (set by SIM; GS just carries them).

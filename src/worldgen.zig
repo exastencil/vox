@@ -5,15 +5,15 @@ const constants = @import("constants");
 const wgen = @import("registry/worldgen.zig");
 const wapi = @import("worldgen_api.zig");
 
-fn totalVoxels(section_count_y: u16) usize {
-    return wapi.totalVoxels(section_count_y);
+fn totalVoxels(sections_below: u16, sections_above: u16) usize {
+    return wapi.totalVoxels(sections_below, sections_above);
 }
 
-pub fn protoInit(allocator: std.mem.Allocator, section_count_y: u16, pos: gs.ChunkPos) !wapi.ProtoChunk {
+pub fn protoInit(allocator: std.mem.Allocator, sections_below: u16, sections_above: u16, pos: gs.ChunkPos) !wapi.ProtoChunk {
     const tops_len: usize = constants.chunk_size_x * constants.chunk_size_z;
     const tops = try allocator.alloc(i32, tops_len);
     @memset(tops, -1);
-    return .{ .allocator = allocator, .section_count_y = section_count_y, .pos = .{ .x = pos.x, .z = pos.z }, .tops = tops };
+    return .{ .allocator = allocator, .sections_below = sections_below, .sections_above = sections_above, .pos = .{ .x = pos.x, .z = pos.z }, .tops = tops };
 }
 
 pub fn protoDeinit(proto: *wapi.ProtoChunk) void {
@@ -111,7 +111,7 @@ fn buildChunkFromBuffers(proto: *const wapi.ProtoChunk) !gs.Chunk {
     if (proto.blocks_buf == null or proto.biomes_buf == null) return error.WorldgenNotReady;
 
     const allocator = proto.allocator;
-    const sections_len: usize = proto.section_count_y;
+    const sections_len: usize = @intCast(proto.totalSections());
     var sections = try allocator.alloc(gs.Section, sections_len);
 
     const voxel_count: usize = constants.chunk_size_x * constants.section_height * constants.chunk_size_z;
@@ -192,6 +192,29 @@ fn buildChunkFromBuffers(proto: *const wapi.ProtoChunk) !gs.Chunk {
         idx_global += voxel_count;
     }
 
+    // Trim trailing all-air sections (palette == [0])
+    var new_len: usize = sections.len;
+    while (new_len > 0) {
+        const last = sections[new_len - 1];
+        if (last.palette.len == 1 and last.palette[0] == 0 and last.block_entities.len == 0) {
+            // free this section's memory and shrink
+            allocator.free(last.palette);
+            allocator.free(last.blocks_indices_bits);
+            allocator.free(last.skylight);
+            allocator.free(last.blocklight);
+            allocator.free(last.biome_palette);
+            allocator.free(last.biome_indices_bits);
+            allocator.free(last.block_entities);
+            new_len -= 1;
+        } else break;
+    }
+    if (new_len < sections.len) {
+        var trimmed = try allocator.alloc(gs.Section, new_len);
+        @memcpy(trimmed[0..new_len], sections[0..new_len]);
+        allocator.free(sections);
+        sections = trimmed;
+    }
+
     // compute heightmaps from proto.tops
     var heightmaps: gs.Heightmaps = .{ .motion_blocking = undefined, .world_surface = undefined };
     for (0..constants.chunk_size_z) |lz| {
@@ -270,7 +293,8 @@ pub fn generateChunk(
     params: wgen.Params,
     lookup: wgen.BlockLookup,
 ) !gs.Chunk {
-    var proto = try protoInit(allocator, section_count_y, chunk_pos);
+    // Back-compat wrapper: interpret section_count_y as sections above origin, with 0 below
+    var proto = try protoInit(allocator, 0, section_count_y, chunk_pos);
     defer protoDeinit(&proto);
 
     try callBiomesHook(&proto, seed, def, params);

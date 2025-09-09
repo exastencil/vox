@@ -185,6 +185,7 @@ const RegionSnapshot = struct {
     base_cx: i32,
     base_cz: i32,
     section_count_y: u16,
+    sections_below: u16,
     chunks: []ChunkSnapshot,
     // 32x32 grid mapping local (x,z) -> chunk index or -1
     grid_map: []i32,
@@ -193,7 +194,7 @@ const RegionSnapshot = struct {
 // Temporary slice-ref structs for capturing under lock, then copying outside the lock
 const SectionSliceRefs = struct { pal_ptr: [*]const u32, pal_len: usize, bits_ptr: [*]const u32, bits_len: usize };
 const ChunkSliceRefs = struct { pos: gs.ChunkPos, sections: []SectionSliceRefs };
-const RegionSliceRefs = struct { rpos: simulation.RegionPos, section_count_y: u16, base_cx: i32, base_cz: i32, chunks: []ChunkSliceRefs };
+const RegionSliceRefs = struct { rpos: simulation.RegionPos, section_count_y: u16, sections_below: u16, base_cx: i32, base_cz: i32, chunks: []ChunkSliceRefs };
 
 const REGION_MESH_BUDGET: usize = 128; // generous, regions are fewer than chunks
 
@@ -1763,7 +1764,7 @@ pub const Client = struct {
 
     fn isSolidAt(self: *Client, ws: *const simulation.WorldState, start_chunk: *const gs.Chunk, cpos_x_in: i32, cpos_z_in: i32, lx_in: i32, abs_y_in: i32, lz_in: i32) bool {
         var nx = lx_in;
-        const ny = abs_y_in;
+        const ny0 = abs_y_in + @as(i32, @intCast(ws.sections_below)) * @as(i32, @intCast(constants.section_height));
         var nz = lz_in;
         var cpos_x = cpos_x_in;
         var cpos_z = cpos_z_in;
@@ -1804,9 +1805,9 @@ pub const Client = struct {
 
         // Y in-bounds
         const total_y: i32 = @intCast(chn.sections.len * constants.section_height);
-        if (ny < 0 or ny >= total_y) return false;
-        const n_sy_idx: usize = @intCast(@divTrunc(ny, @as(i32, @intCast(constants.section_height))));
-        const n_ly: usize = @intCast(@mod(ny, @as(i32, @intCast(constants.section_height))));
+        if (ny0 < 0 or ny0 >= total_y) return false;
+        const n_sy_idx: usize = @intCast(@divTrunc(ny0, @as(i32, @intCast(constants.section_height))));
+        const n_ly: usize = @intCast(@mod(ny0, @as(i32, @intCast(constants.section_height))));
         const s = chn.sections[n_sy_idx];
         const bpi: u6 = bitsFor(s.palette.len);
         const idx: usize = @as(usize, @intCast(nz)) * (constants.chunk_size_x * constants.section_height) + @as(usize, @intCast(nx)) * constants.section_height + n_ly;
@@ -1881,7 +1882,7 @@ pub const Client = struct {
             }
         };
         const MaskCell = struct { present: bool, m: FaceMat };
-        const section_base_y: i32 = @intCast(sy * constants.section_height);
+        const section_base_y: i32 = @as(i32, @intCast(sy * constants.section_height)) - @as(i32, @intCast(ws.sections_below)) * @as(i32, @intCast(constants.section_height));
         var ly_top: usize = 0;
         while (ly_top < constants.section_height) : (ly_top += 1) {
             const abs_y: i32 = section_base_y + @as(i32, @intCast(ly_top));
@@ -1963,7 +1964,7 @@ pub const Client = struct {
                     if (!info.draw) continue;
 
                     const wx0: f32 = base_x + @as(f32, @floatFromInt(lx));
-                    const wy0: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(sy * constants.section_height)) + @as(i32, @intCast(ly))));
+                    const wy0: f32 = @as(f32, @floatFromInt(section_base_y + @as(i32, @intCast(ly))));
                     const wz0: f32 = base_z + @as(f32, @floatFromInt(lz));
                     const wx1: f32 = wx0 + 1.0;
                     const wy1: f32 = wy0 + 1.0;
@@ -1999,7 +2000,7 @@ pub const Client = struct {
 
     // Build a single region mesh (one buffer) by concatenating all section vertices of all chunks in the region
     fn buildRegionMeshNow(self: *Client, ws: *const simulation.WorldState, rs: *const simulation.RegionState) RegionMesh {
-        var draws = self.allocator.alloc(SectionDraw, rs.chunks.items.len * @as(usize, @intCast(ws.section_count_y))) catch return .{ .vbuf = .{}, .draws = &[_]SectionDraw{}, .built_chunk_count = 0, .dirty = false, .inflight = false, .last_built_frame = self.frame_index };
+        var draws = self.allocator.alloc(SectionDraw, rs.chunks.items.len * @as(usize, @intCast(ws.sections_below + ws.sections_above))) catch return .{ .vbuf = .{}, .draws = &[_]SectionDraw{}, .built_chunk_count = 0, .dirty = false, .inflight = false, .last_built_frame = self.frame_index };
         var draws_len: usize = 0;
         var verts = std.ArrayList(Vertex).initCapacity(self.allocator, 0) catch {
             self.allocator.free(draws);
@@ -2039,7 +2040,7 @@ pub const Client = struct {
     // Under world lock: capture slice refs for a region (no heavy copies)
     fn buildRegionRefsUnderLock(self: *Client, alloc: std.mem.Allocator, ws: *const simulation.WorldState, rs: *const simulation.RegionState, rpos: simulation.RegionPos) RegionSliceRefs {
         _ = self;
-        var refs: RegionSliceRefs = .{ .rpos = rpos, .section_count_y = ws.section_count_y, .base_cx = rpos.x * 32, .base_cz = rpos.z * 32, .chunks = &[_]ChunkSliceRefs{} };
+        var refs: RegionSliceRefs = .{ .rpos = rpos, .section_count_y = ws.sections_below + ws.sections_above, .sections_below = ws.sections_below, .base_cx = rpos.x * 32, .base_cz = rpos.z * 32, .chunks = &[_]ChunkSliceRefs{} };
         const count: usize = rs.chunks.items.len;
         if (count == 0) return refs;
         var chunks = alloc.alloc(ChunkSliceRefs, count) catch return refs;
@@ -2068,7 +2069,7 @@ pub const Client = struct {
             if (ch.sections.len > 0) alloc.free(ch.sections);
         }
         if (refs.chunks.len > 0) alloc.free(refs.chunks);
-        refs.* = .{ .rpos = refs.rpos, .section_count_y = refs.section_count_y, .base_cx = refs.base_cx, .base_cz = refs.base_cz, .chunks = &[_]ChunkSliceRefs{} };
+        refs.* = .{ .rpos = refs.rpos, .section_count_y = refs.section_count_y, .sections_below = refs.sections_below, .base_cx = refs.base_cx, .base_cz = refs.base_cz, .chunks = &[_]ChunkSliceRefs{} };
     }
 
     // Outside world lock: copy refs into an owned RegionSnapshot
@@ -2079,6 +2080,7 @@ pub const Client = struct {
             .base_cx = refs.base_cx,
             .base_cz = refs.base_cz,
             .section_count_y = refs.section_count_y,
+            .sections_below = refs.sections_below,
             .chunks = &[_]ChunkSnapshot{},
             .grid_map = &[_]i32{},
         };
@@ -2144,7 +2146,7 @@ pub const Client = struct {
         if (snap.chunks.len > 0) alloc.free(snap.chunks);
         if (snap.grid_map.len > 0) alloc.free(snap.grid_map);
         // reset
-        snap.* = .{ .rpos = snap.rpos, .base_cx = snap.base_cx, .base_cz = snap.base_cz, .section_count_y = snap.section_count_y, .chunks = &[_]ChunkSnapshot{}, .grid_map = &[_]i32{} };
+        snap.* = .{ .rpos = snap.rpos, .base_cx = snap.base_cx, .base_cz = snap.base_cz, .section_count_y = snap.section_count_y, .sections_below = snap.sections_below, .chunks = &[_]ChunkSnapshot{}, .grid_map = &[_]i32{} };
     }
 
     fn snapGetChunkIndex(snap: *const RegionSnapshot, cx: i32, cz: i32) ?usize {
@@ -2182,10 +2184,10 @@ pub const Client = struct {
         if (idx_opt == null) return true; // outside snapshot => treat as solid to avoid seams
         const ch = snap.chunks[idx_opt.?];
         const total_y: i32 = @as(i32, @intCast(snap.section_count_y)) * @as(i32, @intCast(constants.section_height));
-        const ny = abs_y_in;
-        if (ny < 0 or ny >= total_y) return false;
-        const sy: usize = @intCast(@divTrunc(ny, @as(i32, @intCast(constants.section_height))));
-        const ly: usize = @intCast(@mod(ny, @as(i32, @intCast(constants.section_height))));
+        const ny0 = abs_y_in + @as(i32, @intCast(snap.sections_below)) * @as(i32, @intCast(constants.section_height));
+        if (ny0 < 0 or ny0 >= total_y) return false;
+        const sy: usize = @intCast(@divTrunc(ny0, @as(i32, @intCast(constants.section_height))));
+        const ly: usize = @intCast(@mod(ny0, @as(i32, @intCast(constants.section_height))));
         if (sy >= ch.sections.len) return false;
         const s = ch.sections[sy];
         const bpi: u6 = bitsFor(s.palette.len);
@@ -2257,7 +2259,7 @@ pub const Client = struct {
                 return a.off[0] == b.off[0] and a.off[1] == b.off[1] and a.sc[0] == b.sc[0] and a.sc[1] == b.sc[1];
             }
         };
-        const section_base_y: i32 = @intCast(sy * constants.section_height);
+        const section_base_y: i32 = @as(i32, @intCast(sy * constants.section_height)) - @as(i32, @intCast(snap.sections_below)) * @as(i32, @intCast(constants.section_height));
         var ly_top: usize = 0;
         while (ly_top < constants.section_height) : (ly_top += 1) {
             const abs_y: i32 = section_base_y + @as(i32, @intCast(ly_top));
@@ -2334,7 +2336,7 @@ pub const Client = struct {
                     if (!info.draw) continue;
 
                     const wx0: f32 = base_x + @as(f32, @floatFromInt(lx));
-                    const wy0: f32 = @as(f32, @floatFromInt(@as(i32, @intCast(sy * constants.section_height)) + @as(i32, @intCast(ly))));
+                    const wy0: f32 = @as(f32, @floatFromInt(section_base_y + @as(i32, @intCast(ly))));
                     const wz0: f32 = base_z + @as(f32, @floatFromInt(lz));
                     const wx1: f32 = wx0 + 1.0;
                     const wy1: f32 = wy0 + 1.0;
