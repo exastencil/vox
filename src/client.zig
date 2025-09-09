@@ -926,9 +926,7 @@ pub const Client = struct {
         // Initialize local state and camera from player entity if available
         self.initLocalFromSim();
         self.updateCameraFromLocal();
-        // Lock and enable raw mouse input on startup
-        sapp.lockMouse(true);
-        setRawMouse(true);
+        // Defer mouse capture until world is ready (see checkReady)
     }
 
     fn buildChunkSurfaceMesh(self: *Client, out: *std.ArrayList(Vertex)) usize {
@@ -1139,8 +1137,7 @@ pub const Client = struct {
 
     fn checkReady(self: *Client) void {
         if (self.ready) return;
-        // Determine the player's current chunk and see if it's loaded
-        // For now, assume the single-world prototype key
+        // Determine the player's current chunk and require a 5x5 area around it to be loaded
         const wk = "minecraft:overworld";
         // Read player position under the connections mutex
         self.sim.connections_mutex.lock();
@@ -1158,11 +1155,30 @@ pub const Client = struct {
         }
         self.sim.connections_mutex.unlock();
         if (!has_pos) return;
-        if (self.sim.isChunkLoadedAt(wk, .{ .x = cx, .z = cz })) {
+
+        // Require all chunks in a 5x5 square centered on (cx,cz)
+        const radius: i32 = 2;
+        var all_loaded = true;
+        var dz: i32 = -radius;
+        while (dz <= radius) : (dz += 1) {
+            var dx: i32 = -radius;
+            while (dx <= radius) : (dx += 1) {
+                if (!self.sim.isChunkLoadedAt(wk, .{ .x = cx + dx, .z = cz + dz })) {
+                    all_loaded = false;
+                    break;
+                }
+            }
+            if (!all_loaded) break;
+        }
+
+        if (all_loaded) {
             self.ready = true;
-            // Initialize local player and camera now that the world around the player exists
+            // Initialize local player and camera now that the surrounding world exists
             self.initLocalFromSim();
             self.updateCameraFromLocal();
+            // Now that we are ready, capture the mouse and enable raw input
+            sapp.lockMouse(true);
+            setRawMouse(true);
         }
     }
 
@@ -1515,6 +1531,10 @@ pub const Client = struct {
     }
 
     pub fn event(self: *Client, ev: sapp.Event) void {
+        // Ignore all input until the client is ready (prevents affecting the simulation while connecting/loading)
+        if (!self.ready) {
+            return;
+        }
         switch (ev.type) {
             .KEY_UP => {
                 if (ev.key_code == .F3) self.show_debug = !self.show_debug;
