@@ -1,6 +1,6 @@
 # Build Targets
 
-We currently ship three separate executables that reflect the intended runtime split. The default when running `zig build run` is the full target.
+We currently ship two executables that reflect the intended runtime split. The default when running `zig build run` is the full target.
 
 - full (default at zig build run)
   - Executable: vox-aetatum
@@ -8,12 +8,6 @@ We currently ship three separate executables that reflect the intended runtime s
   - Build: zig build full
   - Run: zig build run -- [args]
 
-- client
-  - Executable: vox-client
-  - Purpose: Rendering/UI only. Includes client and Simulation code but does not run the Simulation. Instead, it is intended to connect to a remote server and use the Simulation module only for prediction/latency compensation and as a container for streamed state.
-  - Current status: Skeleton. It creates a local Simulation instance but does not start its thread, and attempts a TCP connect to 127.0.0.1:7777 in the background. Protocol/handshake and state sync are TODO.
-  - Build: zig build client
-  - Run: zig-out/bin/vox-client [args]
 
 - server (headless)
   - Executable: vox-server
@@ -25,7 +19,7 @@ We currently ship three separate executables that reflect the intended runtime s
 Notes
 
 - UI/screen coordinates use origin (0,0) at the top‑left, consistent with Sokol.
-- The shader `src/shaders/chunk_shd.zig` is generated at build time from `shaders/chunk.glsl` via sokol-shdc. It is required by the client and full targets; the server target does not include Sokol.
+- The shader `src/shaders/chunk_shd.zig` is generated at build time from `shaders/chunk.glsl` via sokol-shdc. It is required by the full target; the server target does not include Sokol.
 - As features evolve, if the wiki describes functionality not yet implemented in code, we place a TODO in code and prefer to keep the wiki up to date with intent and current status.
 
 See also

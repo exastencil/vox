@@ -91,7 +91,7 @@ pub fn build(b: *Build) !void {
         },
     });
 
-    // Root modules for the three executables
+    // Root modules for the two executables
     const root_mod_full = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -102,20 +102,6 @@ pub fn build(b: *Build) !void {
             .{ .name = "ids", .module = mod_ids },
             .{ .name = "constants", .module = mod_constants },
             .{ .name = "noise", .module = mod_noise },
-        },
-    });
-    const root_mod_client = b.createModule(.{
-        .root_source_file = b.path("src/bin/client_main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "sokol", .module = dep_sokol.module("sokol") },
-            .{ .name = "gs", .module = mod_gs },
-            .{ .name = "ids", .module = mod_ids },
-            .{ .name = "constants", .module = mod_constants },
-            .{ .name = "noise", .module = mod_noise },
-            // aggregate module exposing src/ tree
-            .{ .name = "vox", .module = mod_vox },
         },
     });
     const root_mod_server = b.createModule(.{
@@ -133,12 +119,11 @@ pub fn build(b: *Build) !void {
 
     // Executables
     const exe_full = b.addExecutable(.{ .name = "vox-aetatum", .root_module = root_mod_full });
-    const exe_client = b.addExecutable(.{ .name = "vox-client", .root_module = root_mod_client });
     const exe_server = b.addExecutable(.{ .name = "vox-server", .root_module = root_mod_server });
 
     // No-op: modules index is created on disk above before compiling
 
-    // Shader generation (sokol-shdc) — required by client/full only
+    // Shader generation (sokol-shdc) — required by full only
     const dep_tools = b.dependency("sokol-tools-bin", .{});
     const builtin = @import("builtin");
     const os_tag = builtin.target.os.tag;
@@ -160,18 +145,15 @@ pub fn build(b: *Build) !void {
         "--slang=glsl430:hlsl5:metal_macos:wgsl", "--format=sokol_zig",
         "--bytecode",
     });
-    // Ensure shader gets generated before compiling client/full
+    // Ensure shader gets generated before compiling full
     exe_full.step.dependOn(&shdc.step);
-    exe_client.step.dependOn(&shdc.step);
 
     // Install all artifacts
     b.installArtifact(exe_full);
-    b.installArtifact(exe_client);
     b.installArtifact(exe_server);
 
     // Named build steps for each target
     b.step("full", "Build the full target (client + simulation in one process)").dependOn(&exe_full.step);
-    b.step("client", "Build the client target (renders, connects to server)").dependOn(&exe_client.step);
     b.step("server", "Build the server target (headless, authoritative simulation)").dependOn(&exe_server.step);
 
     // Default run: full

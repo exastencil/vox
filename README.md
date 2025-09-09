@@ -87,14 +87,12 @@ This project aims to replicate certain gameplay features for educational and com
   - zig build
 - Build specific executables:
   - zig build full     # full single-process (default for `zig build run`)
-  - zig build client   # client-only (Sokol; connects to server)
   - zig build server   # headless server (authoritative simulation)
 - Run (defaults to full target):
   - zig build run -- [args]
 
 Binaries land in zig-out/bin/:
 - vox-aetatum (full)
-- vox-client (client)
 - vox-server (server)
 
 See docs/wiki/build-targets.md for details.

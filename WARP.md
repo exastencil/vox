@@ -13,7 +13,6 @@ Common commands
   - zig build
   - Build specific targets:
     - zig build full     # full single-process (default for `zig build run`)
-    - zig build client   # client-only executable (Sokol)
     - zig build server   # headless server executable (no Sokol)
 - Run the game (defaults to full):
   - zig build run
@@ -43,7 +42,6 @@ High-level architecture
 
 - Entry/Executables
   - Full: src/main.zig builds vox-aetatum (client + in-process simulation). This is the default run target.
-  - Client: src/bin/client_main.zig builds vox-client (Sokol, connects to server; includes Simulation for prediction but does not run it).
   - Server: src/bin/server_main.zig builds vox-server (headless; authoritative simulation).
   - The full executable is integrated with a build “run” step (zig build run) that forwards CLI args.
 - Client/Render Loop
