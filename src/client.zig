@@ -135,7 +135,247 @@ const Camera = struct {
     }
 };
 
+// Control scheme abstraction encapsulating how input affects camera and player
+const ViewProj = struct { view: [16]f32, proj: [16]f32 };
+const ControlScheme = struct {
+    name: []const u8,
+    onMouseMove: *const fn (*anyopaque, sapp.Event) void,
+    onScroll: *const fn (*anyopaque, sapp.Event) void,
+    applyMovement: *const fn (*anyopaque) void,
+    updateCamera: *const fn (*anyopaque) void,
+    makeViewProj: *const fn (*anyopaque, f32, f32) ViewProj,
+};
+
+// FirstPersonHorizontal control scheme: horizontal-only mouse look (yaw),
+// movement derived from yaw on XZ plane, camera mirrors local state.
+fn cs_fph_onMouseMove(ctx: *anyopaque, ev: sapp.Event) void {
+    const self: *Client = @ptrCast(@alignCast(ctx));
+    const sens: f32 = 0.002; // radians per pixel
+    const dx = ev.mouse_dx * sens;
+    _ = ev.mouse_dy; // ignore vertical mouse input (no pitch)
+
+    // Rotate look around +Y for horizontal mouse motion (mouse right => turn right)
+    var new_dir = self.local_dir;
+    if (dx != 0) {
+        const c = @cos(dx);
+        const s = @sin(dx);
+        const x = new_dir[0];
+        const z = new_dir[2];
+        new_dir[0] = c * x - s * z;
+        new_dir[2] = s * x + c * z;
+    }
+    // normalize
+    const len = @sqrt(new_dir[0] * new_dir[0] + new_dir[1] * new_dir[1] + new_dir[2] * new_dir[2]);
+    if (len > 0.000001) {
+        new_dir[0] /= len;
+        new_dir[1] /= len;
+        new_dir[2] /= len;
+    }
+    self.local_dir = new_dir;
+    // update camera from dir (also updates yaw/pitch)
+    self.camera.setDir(self.local_dir);
+    self.local_yaw = self.camera.yaw;
+    self.local_pitch = self.camera.pitch;
+
+    // If not moving, constrain facing so look stays within 90° of facing (XZ)
+    if (!(self.move_forward or self.move_back or self.move_left or self.move_right)) {
+        // Use camera forward
+        const lpx = self.local_dir[0];
+        const lpz = self.local_dir[2];
+        const lplen = @sqrt(lpx * lpx + lpz * lpz);
+        if (lplen > 0.0001) {
+            const nlx = lpx / lplen;
+            const nlz = lpz / lplen;
+            // Read/adjust facing under mutex
+            self.sim.connections_mutex.lock();
+            const idx_opt_f = self.sim.entity_by_player.get(self.player_id);
+            if (idx_opt_f) |idx_f| {
+                if (idx_f < self.sim.dynamic_entities.items.len) {
+                    var e_f = &self.sim.dynamic_entities.items[idx_f];
+                    const fvx = e_f.facing_dir_xz[0];
+                    const fvz = e_f.facing_dir_xz[1];
+                    const dot = fvx * nlx + fvz * nlz;
+                    if (dot < 0) { // angle > 90°
+                        const facing_yaw = std.math.atan2(fvz, fvx);
+                        const look_yaw = std.math.atan2(nlz, nlx);
+                        var diff = look_yaw - facing_yaw;
+                        // wrap to [-pi, pi]
+                        if (diff > std.math.pi) diff -= 2 * std.math.pi;
+                        if (diff < -std.math.pi) diff += 2 * std.math.pi;
+                        const sign: f32 = if (diff >= 0) 1.0 else -1.0;
+                        const delta = @abs(diff) - (std.math.pi / 2.0);
+                        const new_yaw = facing_yaw + sign * delta;
+                        e_f.facing_dir_xz = .{ @cos(new_yaw), @sin(new_yaw) };
+                    }
+                }
+            }
+            self.sim.connections_mutex.unlock();
+        }
+    }
+}
+
+fn cs_fph_applyMovement(ctx: *anyopaque) void {
+    const self: *Client = @ptrCast(@alignCast(ctx));
+    self.applyMovementInputsLocal();
+}
+
+fn cs_fph_updateCamera(ctx: *anyopaque) void {
+    const self: *Client = @ptrCast(@alignCast(ctx));
+    self.updateCameraFromLocal();
+}
+
+fn cs_fph_makeViewProj(ctx: *anyopaque, w_px: f32, h_px: f32) ViewProj {
+    const self: *Client = @ptrCast(@alignCast(ctx));
+    const aspect_wh: f32 = if (h_px > 0) (w_px / h_px) else 1.0;
+    const proj = Client.makePerspective(60.0 * std.math.pi / 180.0, aspect_wh, 0.1, 1000.0);
+    const view = self.makeViewNoRoll(self.camera.pos, self.camera.yaw, self.camera.pitch);
+    return .{ .view = view, .proj = proj };
+}
+
+fn cs_fph_onScroll(ctx: *anyopaque, ev: sapp.Event) void {
+    _ = ctx;
+    _ = ev; // no-op for first person horizontal
+}
+
+const firstPersonHorizontalScheme: ControlScheme = .{
+    .name = "FirstPersonHorizontal",
+    .onMouseMove = cs_fph_onMouseMove,
+    .onScroll = cs_fph_onScroll,
+    .applyMovement = cs_fph_applyMovement,
+    .updateCamera = cs_fph_updateCamera,
+    .makeViewProj = cs_fph_makeViewProj,
+};
+
 const Vertex = struct { pos: [3]f32, uv: [2]f32, uv_off: [2]f32, uv_scale: [2]f32 };
+
+// ThirdPersonIsometric control scheme
+fn cs_iso_onMouseMove(ctx: *anyopaque, ev: sapp.Event) void {
+    const self: *Client = @ptrCast(@alignCast(ctx));
+    const sens: f32 = 0.002; // radians per pixel
+    const dx = ev.mouse_dx * sens;
+    // Horizontal orbit around the player (mouse right => turn right)
+    self.iso_yaw += dx;
+    // Normalize yaw to [-pi, pi]
+    if (self.iso_yaw > std.math.pi) self.iso_yaw -= 2.0 * std.math.pi;
+    if (self.iso_yaw < -std.math.pi) self.iso_yaw += 2.0 * std.math.pi;
+}
+
+fn cs_iso_onScroll(ctx: *anyopaque, ev: sapp.Event) void {
+    const self: *Client = @ptrCast(@alignCast(ctx));
+    const step: f32 = 1.0;
+    // Positive scroll_y typically means scroll up; bring camera closer
+    self.iso_dist = std.math.clamp(self.iso_dist - (ev.scroll_y * step), self.iso_min_dist, self.iso_max_dist);
+}
+
+fn cs_iso_applyMovement(ctx: *anyopaque) void {
+    const self: *Client = @ptrCast(@alignCast(ctx));
+    // Camera-relative movement in XZ using orbit yaw
+    const yaw = self.iso_yaw;
+    const fwd_x: f32 = @cos(yaw);
+    const fwd_z: f32 = @sin(yaw);
+    const right_x: f32 = -@sin(yaw);
+    const right_z: f32 = @cos(yaw);
+
+    var vx: f32 = 0;
+    var vz: f32 = 0;
+    if (self.move_forward) {
+        vx += fwd_x;
+        vz += fwd_z;
+    }
+    if (self.move_back) {
+        vx -= fwd_x;
+        vz -= fwd_z;
+    }
+    if (self.move_right) {
+        vx += right_x;
+        vz += right_z;
+    }
+    if (self.move_left) {
+        vx -= right_x;
+        vz -= right_z;
+    }
+    const mag: f32 = @sqrt(vx * vx + vz * vz);
+    if (mag > 0.0001) {
+        vx /= mag;
+        vz /= mag;
+    }
+    const speed: f32 = 4.5;
+    self.local_vel[0] = vx * speed;
+    self.local_vel[2] = vz * speed;
+    if (self.jump_pressed and self.local_on_ground) {
+        const g: f32 = 9.80665;
+        const target_h: f32 = 1.1;
+        const v0: f32 = @sqrt(2.0 * g * target_h);
+        self.local_vel[1] = v0;
+        self.local_on_ground = false;
+        self.jump_pending = true;
+    }
+    self.jump_pressed = false;
+}
+
+fn cs_iso_updateCamera(ctx: *anyopaque) void {
+    const self: *Client = @ptrCast(@alignCast(ctx));
+    // Desired isometric yaw/pitch control the orbit direction
+    const yaw = self.iso_yaw;
+    const pitch = self.iso_pitch;
+
+    // Forward from yaw/pitch
+    const cy = @cos(yaw);
+    const sy = @sin(yaw);
+    const cp = @cos(pitch);
+    const sp = @sin(pitch);
+    const fwd = [3]f32{ cp * cy, sp, cp * sy };
+
+    // Orbit around the bottom center of the player's bounding box
+    const bottom_y: f32 = self.local_pos[1];
+    const target = [3]f32{ self.local_pos[0], bottom_y, self.local_pos[2] };
+    self.camera.pos = .{ target[0] - fwd[0] * self.iso_dist, target[1] - fwd[1] * self.iso_dist, target[2] - fwd[2] * self.iso_dist };
+
+    // Ensure the camera actually looks at the target (robust to any view debug transforms)
+    var dir = [3]f32{ target[0] - self.camera.pos[0], target[1] - self.camera.pos[1], target[2] - self.camera.pos[2] };
+    const dl: f32 = @sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+    if (dl > 0.000001) {
+        dir[0] /= dl;
+        dir[1] /= dl;
+        dir[2] /= dl;
+    }
+    const look_pitch: f32 = std.math.asin(std.math.clamp(dir[1], -1.0, 1.0));
+    const look_yaw: f32 = std.math.atan2(dir[2], dir[0]);
+    self.camera.setYawPitch(look_yaw, look_pitch);
+    self.camera.roll = 0;
+    // Note: In isometric mode, the player's look vector remains independent of the camera.
+}
+
+fn makeOrthoCentered(half_width: f32, half_height: f32, znear: f32, zfar: f32) [16]f32 {
+    var m: [16]f32 = [_]f32{0} ** 16;
+    // column-major
+    m[0] = if (half_width != 0) (1.0 / half_width) else 0.0;
+    m[5] = if (half_height != 0) (1.0 / half_height) else 0.0;
+    m[10] = if ((zfar - znear) != 0) (-2.0 / (zfar - znear)) else 0.0;
+    m[15] = 1.0;
+    // translate is zero for symmetric bounds
+    m[12] = 0.0;
+    m[13] = 0.0;
+    m[14] = -(zfar + znear) / (zfar - znear);
+    return m;
+}
+
+fn cs_iso_makeViewProj(ctx: *anyopaque, w_px: f32, h_px: f32) ViewProj {
+    const self: *Client = @ptrCast(@alignCast(ctx));
+    const aspect_wh: f32 = if (h_px > 0) (w_px / h_px) else 1.0;
+    const proj = Client.makePerspective(60.0 * std.math.pi / 180.0, aspect_wh, 0.1, 1000.0);
+    const view = self.makeViewNoRoll(self.camera.pos, self.iso_yaw, self.iso_pitch);
+    return .{ .view = view, .proj = proj };
+}
+
+const thirdPersonIsometricScheme: ControlScheme = .{
+    .name = "ThirdPersonIsometric",
+    .onMouseMove = cs_iso_onMouseMove,
+    .onScroll = cs_iso_onScroll,
+    .applyMovement = cs_iso_applyMovement,
+    .updateCamera = cs_iso_updateCamera,
+    .makeViewProj = cs_iso_makeViewProj,
+};
 
 inline fn wrap01m(v: f32) f32 {
     const f = v - std.math.floor(v);
@@ -586,19 +826,28 @@ pub const Client = struct {
     pass_action: sg.PassAction = .{},
     ui_scale: f32 = 2.0,
     show_debug: bool = true,
-    show_atlas_overlay: bool = false,
+    // Backend quirks
+    metal_transpose_view3x3: bool = false,
+
+    // Debug view basis capture (for diagnostics)
+    dbg_s: [3]f32 = .{ 0, 0, 0 },
+    dbg_u: [3]f32 = .{ 0, 0, 0 },
+    dbg_f: [3]f32 = .{ 0, 0, 0 },
 
     // Minimal chunk renderer state
     shd: sg.Shader = .{},
     pip: sg.Pipeline = .{},
-    quad_pip: sg.Pipeline = .{},
     vbuf: sg.Buffer = .{},
-    ui_vbuf: sg.Buffer = .{},
+    // dedicated dynamic buffer for 3D debug (e.g., player AABB)
+    aabb_vbuf: sg.Buffer = .{},
     bind: sg.Bindings = .{},
     // We reuse grass_* for the atlas image/view binding for now
     grass_img: sg.Image = .{},
     grass_view: sg.View = .{},
     sampler: sg.Sampler = .{},
+    // Debug solid-color texture for player AABB
+    green_img: sg.Image = .{},
+    green_view: sg.View = .{},
     atlas_w: u32 = 1,
     atlas_h: u32 = 1,
     // Atlas UV transforms per texture path
@@ -609,7 +858,7 @@ pub const Client = struct {
 
     // GPU buffer capacity tracking
     vbuf_capacity_bytes: usize = 0,
-    ui_vbuf_capacity_bytes: usize = 0,
+    aabb_vbuf_capacity_bytes: usize = 0,
 
     // View frustum (derived each frame from MVP) for culling
     frustum_planes: [6][4]f32 = [_][4]f32{.{ 0, 0, 0, 0 }} ** 6,
@@ -642,6 +891,18 @@ pub const Client = struct {
 
     // Camera mirrored from player entity (position only; orientation is client-local)
     camera: Camera = .{},
+
+    // Control schemes
+    control_schemes: []const ControlScheme = &[_]ControlScheme{},
+    current_scheme: usize = 0,
+
+    // Isometric (third-person) parameters
+    iso_dist: f32 = 12.0,
+    iso_min_dist: f32 = 3.0,
+    iso_max_dist: f32 = 50.0,
+    iso_yaw: f32 = std.math.pi / 4.0, // 45 degrees
+    iso_pitch: f32 = -0.8, // pitched down a bit more to avoid horizon
+    iso_ortho_half_h: f32 = 20.0,
 
     // Local view state (client-predicted, decoupled from simulation)
     local_yaw: f32 = 0.0,
@@ -690,7 +951,7 @@ pub const Client = struct {
 
     pub fn init(allocator: std.mem.Allocator, sim: *simulation.Simulation, player_id: player.PlayerId, account_name: []const u8) !Client {
         const acc = try allocator.dupe(u8, account_name);
-        return .{
+        var cli: Client = .{
             .allocator = allocator,
             .sim = sim,
             .player_id = player_id,
@@ -703,6 +964,10 @@ pub const Client = struct {
             .mesher_results = std.ArrayList(MeshingResult).initCapacity(allocator, 0) catch unreachable,
             .mesher_threads = std.ArrayList(std.Thread).initCapacity(allocator, 0) catch unreachable,
         };
+        // Initialize control schemes (default to FirstPersonHorizontal)
+        cli.control_schemes = &[_]ControlScheme{ firstPersonHorizontalScheme, thirdPersonIsometricScheme };
+        cli.current_scheme = 0; // first person by default
+        return cli;
     }
 
     fn mesherThreadMain(self: *Client) void {
@@ -774,12 +1039,13 @@ pub const Client = struct {
     pub fn deinit(self: *Client) void {
         // Release GPU resources if created
         if (self.vbuf.id != 0) sg.destroyBuffer(self.vbuf);
-        if (self.ui_vbuf.id != 0) sg.destroyBuffer(self.ui_vbuf);
+        if (self.aabb_vbuf.id != 0) sg.destroyBuffer(self.aabb_vbuf);
         if (self.grass_view.id != 0) sg.destroyView(self.grass_view);
+        if (self.green_view.id != 0) sg.destroyView(self.green_view);
         if (self.sampler.id != 0) sg.destroySampler(self.sampler);
         if (self.grass_img.id != 0) sg.destroyImage(self.grass_img);
+        if (self.green_img.id != 0) sg.destroyImage(self.green_img);
         if (self.pip.id != 0) sg.destroyPipeline(self.pip);
-        if (self.quad_pip.id != 0) sg.destroyPipeline(self.quad_pip);
         if (self.shd.id != 0) sg.destroyShader(self.shd);
 
         // Stop mesher threads
@@ -849,6 +1115,10 @@ pub const Client = struct {
 
         // shader: use shdc-generated cross-platform shader
         const backend = sg.queryBackend();
+        // Metal backend needs a transposed view 3x3 (no runtime toggle)
+        if (backend == .METAL_MACOS) {
+            self.metal_transpose_view3x3 = true;
+        }
         if (@hasDecl(shd_mod, "shaderDesc")) {
             self.shd = sg.makeShader(shd_mod.shaderDesc(backend));
         } else if (@hasDecl(shd_mod, "shader_desc")) {
@@ -878,21 +1148,6 @@ pub const Client = struct {
         pdesc.layout.attrs[2].format = .FLOAT2;
         pdesc.layout.attrs[3].format = .FLOAT2;
         self.pip = sg.makePipeline(pdesc);
-        // dedicated 2D quad pipeline for overlay (no depth test, no culling)
-        var qdesc: sg.PipelineDesc = .{};
-        qdesc.label = "quad-pipeline";
-        qdesc.shader = self.shd;
-        qdesc.layout.attrs[0].format = .FLOAT3;
-        qdesc.layout.attrs[1].format = .FLOAT2;
-        qdesc.layout.attrs[2].format = .FLOAT2;
-        qdesc.layout.attrs[3].format = .FLOAT2;
-        qdesc.primitive_type = .TRIANGLES;
-        qdesc.cull_mode = .NONE;
-        qdesc.face_winding = .CCW;
-        qdesc.depth = .{ .compare = .ALWAYS, .write_enabled = false };
-        qdesc.color_count = 1;
-        qdesc.colors[0].pixel_format = desc.environment.defaults.color_format;
-        self.quad_pip = sg.makePipeline(qdesc);
 
         // Defer starting mesher threads until first frame when this Client is stored in state
         self.mesher_running = false;
@@ -906,11 +1161,11 @@ pub const Client = struct {
         self.vbuf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true, .stream_update = true }, .size = @intCast(initial_bytes) });
         self.vbuf_capacity_bytes = initial_bytes;
         self.bind.vertex_buffers[0] = self.vbuf;
-        // separate small dynamic vertex buffer for UI/overlay (e.g., 6 verts for a quad)
-        const ui_initial_vcount: usize = 6;
-        const ui_initial_bytes: usize = ui_initial_vcount * @sizeOf(Vertex);
-        self.ui_vbuf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true, .stream_update = true }, .size = @intCast(ui_initial_bytes) });
-        self.ui_vbuf_capacity_bytes = ui_initial_bytes;
+        // separate dynamic vertex buffer for 3D debug geometry (player AABB: 12 tris = 36 verts)
+        const aabb_initial_vcount: usize = 36;
+        const aabb_initial_bytes: usize = aabb_initial_vcount * @sizeOf(Vertex);
+        self.aabb_vbuf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true, .stream_update = true }, .size = @intCast(aabb_initial_bytes) });
+        self.aabb_vbuf_capacity_bytes = aabb_initial_bytes;
         self.pass_action.depth = .{ .load_action = .CLEAR, .clear_value = 1.0 };
 
         // Build texture atlas from registry resource paths (map already initialized in init)
@@ -923,9 +1178,21 @@ pub const Client = struct {
         self.bind.views[1] = self.grass_view;
         self.bind.samplers[2] = self.sampler;
 
+        // Create a 1x1 green texture/view for debug solid color draws
+        {
+            var green = [_]u8{ 0, 255, 0, 255 };
+            self.green_img = sg.makeImage(.{
+                .width = 1,
+                .height = 1,
+                .pixel_format = .RGBA8,
+                .data = .{ .subimage = .{ .{ sg.asRange(green[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} } } },
+            });
+            self.green_view = sg.makeView(.{ .texture = .{ .image = self.green_img } });
+        }
+
         // Initialize local state and camera from player entity if available
         self.initLocalFromSim();
-        self.updateCameraFromLocal();
+        self.control_schemes[self.current_scheme].updateCamera(self);
         // Defer mouse capture until world is ready (see checkReady)
     }
 
@@ -1175,7 +1442,7 @@ pub const Client = struct {
             self.ready = true;
             // Initialize local player and camera now that the surrounding world exists
             self.initLocalFromSim();
-            self.updateCameraFromLocal();
+            self.control_schemes[self.current_scheme].updateCamera(self);
             // Now that we are ready, capture the mouse and enable raw input
             sapp.lockMouse(true);
             setRawMouse(true);
@@ -1298,11 +1565,11 @@ pub const Client = struct {
             return;
         }
 
-        // Apply movement inputs locally and predict physics every render frame
-        self.applyMovementInputsLocal();
+        // Apply movement/input via current control scheme and predict physics, then update camera
+        self.control_schemes[self.current_scheme].applyMovement(self);
         const dt_clamped: f32 = std.math.clamp(dt_s, 0.0, 0.05);
         if (dt_clamped > 0.0) self.localPhysicsStep(dt_clamped);
-        self.updateCameraFromLocal();
+        self.control_schemes[self.current_scheme].updateCamera(self);
         // Notify simulation no more than once per tick
         self.maybeSendLookToSim();
         self.maybeSendMoveToSim();
@@ -1310,10 +1577,13 @@ pub const Client = struct {
         // Prepare MVP and frustum before building the mesh (used for culling)
         const w_px: f32 = @floatFromInt(sapp.width());
         const h_px: f32 = @floatFromInt(sapp.height());
-        const aspect_wh: f32 = if (h_px > 0) (w_px / h_px) else 1.0;
-        const proj = makePerspective(60.0 * std.math.pi / 180.0, aspect_wh, 0.1, 1000.0);
-        const view = self.makeViewNoRoll(self.camera.pos, self.camera.yaw, self.camera.pitch);
-        const mvp = matMul(proj, view);
+        const vp = self.control_schemes[self.current_scheme].makeViewProj(self, w_px, h_px);
+        var view_adj = vp.view;
+        if (self.metal_transpose_view3x3) {
+            view_adj = self.transposeView3x3WithEye(view_adj);
+        }
+        // standard MVP (proj*view)
+        const mvp: [16]f32 = matMul(vp.proj, view_adj);
         self.updateFrustum(mvp);
         var vs_params: shd_mod.VsParams = .{ .mvp = mvp, .atlas_pad = .{ 0, 0 } };
 
@@ -1328,10 +1598,8 @@ pub const Client = struct {
 
         // Cached rendering handled above
 
-        // Optional atlas overlay (top-left UI origin)
-        if (self.show_atlas_overlay and self.grass_img.id != 0) {
-            self.drawAtlasOverlay();
-        }
+        // Draw player bounding box in solid green for debugging camera orbit
+        self.drawPlayerAabb(&vs_params);
 
         if (self.show_debug) {
             const scale: f32 = self.ui_scale;
@@ -1538,7 +1806,43 @@ pub const Client = struct {
         switch (ev.type) {
             .KEY_UP => {
                 if (ev.key_code == .F3) self.show_debug = !self.show_debug;
-                if (ev.key_code == .F5) self.show_atlas_overlay = !self.show_atlas_overlay;
+                if (ev.key_code == .F5) {
+                    const next_idx: usize = (self.current_scheme + 1) % self.control_schemes.len;
+                    const next = self.control_schemes[next_idx];
+                    // If switching to first-person, sync camera from the player's look vector
+                    if (std.mem.eql(u8, next.name, "FirstPersonHorizontal")) {
+                        var look: [3]f32 = self.local_dir;
+                        // Try to fetch latest from SIM
+                        self.sim.connections_mutex.lock();
+                        const idx_opt_cam = self.sim.entity_by_player.get(self.player_id);
+                        if (idx_opt_cam) |idx_cam| {
+                            if (idx_cam < self.sim.dynamic_entities.items.len) {
+                                const e_cam = self.sim.dynamic_entities.items[idx_cam];
+                                look = e_cam.look_dir;
+                            }
+                        }
+                        self.sim.connections_mutex.unlock();
+                        // Compute yaw/pitch from look
+                        const dx = look[0];
+                        const dy = look[1];
+                        const dz = look[2];
+                        const len: f32 = @sqrt(dx * dx + dy * dy + dz * dz);
+                        if (len > 0.000001) {
+                            const nx = dx / len;
+                            const ny = dy / len;
+                            const nz = dz / len;
+                            self.local_pitch = std.math.asin(std.math.clamp(ny, -1.0, 1.0));
+                            self.local_yaw = std.math.atan2(nz, nx);
+                            const cp = @cos(self.local_pitch);
+                            const sp = @sin(self.local_pitch);
+                            const cy = @cos(self.local_yaw);
+                            const sy = @sin(self.local_yaw);
+                            self.local_dir = .{ cp * cy, sp, cp * sy };
+                        }
+                    }
+                    self.current_scheme = next_idx;
+                    self.control_schemes[self.current_scheme].updateCamera(self);
+                }
                 if (ev.key_code == .ESCAPE) {
                     // Release mouse when ESC is pressed
                     sapp.lockMouse(false);
@@ -1584,69 +1888,11 @@ pub const Client = struct {
             },
             .MOUSE_MOVE => {
                 if (sapp.mouseLocked()) {
-                    const sens: f32 = 0.002; // radians per pixel
-                    const dx = ev.mouse_dx * sens;
-                    _ = ev.mouse_dy; // ignore vertical mouse input (no pitch)
-
-                    // Rotate look around +Y for horizontal mouse motion
-                    var new_dir = self.local_dir;
-                    if (dx != 0) {
-                        const c = @cos(-dx); // right drag turns right
-                        const s = @sin(-dx);
-                        const x = new_dir[0];
-                        const z = new_dir[2];
-                        new_dir[0] = c * x - s * z;
-                        new_dir[2] = s * x + c * z;
-                    }
-                    // normalize
-                    const len = @sqrt(new_dir[0] * new_dir[0] + new_dir[1] * new_dir[1] + new_dir[2] * new_dir[2]);
-                    if (len > 0.000001) {
-                        new_dir[0] /= len;
-                        new_dir[1] /= len;
-                        new_dir[2] /= len;
-                    }
-                    self.local_dir = new_dir;
-                    // update camera from dir (also updates yaw/pitch)
-                    self.camera.setDir(self.local_dir);
-                    self.local_yaw = self.camera.yaw;
-                    self.local_pitch = self.camera.pitch;
-
-                    // If not moving, constrain facing so look stays within 90° of facing (XZ)
-                    if (!(self.move_forward or self.move_back or self.move_left or self.move_right)) {
-                        // Use camera forward
-                        const lpx = self.local_dir[0];
-                        const lpz = self.local_dir[2];
-                        const lplen = @sqrt(lpx * lpx + lpz * lpz);
-                        if (lplen > 0.0001) {
-                            const nlx = lpx / lplen;
-                            const nlz = lpz / lplen;
-                            // Read/adjust facing under mutex
-                            self.sim.connections_mutex.lock();
-                            const idx_opt_f = self.sim.entity_by_player.get(self.player_id);
-                            if (idx_opt_f) |idx_f| {
-                                if (idx_f < self.sim.dynamic_entities.items.len) {
-                                    var e_f = &self.sim.dynamic_entities.items[idx_f];
-                                    const fvx = e_f.facing_dir_xz[0];
-                                    const fvz = e_f.facing_dir_xz[1];
-                                    const dot = fvx * nlx + fvz * nlz;
-                                    if (dot < 0) { // angle > 90°
-                                        const facing_yaw = std.math.atan2(fvz, fvx);
-                                        const look_yaw = std.math.atan2(nlz, nlx);
-                                        var diff = look_yaw - facing_yaw;
-                                        // wrap to [-pi, pi]
-                                        if (diff > std.math.pi) diff -= 2 * std.math.pi;
-                                        if (diff < -std.math.pi) diff += 2 * std.math.pi;
-                                        const sign: f32 = if (diff >= 0) 1.0 else -1.0;
-                                        const delta = @abs(diff) - (std.math.pi / 2.0);
-                                        const new_yaw = facing_yaw + sign * delta;
-                                        e_f.facing_dir_xz = .{ @cos(new_yaw), @sin(new_yaw) };
-                                    }
-                                }
-                            }
-                            self.sim.connections_mutex.unlock();
-                        }
-                    }
+                    self.control_schemes[self.current_scheme].onMouseMove(self, ev);
                 }
+            },
+            .MOUSE_SCROLL => {
+                self.control_schemes[self.current_scheme].onScroll(self, ev);
             },
             else => {},
         }
@@ -1730,7 +1976,7 @@ pub const Client = struct {
     // Apply currently-pressed movement keys to the client-local predicted player
     fn applyMovementInputsLocal(self: *Client) void {
         // Derive forward from yaw only (horizontal heading), independent of pitch
-        const fwd_x: f32 = -@cos(self.local_yaw);
+        const fwd_x: f32 = @cos(self.local_yaw);
         const fwd_z: f32 = @sin(self.local_yaw);
         // Screen-right (world right) is cross(forward, up) on XZ: (-fwd_z, fwd_x)
         const right_x: f32 = -fwd_z;
@@ -2828,6 +3074,18 @@ pub const Client = struct {
         return r;
     }
 
+    fn transpose4(m: [16]f32) [16]f32 {
+        var r: [16]f32 = undefined;
+        var c: usize = 0;
+        while (c < 4) : (c += 1) {
+            var rrow: usize = 0;
+            while (rrow < 4) : (rrow += 1) {
+                r[c * 4 + rrow] = m[rrow * 4 + c];
+            }
+        }
+        return r;
+    }
+
     // Extract 6 view-frustum planes from a column-major MVP matrix.
     // Plane order: left, right, bottom, top, near, far. Each plane is (a,b,c,d) with outward normal.
     fn extractFrustumPlanes(m: [16]f32) [6][4]f32 {
@@ -2984,64 +3242,70 @@ pub const Client = struct {
         return m;
     }
 
-    fn makeOrthoTopLeft(width_px: f32, height_px: f32) [16]f32 {
-        var m: [16]f32 = [_]f32{0} ** 16;
-        // map x: [0..W] -> [-1..+1]
-        m[0] = if (width_px != 0) (2.0 / width_px) else 0.0;
-        // map y: [0..H] (top-down) -> [+1..-1]
-        m[5] = if (height_px != 0) (-2.0 / height_px) else 0.0;
-        m[10] = 1.0;
-        m[15] = 1.0;
-        // translation to top-left origin
-        m[12] = -1.0;
-        m[13] = 1.0;
-        return m;
-    }
-
-    fn drawAtlasOverlay(self: *Client) void {
-        const w_px: f32 = @floatFromInt(sapp.width());
-        const h_px: f32 = @floatFromInt(sapp.height());
-        const margin: f32 = 8.0;
-        const aw: f32 = @floatFromInt(self.atlas_w);
-        const ah: f32 = @floatFromInt(self.atlas_h);
-        if (!(aw > 0 and ah > 0)) return;
-        const max_w: f32 = w_px * 0.5;
-        const max_h: f32 = h_px * 0.5;
-        var scale: f32 = 1.0;
-        const sx = if (aw != 0) (max_w / aw) else 1.0;
-        const sy = if (ah != 0) (max_h / ah) else 1.0;
-        scale = @min(sx, sy);
-        if (scale > 1.0) scale = 1.0;
-        const dw: f32 = aw * scale;
-        const dh: f32 = ah * scale;
-        const x0: f32 = margin;
-        const y0: f32 = margin;
-        const x1: f32 = x0 + dw;
-        const y1: f32 = y0 + dh;
-        var quad: [6]Vertex = .{
-            .{ .pos = .{ x0, y0, 0 }, .uv = .{ 0, 0 }, .uv_off = .{ 0, 0 }, .uv_scale = .{ 1, 1 } },
-            .{ .pos = .{ x1, y0, 0 }, .uv = .{ 1, 0 }, .uv_off = .{ 0, 0 }, .uv_scale = .{ 1, 1 } },
-            .{ .pos = .{ x1, y1, 0 }, .uv = .{ 1, 1 }, .uv_off = .{ 0, 0 }, .uv_scale = .{ 1, 1 } },
-            .{ .pos = .{ x0, y0, 0 }, .uv = .{ 0, 0 }, .uv_off = .{ 0, 0 }, .uv_scale = .{ 1, 1 } },
-            .{ .pos = .{ x1, y1, 0 }, .uv = .{ 1, 1 }, .uv_off = .{ 0, 0 }, .uv_scale = .{ 1, 1 } },
-            .{ .pos = .{ x0, y1, 0 }, .uv = .{ 0, 1 }, .uv_off = .{ 0, 0 }, .uv_scale = .{ 1, 1 } },
-        };
-        const ortho = makeOrthoTopLeft(w_px, h_px);
-        var vs_params: shd_mod.VsParams = .{ .mvp = ortho, .atlas_pad = .{ 0, 0 } };
-        sg.applyPipeline(self.quad_pip);
-        // use a separate UI vertex buffer to avoid multiple updates to the same buffer in one frame
-        var bind_ui = self.bind;
-        bind_ui.vertex_buffers[0] = self.ui_vbuf;
-        sg.applyBindings(bind_ui);
+    fn drawPlayerAabb(self: *Client, vs_in: *const shd_mod.VsParams) void {
+        // Construct a solid box from the client's local predicted AABB
+        const hx = self.local_aabb_half_extents[0];
+        const hy = self.local_aabb_half_extents[1];
+        const hz = self.local_aabb_half_extents[2];
+        const x0: f32 = self.local_pos[0] - hx;
+        const x1: f32 = self.local_pos[0] + hx;
+        const y0: f32 = self.local_pos[1];
+        const y1: f32 = self.local_pos[1] + 2.0 * hy;
+        const z0: f32 = self.local_pos[2] - hz;
+        const z1: f32 = self.local_pos[2] + hz;
+        var verts: [36]Vertex = undefined;
+        var i: usize = 0;
+        const uv00 = [2]f32{ 0, 0 };
+        const uv01 = [2]f32{ 0, 1 };
+        const uv11 = [2]f32{ 1, 1 };
+        const uv10 = [2]f32{ 1, 0 };
+        const off = [2]f32{ 0, 0 };
+        const sc = [2]f32{ 1, 1 };
+        const addTri = struct {
+            fn call(list: *[36]Vertex, idx: *usize, p0: [3]f32, p1: [3]f32, p2: [3]f32, t0: [2]f32, t1: [2]f32, t2: [2]f32) void {
+                list.*[idx.*] = .{ .pos = p0, .uv = t0, .uv_off = off, .uv_scale = sc };
+                idx.* += 1;
+                list.*[idx.*] = .{ .pos = p1, .uv = t1, .uv_off = off, .uv_scale = sc };
+                idx.* += 1;
+                list.*[idx.*] = .{ .pos = p2, .uv = t2, .uv_off = off, .uv_scale = sc };
+                idx.* += 1;
+            }
+        }.call;
+        // +X
+        addTri(&verts, &i, .{ x1, y0, z0 }, .{ x1, y1, z0 }, .{ x1, y1, z1 }, uv00, uv01, uv11);
+        addTri(&verts, &i, .{ x1, y0, z0 }, .{ x1, y1, z1 }, .{ x1, y0, z1 }, uv00, uv11, uv10);
+        // -X
+        addTri(&verts, &i, .{ x0, y0, z1 }, .{ x0, y1, z1 }, .{ x0, y1, z0 }, uv00, uv01, uv11);
+        addTri(&verts, &i, .{ x0, y0, z1 }, .{ x0, y1, z0 }, .{ x0, y0, z0 }, uv00, uv11, uv10);
+        // +Y (top)
+        addTri(&verts, &i, .{ x0, y1, z0 }, .{ x0, y1, z1 }, .{ x1, y1, z1 }, uv00, uv01, uv11);
+        addTri(&verts, &i, .{ x0, y1, z0 }, .{ x1, y1, z1 }, .{ x1, y1, z0 }, uv00, uv11, uv10);
+        // -Y (bottom)
+        addTri(&verts, &i, .{ x0, y0, z1 }, .{ x0, y0, z0 }, .{ x1, y0, z0 }, uv00, uv01, uv11);
+        addTri(&verts, &i, .{ x0, y0, z1 }, .{ x1, y0, z0 }, .{ x1, y0, z1 }, uv00, uv11, uv10);
+        // +Z
+        addTri(&verts, &i, .{ x1, y0, z1 }, .{ x1, y1, z1 }, .{ x0, y1, z1 }, uv00, uv01, uv11);
+        addTri(&verts, &i, .{ x1, y0, z1 }, .{ x0, y1, z1 }, .{ x0, y0, z1 }, uv00, uv11, uv10);
+        // -Z
+        addTri(&verts, &i, .{ x0, y0, z0 }, .{ x0, y1, z0 }, .{ x1, y1, z0 }, uv00, uv01, uv11);
+        addTri(&verts, &i, .{ x0, y0, z0 }, .{ x1, y1, z0 }, .{ x1, y0, z0 }, uv00, uv11, uv10);
+        if (i != verts.len) return; // safety
+        // Use the 3D pipeline (depth test on). Override binding to use green texture and UI buffer.
+        sg.applyPipeline(self.pip);
+        var vs_params: shd_mod.VsParams = .{ .mvp = vs_in.mvp, .atlas_pad = .{ 0, 0 } };
         sg.applyUniforms(0, sg.asRange(&vs_params));
-        const needed_bytes: usize = quad.len * @sizeOf(Vertex);
-        if (self.ui_vbuf_capacity_bytes < needed_bytes) {
-            if (self.ui_vbuf.id != 0) sg.destroyBuffer(self.ui_vbuf);
-            self.ui_vbuf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true, .stream_update = true }, .size = @intCast(needed_bytes) });
-            self.ui_vbuf_capacity_bytes = needed_bytes;
+        var b = self.bind;
+        b.vertex_buffers[0] = self.aabb_vbuf;
+        if (self.green_view.id != 0) b.views[1] = self.green_view;
+        sg.applyBindings(b);
+        const needed_bytes: usize = verts.len * @sizeOf(Vertex);
+        if (self.aabb_vbuf_capacity_bytes < needed_bytes) {
+            if (self.aabb_vbuf.id != 0) sg.destroyBuffer(self.aabb_vbuf);
+            self.aabb_vbuf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true, .stream_update = true }, .size = @intCast(needed_bytes) });
+            self.aabb_vbuf_capacity_bytes = needed_bytes;
         }
-        sg.updateBuffer(self.ui_vbuf, sg.asRange(&quad));
-        sg.draw(0, @intCast(quad.len), 1);
+        sg.updateBuffer(self.aabb_vbuf, sg.asRange(&verts));
+        sg.draw(0, @intCast(verts.len), 1);
     }
 
     fn makeViewConv(eye: [3]f32, forward: [3]f32, up_in: [3]f32, conventional: bool) [16]f32 {
@@ -3109,17 +3373,66 @@ pub const Client = struct {
         return matMul(m, t);
     }
 
+    fn transposeView3x3WithEye(self: *Client, v: [16]f32) [16]f32 {
+        var m = v;
+        // transpose rotation 3x3 in upper-left
+        const m00 = m[0];
+        const m01 = m[4];
+        const m02 = m[8];
+        const m10 = m[1];
+        const m11 = m[5];
+        const m12 = m[9];
+        const m20 = m[2];
+        const m21 = m[6];
+        const m22 = m[10];
+        m[0] = m00;
+        m[4] = m10;
+        m[8] = m20;
+        m[1] = m01;
+        m[5] = m11;
+        m[9] = m21;
+        m[2] = m02;
+        m[6] = m12;
+        m[10] = m22;
+        // recompute translation column using new rotation and current camera eye
+        const eye = self.camera.pos;
+        const neg_eye0 = -eye[0];
+        const neg_eye1 = -eye[1];
+        const neg_eye2 = -eye[2];
+        m[12] = m[0] * neg_eye0 + m[4] * neg_eye1 + m[8] * neg_eye2;
+        m[13] = m[1] * neg_eye0 + m[5] * neg_eye1 + m[9] * neg_eye2;
+        m[14] = m[2] * neg_eye0 + m[6] * neg_eye1 + m[10] * neg_eye2;
+        return m;
+    }
+
     fn makeViewNoRoll(self: *Client, eye: [3]f32, yaw: f32, pitch: f32) [16]f32 {
-        _ = self;
         const cy = @cos(yaw);
         const sy = @sin(yaw);
         const cp = @cos(pitch);
         const sp = @sin(pitch);
         // forward from yaw/pitch
         const f: [3]f32 = .{ cp * cy, sp, cp * sy };
-        // force horizon: right is strictly horizontal, up is world +Y
-        const s: [3]f32 = .{ -sy, 0, cy };
-        const u: [3]f32 = .{ 0, 1, 0 };
+        // choose a stable world-up; if nearly parallel to forward, pick Z-up fallback
+        var up: [3]f32 = .{ 0, 1, 0 };
+        const dot_fu: f32 = f[0] * up[0] + f[1] * up[1] + f[2] * up[2];
+        if (@abs(dot_fu) > 0.999) {
+            up = .{ 0, 0, 1 };
+        }
+        // s = normalize(cross(f, up))
+        const sx0: f32 = f[1] * up[2] - f[2] * up[1];
+        const sy0: f32 = f[2] * up[0] - f[0] * up[2];
+        const sz0: f32 = f[0] * up[1] - f[1] * up[0];
+        const sl: f32 = @max(0.000001, @sqrt(sx0 * sx0 + sy0 * sy0 + sz0 * sz0));
+        const s: [3]f32 = .{ sx0 / sl, sy0 / sl, sz0 / sl };
+        // u = cross(s, f)
+        const ux: f32 = s[1] * f[2] - s[2] * f[1];
+        const uy: f32 = s[2] * f[0] - s[0] * f[2];
+        const uz: f32 = s[0] * f[1] - s[1] * f[0];
+        const u: [3]f32 = .{ ux, uy, uz };
+        // capture for debug overlay
+        self.dbg_f = f;
+        self.dbg_s = s;
+        self.dbg_u = u;
         return makeViewFromBasis(eye, s, u, f);
     }
 
