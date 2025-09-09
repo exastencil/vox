@@ -6,6 +6,7 @@ const worldgen = @import("worldgen.zig");
 const wapi = @import("worldgen_api.zig");
 const constants = @import("constants");
 const player = @import("player.zig");
+const physics = @import("physics.zig");
 
 pub const StorageMode = union(enum) {
     memory,
@@ -450,18 +451,19 @@ pub const Simulation = struct {
     fn phasePhysics(self: *Simulation) void {
         // Simple physics: gravity and vertical collision against world surface.
         const dt: f32 = @floatCast(1.0 / self.target_tps);
-        const g: f32 = 9.80665; // m/s^2 downward
-        const world_key = "minecraft:overworld"; // single-world prototype
+        const cfg: physics.PhysicsConfig = .{ .gravity = 9.80665 };
 
-        // Helper to sample top surface (y of top face) from loaded chunks
-        const getTopFaceY = struct {
-            fn call(sim: *Simulation, x: f32, z: f32) ?f32 {
+        // Height sampler that reads from the current world's heightmap under lock
+        const sampler = struct {
+            fn call(ctx: *anyopaque, x: f32, z: f32) ?f32 {
+                const sim: *Simulation = @ptrCast(@alignCast(ctx));
                 const xi: i32 = @intFromFloat(@floor(x));
                 const zi: i32 = @intFromFloat(@floor(z));
                 const cx: i32 = @divFloor(xi, @as(i32, @intCast(constants.chunk_size_x)));
                 const cz: i32 = @divFloor(zi, @as(i32, @intCast(constants.chunk_size_z)));
                 const lx: i32 = @mod(xi, @as(i32, @intCast(constants.chunk_size_x)));
                 const lz: i32 = @mod(zi, @as(i32, @intCast(constants.chunk_size_z)));
+                const world_key = "minecraft:overworld"; // single-world prototype
 
                 sim.worlds_mutex.lock();
                 defer sim.worlds_mutex.unlock();
@@ -483,29 +485,17 @@ pub const Simulation = struct {
         var i: usize = 0;
         while (i < self.dynamic_entities.items.len) : (i += 1) {
             var e = &self.dynamic_entities.items[i];
-            // Apply gravity
-            e.vel[1] -= g * dt;
-
-            // Integrate intended motion
-            var next_pos = e.pos;
-            next_pos[0] += e.vel[0] * dt;
-            next_pos[1] += e.vel[1] * dt;
-            next_pos[2] += e.vel[2] * dt;
-
-            // Vertical collision against ground top from heightmap
-            const half_h = e.aabb_half_extents[1];
-            if (getTopFaceY(self, next_pos[0], next_pos[2])) |top_y| {
-                const bottom_next = next_pos[1] - half_h;
-                if (bottom_next < top_y) {
-                    next_pos[1] = top_y + half_h;
-                    e.vel[1] = 0;
-                    e.flags.on_ground = true;
-                } else {
-                    e.flags.on_ground = false;
-                }
-            }
-
-            e.pos = next_pos;
+            var on_ground_local: bool = e.flags.on_ground;
+            var kin: physics.EntityKinematics = .{
+                .pos = e.pos,
+                .vel = e.vel,
+                .half_extents_y = e.aabb_half_extents[1],
+                .on_ground = &on_ground_local,
+            };
+            physics.integrateStep(cfg, &kin, dt, sampler, self);
+            e.pos = kin.pos;
+            e.vel = kin.vel;
+            e.flags.on_ground = on_ground_local;
         }
     }
     fn phaseAI(self: *Simulation) void {

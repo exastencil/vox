@@ -4,6 +4,7 @@ const player = @import("player.zig");
 const constants = @import("constants");
 const gs = @import("gs");
 const sokol = @import("sokol");
+const physics = @import("physics.zig");
 const sg = sokol.gfx;
 const sapp = sokol.app;
 const sglue = sokol.glue;
@@ -2871,20 +2872,18 @@ pub const Client = struct {
         return p[0] >= min[0] and p[0] <= max[0] and p[1] >= min[1] and p[1] <= max[1] and p[2] >= min[2] and p[2] <= max[2];
     }
 
-    // Local physics step: apply same gravity and simple vertical collision as Simulation.phasePhysics
+    // Local physics step using shared routine
     fn localPhysicsStep(self: *Client, dt: f32) void {
-        const g: f32 = 9.80665;
-        // Apply gravity
-        self.local_vel[1] -= g * dt;
-        // Integrate
-        var next_pos = self.local_pos;
-        next_pos[0] += self.local_vel[0] * dt;
-        next_pos[1] += self.local_vel[1] * dt;
-        next_pos[2] += self.local_vel[2] * dt;
-
-        // Sample ground height from heightmap of loaded chunks (brief world lock)
-        const getTopFaceYLocal = struct {
-            fn call(cli: *Client, x: f32, z: f32) ?f32 {
+        const cfg: physics.PhysicsConfig = .{ .gravity = 9.80665 };
+        var kin: physics.EntityKinematics = .{
+            .pos = self.local_pos,
+            .vel = self.local_vel,
+            .half_extents_y = self.local_aabb_half_extents[1],
+            .on_ground = &self.local_on_ground,
+        };
+        const sampler = struct {
+            fn call(ctx: *anyopaque, x: f32, z: f32) ?f32 {
+                const cli: *Client = @ptrCast(@alignCast(ctx));
                 const xi: i32 = @intFromFloat(@floor(x));
                 const zi: i32 = @intFromFloat(@floor(z));
                 const cx: i32 = @divFloor(xi, @as(i32, @intCast(constants.chunk_size_x)));
@@ -2908,19 +2907,9 @@ pub const Client = struct {
                 return @as(f32, @floatFromInt(h + 1));
             }
         }.call;
-
-        const half_h = self.local_aabb_half_extents[1];
-        if (getTopFaceYLocal(self, next_pos[0], next_pos[2])) |top_y| {
-            const bottom_next = next_pos[1] - half_h;
-            if (bottom_next < top_y) {
-                next_pos[1] = top_y + half_h;
-                self.local_vel[1] = 0;
-                self.local_on_ground = true;
-            } else {
-                self.local_on_ground = false;
-            }
-        }
-        self.local_pos = next_pos;
+        physics.integrateStep(cfg, &kin, dt, sampler, self);
+        self.local_pos = kin.pos;
+        self.local_vel = kin.vel;
     }
 
     // Send movement state to SIM at most once per authoritative tick
