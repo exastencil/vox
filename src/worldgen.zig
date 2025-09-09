@@ -232,7 +232,7 @@ fn buildChunkFromBuffers(proto: *const wapi.ProtoChunk) !gs.Chunk {
     }
 
     const entities = try allocator.alloc(gs.EntityRecord, 0);
-    return .{ .pos = .{ .x = proto.pos.x, .z = proto.pos.z }, .sections = sections, .heightmaps = heightmaps, .entities = entities };
+    return .{ .pos = .{ .x = proto.pos.x, .z = proto.pos.z }, .sections = sections, .heightmaps = heightmaps, .entities = entities, .status = .full };
 }
 
 fn packBitsSet(dst: []u32, idx: usize, bits_per_index: u6, value: u32) void {

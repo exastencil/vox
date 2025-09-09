@@ -107,6 +107,7 @@ pub const Chunk = struct {
     sections: []const Section, // length == (world.sections_below + world.sections_above)
     heightmaps: Heightmaps,
     entities: []const EntityRecord, // per-chunk ownership (<= constants.entity_soft_cap_per_chunk)
+    status: ChunkStatus = .full, // runtime status; generated chunks are .full by default
 };
 
 pub const Seeds = struct {

@@ -450,51 +450,117 @@ pub const Simulation = struct {
         _ = self;
     }
     fn phasePhysics(self: *Simulation) void {
-        // Simple physics: gravity and vertical collision against world surface.
+        // Physics: gravity and AABB collisions against solid voxels.
         const dt: f32 = @floatCast(1.0 / self.target_tps);
         const cfg: physics.PhysicsConfig = .{ .gravity = 9.80665 };
 
-        // Height sampler that reads from the current world's heightmap under lock
-        const sampler = struct {
-            fn call(ctx: *anyopaque, x: f32, z: f32) ?f32 {
+        // Solid sampler that checks palette/flags; unloaded/out-of-range treated as non-solid
+        const solidSampler = struct {
+            fn call(ctx: *anyopaque, ix: i32, iy: i32, iz: i32) bool {
                 const sim: *Simulation = @ptrCast(@alignCast(ctx));
+                const world_key = "minecraft:overworld";
+                sim.worlds_mutex.lock();
+                defer sim.worlds_mutex.unlock();
+                const ws = sim.worlds_state.getPtr(world_key) orelse return false;
+                // convert to chunk/section/local coords
+                const cx: i32 = @divFloor(ix, @as(i32, @intCast(constants.chunk_size_x)));
+                const cz: i32 = @divFloor(iz, @as(i32, @intCast(constants.chunk_size_z)));
+                const lx_i: i32 = @mod(ix, @as(i32, @intCast(constants.chunk_size_x)));
+                const lz_i: i32 = @mod(iz, @as(i32, @intCast(constants.chunk_size_z)));
+                const rp = RegionPos{ .x = @divFloor(cx, 32), .z = @divFloor(cz, 32) };
+                const rs = ws.regions.getPtr(rp) orelse return false;
+                const idx_opt = rs.chunk_index.get(.{ .x = cx, .z = cz });
+                if (idx_opt == null) return false;
+                const ch = rs.chunks.items[idx_opt.?];
+                const total_y: i32 = @intCast(ch.sections.len * constants.section_height);
+                const ny0: i32 = iy + @as(i32, @intCast(ws.sections_below)) * @as(i32, @intCast(constants.section_height));
+                if (ny0 < 0 or ny0 >= total_y) return false;
+                const sy: usize = @intCast(@divTrunc(ny0, @as(i32, @intCast(constants.section_height))));
+                const ly: usize = @intCast(@mod(ny0, @as(i32, @intCast(constants.section_height))));
+                if (sy >= ch.sections.len) return false;
+                const s = ch.sections[sy];
+                // local helper to unpack bitpacked indices (little-endian within u32 words)
+                const unpackBitsGetLocal = struct {
+                    fn call(bits: []const u32, index: usize, bits_per_index: u6) u32 {
+                        const bpi_usize: usize = @intCast(bits_per_index);
+                        const bit_index: usize = index * bpi_usize;
+                        const word_index: usize = bit_index / 32;
+                        const bit_offset_u: usize = bit_index % 32;
+                        const bit_offset: u5 = @intCast(bit_offset_u);
+                        const mask: u32 = if (bpi_usize >= 32) 0xFFFF_FFFF else ((@as(u32, 1) << @intCast(bits_per_index)) - 1);
+                        var value: u32 = bits[word_index] >> bit_offset;
+                        const bits_in_word: usize = 32 - bit_offset_u;
+                        if (bits_in_word < bpi_usize) {
+                            value |= bits[word_index + 1] << @intCast(bits_in_word);
+                            return value & mask;
+                        } else {
+                            return value & mask;
+                        }
+                    }
+                }.call;
+                // compute bits-per-index for this palette length (at least 1 bit)
+                const pal_len: usize = s.palette.len;
+                var tmp_bpi: u6 = 1;
+                if (pal_len > 1) {
+                    var v: usize = pal_len - 1;
+                    var count: u6 = 0;
+                    while (v != 0) : (v >>= 1) count += 1;
+                    if (count == 0) count = 1;
+                    tmp_bpi = count;
+                }
+                const bpi: u6 = tmp_bpi;
+                const lx: usize = @intCast(lx_i);
+                const lz: usize = @intCast(lz_i);
+                if (lx >= constants.chunk_size_x or lz >= constants.chunk_size_z) return false;
+                const idx3d: usize = lz * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
+                const pidx: usize = @intCast(unpackBitsGetLocal(s.blocks_indices_bits, idx3d, bpi));
+                if (pidx >= s.palette.len) return false;
+                const bid: u32 = s.palette[pidx];
+                if (bid == 0) return false;
+                // respect collision flag from registry if known
+                if (bid < sim.reg.blocks.items.len) {
+                    return sim.reg.blocks.items[@intCast(bid)].full_block_collision;
+                }
+                // unknown: treat as solid conservatively
+                return true;
+            }
+        }.call;
+
+        // Helper: check that the chunk at (x,z) is present with at least one section
+        const chunkLoadedAt = struct {
+            fn call(sim: *Simulation, x: f32, z: f32) bool {
                 const xi: i32 = @intFromFloat(@floor(x));
                 const zi: i32 = @intFromFloat(@floor(z));
                 const cx: i32 = @divFloor(xi, @as(i32, @intCast(constants.chunk_size_x)));
                 const cz: i32 = @divFloor(zi, @as(i32, @intCast(constants.chunk_size_z)));
-                const lx: i32 = @mod(xi, @as(i32, @intCast(constants.chunk_size_x)));
-                const lz: i32 = @mod(zi, @as(i32, @intCast(constants.chunk_size_z)));
-                const world_key = "minecraft:overworld"; // single-world prototype
-
+                const world_key = "minecraft:overworld";
                 sim.worlds_mutex.lock();
                 defer sim.worlds_mutex.unlock();
-                const ws = sim.worlds_state.getPtr(world_key) orelse return null;
+                const ws = sim.worlds_state.getPtr(world_key) orelse return false;
                 const rp = RegionPos{ .x = @divFloor(cx, 32), .z = @divFloor(cz, 32) };
-                const rs = ws.regions.getPtr(rp) orelse return null;
+                const rs = ws.regions.getPtr(rp) orelse return false;
                 const idx_opt = rs.chunk_index.get(.{ .x = cx, .z = cz });
-                if (idx_opt == null) return null;
+                if (idx_opt == null) return false;
                 const ch = rs.chunks.items[idx_opt.?];
-                const lx_u: usize = @intCast(lx);
-                const lz_u: usize = @intCast(lz);
-                if (lx_u >= 16 or lz_u >= 16) return null;
-                const h = ch.heightmaps.world_surface[lz_u * 16 + lx_u];
-                // Treat negative heights as valid surface when the world has sections below 0
-                if (h < 0 and ws.sections_below == 0) return null;
-                return @as(f32, @floatFromInt(h + 1));
+                return ch.status == .full;
             }
         }.call;
 
         var i: usize = 0;
         while (i < self.dynamic_entities.items.len) : (i += 1) {
             var e = &self.dynamic_entities.items[i];
+            // Wait for player chunk to be loaded before ticking physics to avoid falling through void
+            if (!chunkLoadedAt(self, e.pos[0], e.pos[2])) {
+                continue;
+            }
             var on_ground_local: bool = e.flags.on_ground;
             var kin: physics.EntityKinematics = .{
                 .pos = e.pos,
                 .vel = e.vel,
-                .half_extents_y = e.aabb_half_extents[1],
+                .half_extents = e.aabb_half_extents,
                 .on_ground = &on_ground_local,
             };
-            physics.integrateStep(cfg, &kin, dt, sampler, self);
+            physics.integrateStep(cfg, &kin, dt, solidSampler, self);
             e.pos = kin.pos;
             e.vel = kin.vel;
             e.flags.on_ground = on_ground_local;

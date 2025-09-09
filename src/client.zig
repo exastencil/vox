@@ -3786,40 +3786,69 @@ pub const Client = struct {
     // Local physics step using shared routine
     fn localPhysicsStep(self: *Client, dt: f32) void {
         const cfg: physics.PhysicsConfig = .{ .gravity = 9.80665 };
-        var kin: physics.EntityKinematics = .{
-            .pos = self.local_pos,
-            .vel = self.local_vel,
-            .half_extents_y = self.local_aabb_half_extents[1],
-            .on_ground = &self.local_on_ground,
-        };
-        const sampler = struct {
-            fn call(ctx: *anyopaque, x: f32, z: f32) ?f32 {
-                const cli: *Client = @ptrCast(@alignCast(ctx));
+        // If the player's current chunk isn't loaded yet, pause client-side physics to avoid visual falling
+        const chunkLoadedAt = struct {
+            fn call(cli: *Client, x: f32, z: f32) bool {
                 const xi: i32 = @intFromFloat(@floor(x));
                 const zi: i32 = @intFromFloat(@floor(z));
                 const cx: i32 = @divFloor(xi, @as(i32, @intCast(constants.chunk_size_x)));
                 const cz: i32 = @divFloor(zi, @as(i32, @intCast(constants.chunk_size_z)));
-                const lx: i32 = @mod(xi, @as(i32, @intCast(constants.chunk_size_x)));
-                const lz: i32 = @mod(zi, @as(i32, @intCast(constants.chunk_size_z)));
                 const wk = "minecraft:overworld";
                 cli.sim.worlds_mutex.lock();
                 defer cli.sim.worlds_mutex.unlock();
-                const ws = cli.sim.worlds_state.getPtr(wk) orelse return null;
+                const ws = cli.sim.worlds_state.getPtr(wk) orelse return false;
                 const rp = simulation.RegionPos{ .x = @divFloor(cx, 32), .z = @divFloor(cz, 32) };
-                const rs = ws.regions.getPtr(rp) orelse return null;
-                const idx_opt = rs.chunk_index.get(.{ .x = cx, .z = cz });
-                if (idx_opt == null) return null;
-                const ch = rs.chunks.items[idx_opt.?];
-                const lx_u: usize = @intCast(lx);
-                const lz_u: usize = @intCast(lz);
-                if (lx_u >= 16 or lz_u >= 16) return null;
-                const h = ch.heightmaps.world_surface[lz_u * 16 + lx_u];
-                // Treat negative heights as valid surface when the world has sections below 0
-                if (h < 0 and ws.sections_below == 0) return null;
-                return @as(f32, @floatFromInt(h + 1));
+                const rs = ws.regions.getPtr(rp) orelse return false;
+                const cidx = rs.chunk_index.get(.{ .x = cx, .z = cz }) orelse return false;
+                const ch = rs.chunks.items[cidx];
+                return ch.status == .full;
             }
         }.call;
-        physics.integrateStep(cfg, &kin, dt, sampler, self);
+        if (!chunkLoadedAt(self, self.local_pos[0], self.local_pos[2])) return;
+        var kin: physics.EntityKinematics = .{
+            .pos = self.local_pos,
+            .vel = self.local_vel,
+            .half_extents = self.local_aabb_half_extents,
+            .on_ground = &self.local_on_ground,
+        };
+        const solidSampler = struct {
+            fn call(ctx: *anyopaque, ix: i32, iy: i32, iz: i32) bool {
+                const cli: *Client = @ptrCast(@alignCast(ctx));
+                const wk = "minecraft:overworld";
+                cli.sim.worlds_mutex.lock();
+                defer cli.sim.worlds_mutex.unlock();
+                const ws = cli.sim.worlds_state.getPtr(wk) orelse return false;
+                const cx: i32 = @divFloor(ix, @as(i32, @intCast(constants.chunk_size_x)));
+                const cz: i32 = @divFloor(iz, @as(i32, @intCast(constants.chunk_size_z)));
+                const lx_i: i32 = @mod(ix, @as(i32, @intCast(constants.chunk_size_x)));
+                const lz_i: i32 = @mod(iz, @as(i32, @intCast(constants.chunk_size_z)));
+                const rp = simulation.RegionPos{ .x = @divFloor(cx, 32), .z = @divFloor(cz, 32) };
+                const rs = ws.regions.getPtr(rp) orelse return false;
+                const cidx = rs.chunk_index.get(.{ .x = cx, .z = cz }) orelse return false;
+                const ch = rs.chunks.items[cidx];
+                const total_y: i32 = @intCast(ch.sections.len * constants.section_height);
+                const ny0: i32 = iy + @as(i32, @intCast(ws.sections_below)) * @as(i32, @intCast(constants.section_height));
+                if (ny0 < 0 or ny0 >= total_y) return false;
+                const sy: usize = @intCast(@divTrunc(ny0, @as(i32, @intCast(constants.section_height))));
+                const ly: usize = @intCast(@mod(ny0, @as(i32, @intCast(constants.section_height))));
+                if (sy >= ch.sections.len) return false;
+                const s = ch.sections[sy];
+                const bpi: u6 = bitsFor(s.palette.len);
+                const lx: usize = @intCast(lx_i);
+                const lz: usize = @intCast(lz_i);
+                if (lx >= constants.chunk_size_x or lz >= constants.chunk_size_z) return false;
+                const idx3d: usize = lz * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
+                const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx3d, bpi));
+                if (pidx >= s.palette.len) return false;
+                const bid: u32 = s.palette[pidx];
+                if (bid == 0) return false;
+                if (bid < cli.sim.reg.blocks.items.len) {
+                    return cli.sim.reg.blocks.items[@intCast(bid)].full_block_collision;
+                }
+                return true;
+            }
+        }.call;
+        physics.integrateStep(cfg, &kin, dt, solidSampler, self);
         self.local_pos = kin.pos;
         self.local_vel = kin.vel;
     }
@@ -3881,8 +3910,9 @@ pub const Client = struct {
         const hz = self.local_aabb_half_extents[2];
         const x0: f32 = self.local_pos[0] - hx;
         const x1: f32 = self.local_pos[0] + hx;
-        const y0: f32 = self.local_pos[1];
-        const y1: f32 = self.local_pos[1] + 2.0 * hy;
+        // Physics pos[1] is center Y; debug box should span [center - hy, center + hy]
+        const y0: f32 = self.local_pos[1] - hy;
+        const y1: f32 = self.local_pos[1] + hy;
         const z0: f32 = self.local_pos[2] - hz;
         const z1: f32 = self.local_pos[2] + hz;
         var verts: [36]Vertex = undefined;
