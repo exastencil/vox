@@ -648,6 +648,14 @@ pub const Client = struct {
     local_orient_initialized: bool = false,
     last_look_tick_sent: u64 = 0,
 
+    // Local predicted player kinematics used for rendering
+    local_pos: [3]f32 = .{ 0, 0, 0 },
+    local_vel: [3]f32 = .{ 0, 0, 0 },
+    local_aabb_half_extents: [3]f32 = .{ 0.375, 0.875, 0.2 }, // keep in sync with Simulation default
+    local_on_ground: bool = false,
+    last_move_tick_sent: u64 = 0,
+    jump_pending: bool = false,
+
     // Debug: track last observed position for delta reporting
     dbg_last_pos: [3]f32 = .{ 0, 0, 0 },
 
@@ -913,8 +921,9 @@ pub const Client = struct {
         self.bind.views[1] = self.grass_view;
         self.bind.samplers[2] = self.sampler;
 
-        // Initialize camera from player entity if available
-        self.updateCameraFromPlayer();
+        // Initialize local state and camera from player entity if available
+        self.initLocalFromSim();
+        self.updateCameraFromLocal();
         // Lock and enable raw mouse input on startup
         sapp.lockMouse(true);
         setRawMouse(true);
@@ -1149,8 +1158,9 @@ pub const Client = struct {
         if (!has_pos) return;
         if (self.sim.isChunkLoadedAt(wk, .{ .x = cx, .z = cz })) {
             self.ready = true;
-            // Initialize camera now that the world around the player exists
-            self.updateCameraFromPlayer();
+            // Initialize local player and camera now that the world around the player exists
+            self.initLocalFromSim();
+            self.updateCameraFromLocal();
         }
     }
 
@@ -1192,16 +1202,16 @@ pub const Client = struct {
     }
 
     pub fn frame(self: *Client) void {
-        // Keep camera mirrored to player each frame for now
-        self.updateCameraFromPlayer();
         // Bump frame index (used for culling hysteresis)
         self.frame_index +%= 1;
 
-        // FPS timing
+        // Frame timing and FPS
         const t_now: i128 = std.time.nanoTimestamp();
+        var dt_s: f32 = 0.0;
         if (self.fps_last_ns != 0) {
             const dt_ns: i128 = t_now - self.fps_last_ns;
             if (dt_ns > 0) {
+                dt_s = @as(f32, @floatFromInt(dt_ns)) / 1_000_000_000.0;
                 self.fps_accum_ns += dt_ns;
                 self.fps_accum_frames += 1;
                 if (self.fps_accum_ns >= 500_000_000) { // 0.5s window
@@ -1270,10 +1280,14 @@ pub const Client = struct {
             return;
         }
 
-        // Apply movement inputs to player entity (client-side write into sim)
-        self.applyMovementInputs();
-        // Send local look to simulation at most once per tick
+        // Apply movement inputs locally and predict physics every render frame
+        self.applyMovementInputsLocal();
+        const dt_clamped: f32 = std.math.clamp(dt_s, 0.0, 0.05);
+        if (dt_clamped > 0.0) self.localPhysicsStep(dt_clamped);
+        self.updateCameraFromLocal();
+        // Notify simulation no more than once per tick
         self.maybeSendLookToSim();
+        self.maybeSendMoveToSim();
 
         // Prepare MVP and frustum before building the mesh (used for culling)
         const w_px: f32 = @floatFromInt(sapp.width());
@@ -1647,18 +1661,20 @@ pub const Client = struct {
         self.sim.connections_mutex.unlock();
     }
 
-    // Update camera to mirror the player's entity position; keep orientation client-local
-    fn updateCameraFromPlayer(self: *Client) void {
+    // Initialize local predicted player state from the authoritative simulation
+    fn initLocalFromSim(self: *Client) void {
         self.sim.connections_mutex.lock();
         defer self.sim.connections_mutex.unlock();
         const idx_opt = self.sim.entity_by_player.get(self.player_id);
         if (idx_opt) |idx| {
             if (idx < self.sim.dynamic_entities.items.len) {
                 const e = self.sim.dynamic_entities.items[idx];
-                const eye_y: f32 = e.pos[1] + e.aabb_half_extents[1];
-                self.camera.pos = .{ e.pos[0], eye_y, e.pos[2] };
+                self.local_pos = e.pos;
+                self.local_vel = e.vel;
+                self.local_aabb_half_extents = e.aabb_half_extents;
+                self.local_on_ground = e.flags.on_ground;
                 if (!self.local_orient_initialized) {
-                    // Seed local orientation from sim once
+                    // Seed local orientation from sim
                     const dx = e.look_dir[0];
                     const dy = e.look_dir[1];
                     const dz = e.look_dir[2];
@@ -1677,80 +1693,68 @@ pub const Client = struct {
                         self.local_orient_initialized = true;
                     }
                 }
-                // Always orient camera from local yaw/pitch, zero roll
-                self.camera.setYawPitch(self.local_yaw, self.local_pitch);
-                self.camera.roll = 0;
             }
         }
     }
 
-    // Apply currently-pressed movement keys to the player entity
-    fn applyMovementInputs(self: *Client) void {
-        // Compute desired horizontal velocity from inputs relative to local yaw
-        self.sim.connections_mutex.lock();
-        defer self.sim.connections_mutex.unlock();
-        const idx_opt = self.sim.entity_by_player.get(self.player_id);
-        if (idx_opt) |idx| {
-            if (idx < self.sim.dynamic_entities.items.len) {
-                var e = &self.sim.dynamic_entities.items[idx];
-                // While moving, keep facing synced to the horizontal component of the look vector
-                if (self.move_forward or self.move_back or self.move_left or self.move_right) {
-                    // Sync facing to camera forward projected onto XZ
-                    const lx = self.local_dir[0];
-                    const lz = self.local_dir[2];
-                    const llen: f32 = @sqrt(lx * lx + lz * lz);
-                    if (llen > 0.0001) {
-                        e.facing_dir_xz = .{ lx / llen, lz / llen };
-                    }
-                }
-                // Derive forward from yaw only (horizontal heading), independent of pitch
-                const fwd_x: f32 = -@cos(self.local_yaw);
-                const fwd_z: f32 = @sin(self.local_yaw);
-                // Screen-right (world right) is cross(forward, up) on XZ: (-fwd_z, fwd_x)
-                const right_x: f32 = -fwd_z;
-                const right_z: f32 = fwd_x;
+    // Update camera to mirror the client-local predicted player position; keep orientation client-local
+    fn updateCameraFromLocal(self: *Client) void {
+        const eye_y: f32 = self.local_pos[1] + self.local_aabb_half_extents[1];
+        self.camera.pos = .{ self.local_pos[0], eye_y, self.local_pos[2] };
+        self.camera.setYawPitch(self.local_yaw, self.local_pitch);
+        self.camera.roll = 0;
+    }
 
-                var vx: f32 = 0;
-                var vz: f32 = 0;
-                if (self.move_forward) {
-                    vx += fwd_x;
-                    vz += fwd_z;
-                }
-                if (self.move_back) {
-                    vx -= fwd_x;
-                    vz -= fwd_z;
-                }
-                if (self.move_right) {
-                    vx += right_x;
-                    vz += right_z;
-                }
-                if (self.move_left) {
-                    vx -= right_x;
-                    vz -= right_z;
-                }
-                // Normalize if any input
-                const mag: f32 = @sqrt(vx * vx + vz * vz);
-                if (mag > 0.0001) {
-                    vx /= mag;
-                    vz /= mag;
-                }
-                const speed: f32 = 4.5; // m/s walking speed
-                e.vel[0] = vx * speed;
-                e.vel[2] = vz * speed;
-                // While moving, ensure entity yaw aligns to facing on XZ (optional; keeps model heading)
-                if (self.move_forward or self.move_back or self.move_left or self.move_right) {
-                    const facing_yaw: f32 = std.math.atan2(e.facing_dir_xz[1], e.facing_dir_xz[0]);
-                    e.yaw_pitch_roll = .{ facing_yaw, 0, 0 };
-                }
-                // Jump impulse on edge press if on ground
-                if (self.jump_pressed and e.flags.on_ground) {
-                    const g: f32 = 9.80665;
-                    const target_h: f32 = 1.1; // slightly over 1 block
-                    const v0: f32 = @sqrt(2.0 * g * target_h);
-                    e.vel[1] = v0;
-                    e.flags.on_ground = false;
-                }
-            }
+    // Apply currently-pressed movement keys to the client-local predicted player
+    fn applyMovementInputsLocal(self: *Client) void {
+        // Derive forward from yaw only (horizontal heading), independent of pitch
+        const fwd_x: f32 = -@cos(self.local_yaw);
+        const fwd_z: f32 = @sin(self.local_yaw);
+        // Screen-right (world right) is cross(forward, up) on XZ: (-fwd_z, fwd_x)
+        const right_x: f32 = -fwd_z;
+        const right_z: f32 = fwd_x;
+
+        var vx: f32 = 0;
+        var vz: f32 = 0;
+        if (self.move_forward) {
+            vx += fwd_x;
+            vz += fwd_z;
+        }
+        if (self.move_back) {
+            vx -= fwd_x;
+            vz -= fwd_z;
+        }
+        if (self.move_right) {
+            vx += right_x;
+            vz += right_z;
+        }
+        if (self.move_left) {
+            vx -= right_x;
+            vz -= right_z;
+        }
+        // Normalize if any input
+        const mag: f32 = @sqrt(vx * vx + vz * vz);
+        if (mag > 0.0001) {
+            vx /= mag;
+            vz /= mag;
+        }
+        const speed: f32 = 4.5; // m/s walking speed
+        self.local_vel[0] = vx * speed;
+        self.local_vel[2] = vz * speed;
+
+        // If moving, keep facing synced to the horizontal component of the look vector
+        if (self.move_forward or self.move_back or self.move_left or self.move_right) {
+            // Note: facing_dir_xz is only written back to SIM in maybeSendMoveToSim()
+        }
+
+        // Jump impulse on edge press if on ground (client-local)
+        if (self.jump_pressed and self.local_on_ground) {
+            const g: f32 = 9.80665;
+            const target_h: f32 = 1.1; // slightly over 1 block
+            const v0: f32 = @sqrt(2.0 * g * target_h);
+            self.local_vel[1] = v0;
+            self.local_on_ground = false;
+            self.jump_pending = true; // request SIM jump on next tick
         }
         // consume jump edge
         self.jump_pressed = false;
@@ -2776,17 +2780,11 @@ pub const Client = struct {
         self.move_back = false;
         self.move_left = false;
         self.move_right = false;
-        // zero horizontal velocity
-        self.sim.connections_mutex.lock();
-        const idx_opt = self.sim.entity_by_player.get(self.player_id);
-        if (idx_opt) |idx| {
-            if (idx < self.sim.dynamic_entities.items.len) {
-                var e = &self.sim.dynamic_entities.items[idx];
-                e.vel[0] = 0;
-                e.vel[2] = 0;
-            }
-        }
-        self.sim.connections_mutex.unlock();
+        // zero horizontal velocity (local)
+        self.local_vel[0] = 0;
+        self.local_vel[2] = 0;
+        // Optionally also zero on SIM at next tick
+        self.jump_pending = false;
     }
 
     // Basic 4x4 column-major matrix helpers
@@ -2871,6 +2869,97 @@ pub const Client = struct {
 
     fn aabbContainsPoint(min: [3]f32, max: [3]f32, p: [3]f32) bool {
         return p[0] >= min[0] and p[0] <= max[0] and p[1] >= min[1] and p[1] <= max[1] and p[2] >= min[2] and p[2] <= max[2];
+    }
+
+    // Local physics step: apply same gravity and simple vertical collision as Simulation.phasePhysics
+    fn localPhysicsStep(self: *Client, dt: f32) void {
+        const g: f32 = 9.80665;
+        // Apply gravity
+        self.local_vel[1] -= g * dt;
+        // Integrate
+        var next_pos = self.local_pos;
+        next_pos[0] += self.local_vel[0] * dt;
+        next_pos[1] += self.local_vel[1] * dt;
+        next_pos[2] += self.local_vel[2] * dt;
+
+        // Sample ground height from heightmap of loaded chunks (brief world lock)
+        const getTopFaceYLocal = struct {
+            fn call(cli: *Client, x: f32, z: f32) ?f32 {
+                const xi: i32 = @intFromFloat(@floor(x));
+                const zi: i32 = @intFromFloat(@floor(z));
+                const cx: i32 = @divFloor(xi, @as(i32, @intCast(constants.chunk_size_x)));
+                const cz: i32 = @divFloor(zi, @as(i32, @intCast(constants.chunk_size_z)));
+                const lx: i32 = @mod(xi, @as(i32, @intCast(constants.chunk_size_x)));
+                const lz: i32 = @mod(zi, @as(i32, @intCast(constants.chunk_size_z)));
+                const wk = "minecraft:overworld";
+                cli.sim.worlds_mutex.lock();
+                defer cli.sim.worlds_mutex.unlock();
+                const ws = cli.sim.worlds_state.getPtr(wk) orelse return null;
+                const rp = simulation.RegionPos{ .x = @divFloor(cx, 32), .z = @divFloor(cz, 32) };
+                const rs = ws.regions.getPtr(rp) orelse return null;
+                const idx_opt = rs.chunk_index.get(.{ .x = cx, .z = cz });
+                if (idx_opt == null) return null;
+                const ch = rs.chunks.items[idx_opt.?];
+                const lx_u: usize = @intCast(lx);
+                const lz_u: usize = @intCast(lz);
+                if (lx_u >= 16 or lz_u >= 16) return null;
+                const h = ch.heightmaps.world_surface[lz_u * 16 + lx_u];
+                if (h < 0) return null;
+                return @as(f32, @floatFromInt(h + 1));
+            }
+        }.call;
+
+        const half_h = self.local_aabb_half_extents[1];
+        if (getTopFaceYLocal(self, next_pos[0], next_pos[2])) |top_y| {
+            const bottom_next = next_pos[1] - half_h;
+            if (bottom_next < top_y) {
+                next_pos[1] = top_y + half_h;
+                self.local_vel[1] = 0;
+                self.local_on_ground = true;
+            } else {
+                self.local_on_ground = false;
+            }
+        }
+        self.local_pos = next_pos;
+    }
+
+    // Send movement state to SIM at most once per authoritative tick
+    fn maybeSendMoveToSim(self: *Client) void {
+        const snap = self.pollSnapshot().*;
+        if (snap.tick == self.last_move_tick_sent) return;
+        self.last_move_tick_sent = snap.tick;
+        self.sim.connections_mutex.lock();
+        const idx_opt = self.sim.entity_by_player.get(self.player_id);
+        if (idx_opt) |idx| {
+            if (idx < self.sim.dynamic_entities.items.len) {
+                var e = &self.sim.dynamic_entities.items[idx];
+                // Horizontal velocity from local prediction
+                e.vel[0] = self.local_vel[0];
+                e.vel[2] = self.local_vel[2];
+                // Apply jump impulse if pending (server will clamp by on_ground)
+                if (self.jump_pending) {
+                    const g2: f32 = 9.80665;
+                    const target_h: f32 = 1.1;
+                    const v0: f32 = @sqrt(2.0 * g2 * target_h);
+                    e.vel[1] = v0;
+                    e.flags.on_ground = false;
+                }
+                // Keep facing aligned to camera forward projected onto XZ when moving
+                if (self.move_forward or self.move_back or self.move_left or self.move_right) {
+                    const lx = self.local_dir[0];
+                    const lz = self.local_dir[2];
+                    const llen: f32 = @sqrt(lx * lx + lz * lz);
+                    if (llen > 0.0001) {
+                        e.facing_dir_xz = .{ lx / llen, lz / llen };
+                        const facing_yaw: f32 = std.math.atan2(e.facing_dir_xz[1], e.facing_dir_xz[0]);
+                        e.yaw_pitch_roll = .{ facing_yaw, 0, 0 };
+                    }
+                }
+            }
+        }
+        self.sim.connections_mutex.unlock();
+        // clear one-shot jump after sending this tick
+        self.jump_pending = false;
     }
 
     fn makePerspective(fovy_radians: f32, aspect: f32, znear: f32, zfar: f32) [16]f32 {
