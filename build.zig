@@ -121,6 +121,11 @@ pub fn build(b: *Build) !void {
     const exe_full = b.addExecutable(.{ .name = "vox-aetatum", .root_module = root_mod_full });
     const exe_server = b.addExecutable(.{ .name = "vox-server", .root_module = root_mod_server });
 
+    // Link macOS frameworks for native cursor warping when targeting macOS
+    if (target.result.os.tag == .macos) {
+        exe_full.linkFramework("CoreGraphics");
+    }
+
     // No-op: modules index is created on disk above before compiling
 
     // Shader generation (sokol-shdc) — required by full only

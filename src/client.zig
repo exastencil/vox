@@ -10,6 +10,24 @@ const sapp = sokol.app;
 const sglue = sokol.glue;
 const sdtx = sokol.debugtext;
 const shd_mod = @import("shaders/chunk_shd.zig");
+const builtin = @import("builtin");
+
+// macOS-only: warp the mouse cursor to a point that is guaranteed to be inside our app window.
+// For now, we use the center of the main display, which is typically within the window
+// (our window defaults to 1920x1080 and is centered on launch). This avoids the first click
+// going to another app if the cursor started outside our window.
+inline fn macosWarpCursorIntoAppWindow() void {
+    if (builtin.os.tag != .macos) return;
+    const cg = @cImport({
+        @cInclude("CoreGraphics/CoreGraphics.h");
+    });
+    const display = cg.CGMainDisplayID();
+    const bounds = cg.CGDisplayBounds(display);
+    const cx: cg.CGFloat = bounds.origin.x + (bounds.size.width / 2.0);
+    const cy: cg.CGFloat = bounds.origin.y + (bounds.size.height / 2.0);
+    const pt = cg.CGPointMake(cx, cy);
+    _ = cg.CGWarpMouseCursorPosition(pt);
+}
 
 fn loadOrFallback(allocator: std.mem.Allocator, path: []const u8) sg.Image {
     const png = @import("png.zig");
@@ -1518,7 +1536,8 @@ pub const Client = struct {
             // Initialize local player and camera now that the surrounding world exists
             self.initLocalFromSim();
             self.control_schemes[self.current_scheme].updateCamera(self);
-            // Now that we are ready, capture the mouse and enable raw input
+            // Now that we are ready, warp the cursor inside the app (macOS) and capture the mouse
+            macosWarpCursorIntoAppWindow();
             sapp.lockMouse(true);
             setRawMouse(true);
         }
@@ -1881,8 +1900,26 @@ pub const Client = struct {
     }
 
     pub fn event(self: *Client, ev: sapp.Event) void {
-        // Ignore all input until the client is ready (prevents affecting the simulation while connecting/loading)
+        // Ensure mouse lock state is managed even before the client is fully ready.
         if (!self.ready) {
+            switch (ev.type) {
+                .FOCUSED => {
+                    // On macOS, the system may require a user interaction before lock fully takes effect.
+                    // Warp the cursor inside the app to ensure the next click cannot hit another app.
+                    macosWarpCursorIntoAppWindow();
+                    // Lock the mouse immediately when the window gains focus to avoid stray first clicks
+                    sapp.lockMouse(true);
+                    setRawMouse(true);
+                },
+                .UNFOCUSED => {
+                    // Always release on focus loss
+                    sapp.lockMouse(false);
+                    setRawMouse(false);
+                    self.clearMovementInputs();
+                },
+                else => {},
+            }
+            // Ignore all other input until the client is ready (prevents affecting the simulation while connecting/loading)
             return;
         }
         switch (ev.type) {
@@ -1940,6 +1977,8 @@ pub const Client = struct {
                 }
             },
             .FOCUSED => {
+                // On macOS, warp the cursor inside the app window to prevent the first click going elsewhere
+                macosWarpCursorIntoAppWindow();
                 // Lock the mouse when the window gains focus
                 sapp.lockMouse(true);
                 // Enable raw mouse input if supported
@@ -1964,6 +2003,8 @@ pub const Client = struct {
             .MOUSE_DOWN => {
                 // If the mouse is unlocked (e.g., after ESC), clicking the window should re-lock it
                 if (!sapp.mouseLocked()) {
+                    // Before re-locking, warp cursor inside window on macOS to keep interaction local
+                    macosWarpCursorIntoAppWindow();
                     sapp.lockMouse(true);
                     setRawMouse(true);
                 } else {
