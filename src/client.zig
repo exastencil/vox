@@ -1349,7 +1349,8 @@ pub const Client = struct {
                         const xi: i32 = @intCast(x);
                         const zi: i32 = @intCast(z);
                         const h = hm[z * 16 + x];
-                        if (h < 0) continue; // empty column
+                        // Allow negative tops when the world has sections below 0; still skip if world has no below sections
+                        if (h < 0 and ws.sections_below == 0) continue; // empty column in worlds with no below-zero terrain
                         const y_top: f32 = @floatFromInt(h + 1);
                         const x0: f32 = base_x + @as(f32, @floatFromInt(x));
                         const x1: f32 = x0 + 1.0;
@@ -1526,7 +1527,7 @@ pub const Client = struct {
     fn startMesherIfNeeded(self: *Client) void {
         if (!self.mesher_started) {
             self.mesher_running = true;
-            const thread_count: usize = 1;
+            const thread_count: usize = 4;
             self.mesher_threads.ensureTotalCapacity(self.allocator, thread_count) catch return;
             var ti: usize = 0;
             while (ti < thread_count) : (ti += 1) {
@@ -2508,6 +2509,38 @@ pub const Client = struct {
                                     if (self.region_mesh_cache.getPtr(rp_hit)) |rm| {
                                         rm.dirty = true;
                                     }
+                                    // Also dirty neighbor region meshes if we edited a chunk-edge column,
+                                    // since their meshing samples cross-chunk solids.
+                                    var dxs: [2]i32 = .{ 0, 0 };
+                                    var dzs: [2]i32 = .{ 0, 0 };
+                                    var ncount: usize = 0;
+                                    if (hit_lx == 0) {
+                                        dxs[ncount] = -1;
+                                        dzs[ncount] = 0;
+                                        ncount += 1;
+                                    }
+                                    if (hit_lx == (@as(usize, @intCast(constants.chunk_size_x)) - 1)) {
+                                        dxs[ncount] = 1;
+                                        dzs[ncount] = 0;
+                                        ncount += 1;
+                                    }
+                                    if (hit_lz == 0) {
+                                        dxs[ncount] = 0;
+                                        dzs[ncount] = -1;
+                                        ncount += 1;
+                                    }
+                                    if (hit_lz == (@as(usize, @intCast(constants.chunk_size_z)) - 1)) {
+                                        dxs[ncount] = 0;
+                                        dzs[ncount] = 1;
+                                        ncount += 1;
+                                    }
+                                    var ni: usize = 0;
+                                    while (ni < ncount) : (ni += 1) {
+                                        const ncx: i32 = hit_cx + dxs[ni];
+                                        const ncz: i32 = hit_cz + dzs[ni];
+                                        const nrp = simulation.RegionPos{ .x = @divFloor(ncx, 32), .z = @divFloor(ncz, 32) };
+                                        if (self.region_mesh_cache.getPtr(nrp)) |rmn| rmn.dirty = true;
+                                    }
                                 }
                             }
                         }
@@ -2992,7 +3025,45 @@ pub const Client = struct {
             lz -= @as(i32, @intCast(constants.chunk_size_z));
         }
         const idx_opt = snapGetChunkIndex(snap, cx, cz);
-        if (idx_opt == null) return true; // outside snapshot => treat as solid to avoid seams
+        if (idx_opt == null) {
+            // Outside this region snapshot: fall back to reading the live world state under lock
+            // so we don't create seams at region borders.
+            self.sim.worlds_mutex.lock();
+            const ws_ptr = self.sim.worlds_state.getPtr("minecraft:overworld");
+            if (ws_ptr) |ws_live| {
+                const rp = simulation.RegionPos{ .x = @divFloor(cx, 32), .z = @divFloor(cz, 32) };
+                if (ws_live.regions.getPtr(rp)) |rs_live| {
+                    if (rs_live.chunk_index.get(.{ .x = cx, .z = cz })) |cidx_live| {
+                        const ch_live = rs_live.chunks.items[cidx_live];
+                        const total_y_live: i32 = @intCast(ch_live.sections.len * constants.section_height);
+                        const ny0_live: i32 = abs_y_in + @as(i32, @intCast(snap.sections_below)) * @as(i32, @intCast(constants.section_height));
+                        if (!(ny0_live < 0 or ny0_live >= total_y_live)) {
+                            const sy_live: usize = @intCast(@divTrunc(ny0_live, @as(i32, @intCast(constants.section_height))));
+                            const ly_live: usize = @intCast(@mod(ny0_live, @as(i32, @intCast(constants.section_height))));
+                            if (sy_live < ch_live.sections.len) {
+                                const s_live = ch_live.sections[sy_live];
+                                const bpi_live: u6 = bitsFor(s_live.palette.len);
+                                const idx3d_live: usize = @as(usize, @intCast(lz)) * (constants.chunk_size_x * constants.section_height) + @as(usize, @intCast(lx)) * constants.section_height + ly_live;
+                                const pidx_live: usize = @intCast(unpackBitsGet(s_live.blocks_indices_bits, idx3d_live, bpi_live));
+                                if (pidx_live < s_live.palette.len) {
+                                    const bid_live: u32 = s_live.palette[pidx_live];
+                                    if (bid_live == 0) {
+                                        self.sim.worlds_mutex.unlock();
+                                        return false;
+                                    }
+                                    const solid_live: bool = if (bid_live < self.sim.reg.blocks.items.len) self.sim.reg.blocks.items[@intCast(bid_live)].full_block_collision else true;
+                                    self.sim.worlds_mutex.unlock();
+                                    return solid_live;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            self.sim.worlds_mutex.unlock();
+            // Default: treat as solid if we couldn't read neighbor
+            return true;
+        }
         const ch = snap.chunks[idx_opt.?];
         const total_y: i32 = @as(i32, @intCast(snap.section_count_y)) * @as(i32, @intCast(constants.section_height));
         const ny0 = abs_y_in + @as(i32, @intCast(snap.sections_below)) * @as(i32, @intCast(constants.section_height));
@@ -3336,7 +3407,9 @@ pub const Client = struct {
         defer regions.deinit(self.allocator);
         self.sim.worlds_mutex.lock();
         const ws = self.sim.worlds_state.getPtr(wk);
+        var world_sections_below: u16 = 0;
         if (ws) |ws_ptr| {
+            world_sections_below = ws_ptr.sections_below;
             var reg_it = ws_ptr.regions.iterator();
             while (reg_it.next()) |rentry| {
                 const rpos = rentry.key_ptr.*;
@@ -3378,8 +3451,9 @@ pub const Client = struct {
                 if (self.frustum_valid) {
                     const base_x: f32 = @floatFromInt(d.chunk_pos.x * @as(i32, @intCast(constants.chunk_size_x)));
                     const base_z: f32 = @floatFromInt(d.chunk_pos.z * @as(i32, @intCast(constants.chunk_size_z)));
-                    const minp_s: [3]f32 = .{ base_x, @as(f32, @floatFromInt((@as(usize, d.sy) * constants.section_height))), base_z };
-                    const maxp_s: [3]f32 = .{ base_x + 16.0, @as(f32, @floatFromInt(((@as(usize, d.sy) + 1) * constants.section_height))), base_z + 16.0 };
+                    const y_off_sections: f32 = -@as(f32, @floatFromInt(@as(i32, @intCast(world_sections_below)) * @as(i32, @intCast(constants.section_height))));
+                    const minp_s: [3]f32 = .{ base_x, y_off_sections + @as(f32, @floatFromInt((@as(usize, d.sy) * constants.section_height))), base_z };
+                    const maxp_s: [3]f32 = .{ base_x + 16.0, y_off_sections + @as(f32, @floatFromInt(((@as(usize, d.sy) + 1) * constants.section_height))), base_z + 16.0 };
                     const cam = self.camera.pos;
                     const vis_sec = aabbContainsPoint(minp_s, maxp_s, cam) or aabbInFrustum(self.frustum_planes, minp_s, maxp_s, 0.5);
                     if (!vis_sec) continue;
@@ -3435,6 +3509,7 @@ pub const Client = struct {
         self.sim.worlds_mutex.lock();
         defer self.sim.worlds_mutex.unlock();
         const ws = self.sim.worlds_state.getPtr(wk) orelse return 0;
+        const y_off_mesh: f32 = -@as(f32, @floatFromInt(@as(i32, @intCast(ws.sections_below)) * @as(i32, @intCast(constants.section_height))));
 
         const verts_before: usize = out.items.len;
 
@@ -3448,10 +3523,10 @@ pub const Client = struct {
 
                 // Frustum culling per-chunk AABB
                 if (self.frustum_valid) {
-                    const minp: [3]f32 = .{ base_x, 0.0, base_z };
+                    const minp: [3]f32 = .{ base_x, y_off_mesh, base_z };
                     const maxp: [3]f32 = .{
                         base_x + @as(f32, @floatFromInt(constants.chunk_size_x)),
-                        @as(f32, @floatFromInt(ch.sections.len * constants.section_height)),
+                        y_off_mesh + @as(f32, @floatFromInt(ch.sections.len * constants.section_height)),
                         base_z + @as(f32, @floatFromInt(constants.chunk_size_z)),
                     };
                     const cull_margin: f32 = 0.5; // tighter margin; hysteresis handles stability
@@ -3739,7 +3814,8 @@ pub const Client = struct {
                 const lz_u: usize = @intCast(lz);
                 if (lx_u >= 16 or lz_u >= 16) return null;
                 const h = ch.heightmaps.world_surface[lz_u * 16 + lx_u];
-                if (h < 0) return null;
+                // Treat negative heights as valid surface when the world has sections below 0
+                if (h < 0 and ws.sections_below == 0) return null;
                 return @as(f32, @floatFromInt(h + 1));
             }
         }.call;

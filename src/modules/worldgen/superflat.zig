@@ -16,12 +16,19 @@ fn hook_biomes(seed: u64, proto: *wapi.ProtoChunk, params: WorldGen.Params) !voi
 
 fn hook_noise(seed: u64, proto: *wapi.ProtoChunk, params: WorldGen.Params, lookup: WorldGen.BlockLookup) !void {
     _ = seed;
+    // Require at least one section below the origin; superflat generates only below Y=0
+    if (proto.sections_below < 1) return error.RequiresAtLeastOneSectionBelow;
+
     try wapi.ensureBlocksAllocated(proto);
     const air: ids.BlockStateId = lookup.call(lookup.ctx, "core:air") orelse 0;
-    const surface: ids.BlockStateId = if (params.blocks.len >= 1) params.blocks[0] else (lookup.call(lookup.ctx, "minecraft:grass") orelse 0);
-    const depth: ids.BlockStateId = if (params.blocks.len >= 2) params.blocks[1] else (lookup.call(lookup.ctx, "minecraft:dirt") orelse 0);
+
+    const nb: usize = params.blocks.len;
+    const last_idx: usize = if (nb > 0) nb - 1 else 0;
+    const penult_idx: usize = if (nb >= 2) nb - 2 else last_idx; // if only one block provided, use it for all below
 
     const scy: usize = @intCast(proto.totalSections());
+    const bottom_depth: usize = @as(usize, @intCast(proto.sections_below)) * constants.section_height; // number of layers below 0
+
     var idx: usize = 0;
     for (0..scy) |sy| {
         const y_base: i32 = (@as(i32, @intCast(sy)) - @as(i32, @intCast(proto.sections_below))) * @as(i32, @intCast(constants.section_height));
@@ -29,7 +36,25 @@ fn hook_noise(seed: u64, proto: *wapi.ProtoChunk, params: WorldGen.Params, looku
             for (0..constants.chunk_size_x) |lx| {
                 for (0..constants.section_height) |ly| {
                     const wy: i32 = y_base + @as(i32, @intCast(ly));
-                    const bid: ids.BlockStateId = if (wy < 0) depth else if (wy <= 2) surface else air;
+                    var bid: ids.BlockStateId = air;
+                    if (wy < 0 and nb > 0) {
+                        // Distance below 0 in layers, 1..bottom_depth
+                        const d: usize = @intCast(-wy);
+                        if (d == bottom_depth) {
+                            bid = params.blocks[last_idx]; // bottom layer: final block
+                        } else {
+                            // Top unique layers: one layer per block except the last two (penultimate repeats)
+                            if (nb >= 2 and d <= (nb - 2)) {
+                                // d starts at 1 => map to blocks[d-1]
+                                bid = params.blocks[d - 1];
+                            } else {
+                                bid = params.blocks[penult_idx];
+                            }
+                        }
+                    } else {
+                        bid = air; // no generation at or above Y=0
+                    }
+
                     proto.blocks_buf.?[idx] = bid;
                     if (bid != air) {
                         const col_idx = @as(usize, @intCast(lz)) * constants.chunk_size_x + @as(usize, @intCast(lx));

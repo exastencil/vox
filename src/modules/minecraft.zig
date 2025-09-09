@@ -68,12 +68,24 @@ fn init(ctx: ?*anyopaque) !void {
     regp.setBlockFullCollisionById(@intCast(water_id), false);
 
     // World: minecraft:overworld using the existing superflat generator.
-    // Sections: mirror the default of 4 for now (4*32=128 height).
+    // Refactor: require at least 1 section below and generate only below Y=0.
+    // Use layers: grass, dirt, dirt, stone (repeat), bedrock at bottom.
+    const grass_id: ids.BlockStateId = regp.addBlock("minecraft:grass") catch 0;
+    const bedrock_id: ids.BlockStateId = regp.addBlock("minecraft:bedrock") catch 0;
+
+    // Provide textures for the grass alias as well (same as grass_block)
+    regp.resources.setFacingPaths(
+        "minecraft:grass",
+        "resources/textures/blocks/minecraft/grass_top.png",
+        "resources/textures/blocks/minecraft/dirt.png",
+    ) catch {};
+
+    // Sections: put 4 below and 0 above (4*32=128 below origin)
     regp.worlds.addWorldWithGen(
         "minecraft:overworld",
         "Overworld",
-        0,
+        1,
         4,
-        .{ .key = "core:superflat", .blocks = &[_]ids.BlockStateId{ dirt_id, stone_id }, .biomes = &[_]ids.BiomeId{plains_biome} },
+        .{ .key = "core:superflat", .blocks = &[_]ids.BlockStateId{ grass_id, dirt_id, dirt_id, stone_id, bedrock_id }, .biomes = &[_]ids.BiomeId{plains_biome} },
     ) catch {};
 }

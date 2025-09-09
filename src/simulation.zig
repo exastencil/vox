@@ -478,7 +478,8 @@ pub const Simulation = struct {
                 const lz_u: usize = @intCast(lz);
                 if (lx_u >= 16 or lz_u >= 16) return null;
                 const h = ch.heightmaps.world_surface[lz_u * 16 + lx_u];
-                if (h < 0) return null;
+                // Treat negative heights as valid surface when the world has sections below 0
+                if (h < 0 and ws.sections_below == 0) return null;
                 return @as(f32, @floatFromInt(h + 1));
             }
         }.call;

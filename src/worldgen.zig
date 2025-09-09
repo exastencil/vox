@@ -147,6 +147,12 @@ fn buildChunkFromBuffers(proto: *const wapi.ProtoChunk) !gs.Chunk {
                 try biome_map.put(bm, pi2);
             }
         }
+        // Ensure air is present in the block palette so edits (breaking/placing) can target air safely
+        if (block_map.get(0) == null) {
+            const pi_air: u32 = @intCast(block_palette_list.items.len);
+            try block_palette_list.append(allocator, 0);
+            try block_map.put(0, pi_air);
+        }
 
         // Allocate outputs for section
         const bpi: u6 = bitsFor(block_palette_list.items.len);
