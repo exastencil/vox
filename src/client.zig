@@ -146,36 +146,31 @@ const ControlScheme = struct {
     makeViewProj: *const fn (*anyopaque, f32, f32) ViewProj,
 };
 
-// FirstPersonHorizontal control scheme: horizontal-only mouse look (yaw),
+// FirstPersonHorizontal control scheme: horizontal + vertical mouse look (yaw + pitch),
 // movement derived from yaw on XZ plane, camera mirrors local state.
 fn cs_fph_onMouseMove(ctx: *anyopaque, ev: sapp.Event) void {
     const self: *Client = @ptrCast(@alignCast(ctx));
     const sens: f32 = 0.002; // radians per pixel
-    const dx = ev.mouse_dx * sens;
-    _ = ev.mouse_dy; // ignore vertical mouse input (no pitch)
+    const dx: f32 = ev.mouse_dx * sens;
+    const dy: f32 = ev.mouse_dy * sens;
 
-    // Rotate look around +Y for horizontal mouse motion (mouse right => turn right)
-    var new_dir = self.local_dir;
-    if (dx != 0) {
-        const c = @cos(dx);
-        const s = @sin(dx);
-        const x = new_dir[0];
-        const z = new_dir[2];
-        new_dir[0] = c * x - s * z;
-        new_dir[2] = s * x + c * z;
-    }
-    // normalize
-    const len = @sqrt(new_dir[0] * new_dir[0] + new_dir[1] * new_dir[1] + new_dir[2] * new_dir[2]);
-    if (len > 0.000001) {
-        new_dir[0] /= len;
-        new_dir[1] /= len;
-        new_dir[2] /= len;
-    }
-    self.local_dir = new_dir;
-    // update camera from dir (also updates yaw/pitch)
-    self.camera.setDir(self.local_dir);
-    self.local_yaw = self.camera.yaw;
-    self.local_pitch = self.camera.pitch;
+    // Update yaw from horizontal mouse motion (mouse right => turn right)
+    self.local_yaw += dx;
+    if (self.local_yaw > std.math.pi) self.local_yaw -= 2.0 * std.math.pi;
+    if (self.local_yaw < -std.math.pi) self.local_yaw += 2.0 * std.math.pi;
+
+    // Update pitch from vertical mouse motion.
+    // Top-left origin: moving mouse up yields negative dy; looking up is +pitch => subtract dy
+    const pitch_max: f32 = (std.math.pi / 2.0) - 0.01; // keep away from poles to avoid singularities
+    self.local_pitch = std.math.clamp(self.local_pitch - dy, -pitch_max, pitch_max);
+
+    // Recompute forward/look vector and sync camera
+    const cp: f32 = @cos(self.local_pitch);
+    const sp: f32 = @sin(self.local_pitch);
+    const cy: f32 = @cos(self.local_yaw);
+    const sy: f32 = @sin(self.local_yaw);
+    self.local_dir = .{ cp * cy, sp, cp * sy };
+    self.camera.setYawPitch(self.local_yaw, self.local_pitch);
 
     // If not moving, constrain facing so look stays within 90° of facing (XZ)
     if (!(self.move_forward or self.move_back or self.move_left or self.move_right)) {
