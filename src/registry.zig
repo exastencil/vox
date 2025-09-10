@@ -31,7 +31,10 @@ pub const Registry = struct {
     pub fn deinit(self: *Registry) void {
         // free any names we duplicated
         for (self.blocks.items) |b| self.allocator.free(b.name);
-        for (self.biomes.items) |b| self.allocator.free(b.name);
+        for (self.biomes.items) |*b| {
+            self.allocator.free(b.name);
+            b.tints.deinit();
+        }
         self.blocks.deinit(self.allocator);
         self.biomes.deinit(self.allocator);
         self.worlds.deinit();
@@ -85,8 +88,22 @@ pub const Registry = struct {
             if (std.mem.eql(u8, b.name, name)) return @intCast(i);
         }
         const owned = try self.dup(name);
-        try self.biomes.append(self.allocator, .{ .name = owned });
+        const def: Biome.Def = .{ .name = owned, .tints = std.StringHashMap([3]f32).init(self.allocator) };
+        try self.biomes.append(self.allocator, def);
         return @intCast(self.biomes.items.len - 1);
+    }
+
+    pub fn setBiomeTint(self: *Registry, biome_id: ids.BiomeId, key: []const u8, color_rgb: [3]f32) void {
+        if (biome_id >= self.biomes.items.len) return;
+        var b = &self.biomes.items[@intCast(biome_id)];
+        // Store key by borrowing; registry names are stable during runtime; duplication optional
+        _ = b.tints.put(key, color_rgb) catch {};
+    }
+
+    pub fn getBiomeTint(self: *const Registry, biome_id: ids.BiomeId, key: []const u8) ?[3]f32 {
+        if (biome_id >= self.biomes.items.len) return null;
+        const b = self.biomes.items[@intCast(biome_id)];
+        return b.tints.get(key);
     }
 
     pub fn getBlockName(self: *const Registry, id: ids.BlockId) []const u8 {

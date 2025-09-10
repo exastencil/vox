@@ -259,7 +259,7 @@ const firstPersonHorizontalScheme: ControlScheme = .{
     .makeViewProj = cs_fph_makeViewProj,
 };
 
-const Vertex = struct { pos: [3]f32, uv: [2]f32, layer: f32 };
+const Vertex = struct { pos: [3]f32, uv: [2]f32, layer: f32, apply_tint: f32 };
 
 // ThirdPersonIsometric control scheme
 fn cs_iso_onMouseMove(ctx: *anyopaque, ev: sapp.Event) void {
@@ -395,14 +395,14 @@ inline fn wrap01m(v: f32) f32 {
     return if (f == 0.0 and v > 0.0) 1.0 else f;
 }
 
-inline fn emitQuad(allocator: std.mem.Allocator, list: *std.ArrayList(Vertex), v0: [3]f32, v1: [3]f32, v2: [3]f32, v3: [3]f32, uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32, layer: f32) void {
+inline fn emitQuad(allocator: std.mem.Allocator, list: *std.ArrayList(Vertex), v0: [3]f32, v1: [3]f32, v2: [3]f32, v3: [3]f32, uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32, layer: f32, apply_tint: f32) void {
     // Store tile-local UVs (may be >1) and the texture-array layer index; shader applies fract
-    list.append(allocator, .{ .pos = v0, .uv = uv0, .layer = layer }) catch return;
-    list.append(allocator, .{ .pos = v1, .uv = uv1, .layer = layer }) catch return;
-    list.append(allocator, .{ .pos = v2, .uv = uv2, .layer = layer }) catch return;
-    list.append(allocator, .{ .pos = v0, .uv = uv0, .layer = layer }) catch return;
-    list.append(allocator, .{ .pos = v2, .uv = uv2, .layer = layer }) catch return;
-    list.append(allocator, .{ .pos = v3, .uv = uv3, .layer = layer }) catch return;
+    list.append(allocator, .{ .pos = v0, .uv = uv0, .layer = layer, .apply_tint = apply_tint }) catch return;
+    list.append(allocator, .{ .pos = v1, .uv = uv1, .layer = layer, .apply_tint = apply_tint }) catch return;
+    list.append(allocator, .{ .pos = v2, .uv = uv2, .layer = layer, .apply_tint = apply_tint }) catch return;
+    list.append(allocator, .{ .pos = v0, .uv = uv0, .layer = layer, .apply_tint = apply_tint }) catch return;
+    list.append(allocator, .{ .pos = v2, .uv = uv2, .layer = layer, .apply_tint = apply_tint }) catch return;
+    list.append(allocator, .{ .pos = v3, .uv = uv3, .layer = layer, .apply_tint = apply_tint }) catch return;
 }
 
 // Cached mesh types (region-level aggregation)
@@ -451,6 +451,9 @@ const REGION_MESH_BUDGET: usize = 128; // generous, regions are fewer than chunk
 
 // Texture-array layer identifier
 const LayerId = u16;
+
+// Per-region tint cache entry (512x512 covering a 32x32 chunk area)
+const RegionTintEntry = struct { img: sg.Image, view: sg.View, last_used: u32, dirty: bool };
 
 fn bitsFor(n: usize) u6 {
     if (n <= 1) return 1;
@@ -512,12 +515,12 @@ fn buildQuadVerts(out: []Vertex, x0: f32, y0: f32, size: f32) usize {
     if (out.len < 6) return 0;
     const x1: f32 = x0 + size;
     const y1: f32 = y0 + size;
-    out[0] = .{ .pos = .{ x0, y0 }, .uv = .{ 0, 0 }, .layer = 0 };
-    out[1] = .{ .pos = .{ x1, y0 }, .uv = .{ 1, 0 }, .layer = 0 };
-    out[2] = .{ .pos = .{ x1, y1 }, .uv = .{ 1, 1 }, .layer = 0 };
-    out[3] = .{ .pos = .{ x0, y0 }, .uv = .{ 0, 0 }, .layer = 0 };
-    out[4] = .{ .pos = .{ x1, y1 }, .uv = .{ 1, 1 }, .layer = 0 };
-    out[5] = .{ .pos = .{ x0, y1 }, .uv = .{ 0, 1 }, .layer = 0 };
+    out[0] = .{ .pos = .{ x0, y0 }, .uv = .{ 0, 0 }, .layer = 0, .apply_tint = 0 };
+    out[1] = .{ .pos = .{ x1, y0 }, .uv = .{ 1, 0 }, .layer = 0, .apply_tint = 0 };
+    out[2] = .{ .pos = .{ x1, y1 }, .uv = .{ 1, 1 }, .layer = 0, .apply_tint = 0 };
+    out[3] = .{ .pos = .{ x0, y0 }, .uv = .{ 0, 0 }, .layer = 0, .apply_tint = 0 };
+    out[4] = .{ .pos = .{ x1, y1 }, .uv = .{ 1, 1 }, .layer = 0, .apply_tint = 0 };
+    out[5] = .{ .pos = .{ x0, y1 }, .uv = .{ 0, 1 }, .layer = 0, .apply_tint = 0 };
     return 6;
 }
 
@@ -647,6 +650,11 @@ fn buildTextureArray(self: *Client) void {
                 addUniquePath(self.allocator, &paths, f.face_path) catch {};
                 addUniquePath(self.allocator, &paths, f.other_path) catch {};
             },
+            .AxisAlignedTintedPrimary => |a| {
+                addUniquePath(self.allocator, &paths, a.primary_face_path) catch {};
+                addUniquePath(self.allocator, &paths, a.bottom_face_path) catch {};
+                addUniquePath(self.allocator, &paths, a.side_face_path) catch {};
+            },
             .Void => {},
         }
     }
@@ -746,8 +754,12 @@ fn buildTextureArray(self: *Client) void {
         };
     }
     if (!chosen) {
-        if (self.sim.reg.resources.get("minecraft:grass")) |res| switch (res) {
+        if (self.sim.reg.resources.get("minecraft:grass_block")) |res| switch (res) {
             .Facing => |f| if (findIndexForPath(paths.items, f.face_path)) |idx| {
+                self.default_layer = @intCast(idx);
+                chosen = true;
+            },
+            .AxisAlignedTintedPrimary => |a| if (findIndexForPath(paths.items, a.primary_face_path)) |idx| {
                 self.default_layer = @intCast(idx);
                 chosen = true;
             },
@@ -780,6 +792,10 @@ fn buildTextureArray(self: *Client) void {
                 self.top_layer = @intCast(idx);
                 top_set = true;
             },
+            .AxisAlignedTintedPrimary => |a| if (findIndexForPath(paths.items, a.primary_face_path)) |idx| {
+                self.top_layer = @intCast(idx);
+                top_set = true;
+            },
             else => {},
         };
     }
@@ -799,6 +815,10 @@ fn buildTextureArray(self: *Client) void {
     if (!side_set) {
         if (self.sim.reg.resources.get("minecraft:grass_block")) |res2| switch (res2) {
             .Facing => |f| if (findIndexForPath(paths.items, f.other_path)) |idx| {
+                self.side_layer = @intCast(idx);
+                side_set = true;
+            },
+            .AxisAlignedTintedPrimary => |a| if (findIndexForPath(paths.items, a.side_face_path)) |idx| {
                 self.side_layer = @intCast(idx);
                 side_set = true;
             },
@@ -867,6 +887,11 @@ pub const Client = struct {
     green_view: sg.View = .{},
     black_img: sg.Image = .{},
     black_view: sg.View = .{},
+    white_img: sg.Image = .{},
+    white_view: sg.View = .{},
+
+    // Per-region tint cache
+    region_tint_cache: std.AutoHashMap(simulation.RegionPos, RegionTintEntry) = undefined,
     // Layer map per texture path
     layers_by_path: std.StringHashMap(LayerId) = undefined,
 
@@ -990,6 +1015,8 @@ pub const Client = struct {
             .mesher_results = std.ArrayList(MeshingResult).initCapacity(allocator, 0) catch unreachable,
             .mesher_threads = std.ArrayList(std.Thread).initCapacity(allocator, 0) catch unreachable,
         };
+        // Initialize additional maps
+        cli.region_tint_cache = std.AutoHashMap(simulation.RegionPos, RegionTintEntry).init(allocator);
         // Initialize control schemes (default to FirstPersonHorizontal)
         cli.control_schemes = &[_]ControlScheme{ firstPersonHorizontalScheme, thirdPersonIsometricScheme };
         cli.current_scheme = 0; // first person by default
@@ -1070,10 +1097,12 @@ pub const Client = struct {
         if (self.grass_view.id != 0) sg.destroyView(self.grass_view);
         if (self.green_view.id != 0) sg.destroyView(self.green_view);
         if (self.black_view.id != 0) sg.destroyView(self.black_view);
+        if (self.white_view.id != 0) sg.destroyView(self.white_view);
         if (self.sampler.id != 0) sg.destroySampler(self.sampler);
         if (self.grass_img.id != 0) sg.destroyImage(self.grass_img);
         if (self.green_img.id != 0) sg.destroyImage(self.green_img);
         if (self.black_img.id != 0) sg.destroyImage(self.black_img);
+        if (self.white_img.id != 0) sg.destroyImage(self.white_img);
         if (self.pip_lines.id != 0) sg.destroyPipeline(self.pip_lines);
         if (self.pip_outline.id != 0) sg.destroyPipeline(self.pip_outline);
         if (self.pip.id != 0) sg.destroyPipeline(self.pip);
@@ -1107,6 +1136,14 @@ pub const Client = struct {
             self.allocator.free(rm.draws);
         }
         self.region_mesh_cache.deinit();
+
+        // Destroy per-region tint cache
+        var itc = self.region_tint_cache.valueIterator();
+        while (itc.next()) |entry| {
+            if (entry.img.id != 0) sg.destroyImage(entry.img);
+            if (entry.view.id != 0) sg.destroyView(entry.view);
+        }
+        self.region_tint_cache.deinit();
 
         self.layers_by_path.deinit();
         self.last_visible_frame_chunk.deinit();
@@ -1168,6 +1205,7 @@ pub const Client = struct {
         pdesc.layout.attrs[0].format = .FLOAT3; // pos
         pdesc.layout.attrs[1].format = .FLOAT2; // uv
         pdesc.layout.attrs[2].format = .FLOAT; // layer
+        pdesc.layout.attrs[3].format = .FLOAT; // apply_tint (0 or 1)
         pdesc.primitive_type = .TRIANGLES;
         pdesc.cull_mode = .BACK;
         // Front-face winding should match our emitted CCW triangles
@@ -1226,8 +1264,10 @@ pub const Client = struct {
         // shader expects VIEW_tex_array at slot 1 and SMP_tex_sampler at slot 2
         self.bind.views[1] = self.grass_view;
         self.bind.samplers[2] = self.sampler;
+        // chunk tint will use view slot 3 and sampler slot 4 (reuse same sampler)
+        self.bind.samplers[4] = self.sampler;
 
-        // Create a 1x1 green texture/view for debug solid color draws
+        // Create a 1x1 green texture/view for debug solid color draws (array type to match VIEW_tex_array usage)
         {
             var green = [_]u8{ 0, 255, 0, 255 };
             self.green_img = sg.makeImage(.{
@@ -1247,7 +1287,23 @@ pub const Client = struct {
         self.control_schemes[self.current_scheme].updateCamera(self);
         // Defer mouse capture until world is ready (see checkReady)
 
-        // Create a 1x1 black texture/view for debug outlines
+        // Create a 1x1 white texture/view for default tint (2D type to match VIEW_chunk_tint_tex)
+        {
+            var white = [_]u8{ 255, 255, 255, 255 };
+            self.white_img = sg.makeImage(.{
+                .type = ._2D,
+                .width = 1,
+                .height = 1,
+                .num_mipmaps = 1,
+                .pixel_format = .RGBA8,
+                .data = .{ .subimage = .{ .{ sg.asRange(white[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} } } },
+            });
+            self.white_view = sg.makeView(.{ .texture = .{ .image = self.white_img } });
+            // Bind default tint view at slot 3 so pipelines expecting VIEW_chunk_tint_tex always have a valid view
+            self.bind.views[3] = self.white_view;
+        }
+
+        // Create a 1x1 black texture/view for debug outlines (array type)
         {
             var black = [_]u8{ 0, 0, 0, 255 };
             self.black_img = sg.makeImage(.{
@@ -1453,7 +1509,7 @@ pub const Client = struct {
         // standard MVP (proj*view)
         const mvp: [16]f32 = matMul(vp.proj, view_adj);
         self.updateFrustum(mvp);
-        var vs_params: shd_mod.VsParams = .{ .mvp = mvp };
+        var vs_params: shd_mod.VsParams = .{ .mvp = mvp, .region_info = .{ 0, 0, 1.0 / 512.0, 0 } };
 
         // Render cached meshes (build on demand)
         if (self.grass_img.id != 0) {
@@ -2106,7 +2162,7 @@ pub const Client = struct {
         var vi: usize = 0;
         const make_vert = struct {
             fn call(p: [3]f32) Vertex {
-                return .{ .pos = p, .uv = .{ 0, 0 }, .layer = 0 };
+                return .{ .pos = p, .uv = .{ 0, 0 }, .layer = 0, .apply_tint = 0 };
             }
         }.call;
         const normalize3 = struct {
@@ -2165,7 +2221,7 @@ pub const Client = struct {
 
         // Use outline triangle pipeline and black texture; renders through geometry (depth compare: ALWAYS)
         sg.applyPipeline(self.pip_outline);
-        var vs_params: shd_mod.VsParams = .{ .mvp = vs_in.mvp };
+        var vs_params: shd_mod.VsParams = .{ .mvp = vs_in.mvp, .region_info = .{ 0, 0, 1.0 / 512.0, 0 } };
         sg.applyUniforms(0, sg.asRange(&vs_params));
         var b = self.bind;
         b.vertex_buffers[0] = self.outline_vbuf;
@@ -2488,6 +2544,7 @@ pub const Client = struct {
             solid: bool,
             top_layer: LayerId,
             side_layer: LayerId,
+            top_apply_tint: bool,
         };
         var pal_info = std.ArrayList(PalInfo).initCapacity(self.allocator, pal_len) catch {
             return;
@@ -2501,6 +2558,7 @@ pub const Client = struct {
                 .solid = true,
                 .top_layer = self.top_layer,
                 .side_layer = self.side_layer,
+                .top_apply_tint = false,
             };
             if (bid < self.sim.reg.blocks.items.len) {
                 pinfo.solid = self.sim.reg.blocks.items[@intCast(bid)].full_block_collision;
@@ -2526,16 +2584,26 @@ pub const Client = struct {
                         pinfo.top_layer = top_layer;
                         pinfo.side_layer = side_layer;
                     },
+                    .AxisAlignedTintedPrimary => |a| {
+                        const top_layer: LayerId = self.layers_by_path.get(a.primary_face_path) orelse self.default_layer;
+                        const side_layer: LayerId = self.layers_by_path.get(a.side_face_path) orelse self.default_layer;
+                        const bottom_layer: LayerId = self.layers_by_path.get(a.bottom_face_path) orelse self.default_layer;
+                        _ = bottom_layer;
+                        pinfo.top_layer = top_layer;
+                        pinfo.side_layer = side_layer;
+                        // bottom uses side_layer when we emit bottom quads below; tint applies only to top
+                        pinfo.top_apply_tint = true;
+                    },
                 };
             }
             pal_info.appendAssumeCapacity(pinfo);
         }
 
         // Greedy meshing for +Y (top) faces per Y-slice to drastically reduce vertex count
-        const FaceMat = struct { layer: LayerId };
+        const FaceMat = struct { layer: LayerId, apply_tint: bool };
         const Mat = struct {
             fn eq(a: FaceMat, b: FaceMat) bool {
-                return a.layer == b.layer;
+                return a.layer == b.layer and a.apply_tint == b.apply_tint;
             }
         };
         const MaskCell = struct { present: bool, m: FaceMat };
@@ -2559,7 +2627,7 @@ pub const Client = struct {
                     if (!info.draw) continue;
                     // top visible if neighbor above not solid
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(mx)), abs_y + 1, @as(i32, @intCast(mz)))) {
-                        mask[idx] = .{ .present = true, .m = .{ .layer = info.top_layer } };
+                        mask[idx] = .{ .present = true, .m = .{ .layer = info.top_layer, .apply_tint = info.top_apply_tint } };
                     }
                 }
             }
@@ -2597,7 +2665,7 @@ pub const Client = struct {
                     const uv0h: [2]f32 = .{ 0, @as(f32, @floatFromInt(h)) };
                     const uvwh: [2]f32 = .{ @as(f32, @floatFromInt(w)), @as(f32, @floatFromInt(h)) };
                     const uvw0: [2]f32 = .{ @as(f32, @floatFromInt(w)), 0 };
-                    emitQuad(self.allocator, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv0h, uvwh, uvw0, @floatFromInt(mkey.layer));
+                    emitQuad(self.allocator, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv0h, uvwh, uvw0, @floatFromInt(mkey.layer), if (mkey.apply_tint) 1.0 else 0.0);
                     // clear mask for used cells
                     var zz: usize = 0;
                     while (zz < h) : (zz += 1) {
@@ -2636,19 +2704,19 @@ pub const Client = struct {
 
                     if (false) {}
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this - 1, @as(i32, @intCast(lz)))) {
-                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
+                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
                     }
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) - 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                        emitQuad(self.allocator, out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
+                        emitQuad(self.allocator, out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
                     }
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) + 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                        emitQuad(self.allocator, out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
+                        emitQuad(self.allocator, out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
                     }
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) - 1)) {
-                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
+                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
                     }
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) + 1)) {
-                        emitQuad(self.allocator, out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
+                        emitQuad(self.allocator, out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
                     }
                 }
             }
@@ -2904,6 +2972,7 @@ pub const Client = struct {
             solid: bool,
             top_layer: LayerId,
             side_layer: LayerId,
+            top_apply_tint: bool,
         };
         var pal_info = std.ArrayList(PalInfo).initCapacity(self.allocator, pal_len) catch {
             return;
@@ -2917,6 +2986,7 @@ pub const Client = struct {
                 .solid = true,
                 .top_layer = self.top_layer,
                 .side_layer = self.side_layer,
+                .top_apply_tint = false,
             };
             if (bid < self.sim.reg.blocks.items.len) {
                 pinfo.solid = self.sim.reg.blocks.items[@intCast(bid)].full_block_collision;
@@ -2942,16 +3012,25 @@ pub const Client = struct {
                         pinfo.top_layer = top_layer;
                         pinfo.side_layer = side_layer;
                     },
+                    .AxisAlignedTintedPrimary => |a| {
+                        const top_layer: LayerId = self.layers_by_path.get(a.primary_face_path) orelse self.default_layer;
+                        const side_layer: LayerId = self.layers_by_path.get(a.side_face_path) orelse self.default_layer;
+                        const bottom_layer: LayerId = self.layers_by_path.get(a.bottom_face_path) orelse self.default_layer;
+                        _ = bottom_layer; // currently sides/bottom emitted with side_layer
+                        pinfo.top_layer = top_layer;
+                        pinfo.side_layer = side_layer;
+                        pinfo.top_apply_tint = true;
+                    },
                 };
             }
             pal_info.appendAssumeCapacity(pinfo);
         }
 
         // Greedy top faces per Y-slice
-        const FaceMat = struct { layer: LayerId };
+        const FaceMat = struct { layer: LayerId, apply_tint: bool };
         const Mat = struct {
             fn eq(a: FaceMat, b: FaceMat) bool {
-                return a.layer == b.layer;
+                return a.layer == b.layer and a.apply_tint == b.apply_tint;
             }
         };
         const section_base_y: i32 = @as(i32, @intCast(sy * constants.section_height)) - @as(i32, @intCast(snap.sections_below)) * @as(i32, @intCast(constants.section_height));
@@ -2972,7 +3051,7 @@ pub const Client = struct {
                     const info = pal_info.items[pidx];
                     if (!info.draw) continue;
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(mx)), abs_y + 1, @as(i32, @intCast(mz)))) {
-                        mask[idxm] = .{ .present = true, .m = .{ .layer = info.top_layer } };
+                        mask[idxm] = .{ .present = true, .m = .{ .layer = info.top_layer, .apply_tint = info.top_apply_tint } };
                     }
                 }
             }
@@ -3009,7 +3088,7 @@ pub const Client = struct {
                     const uv0h: [2]f32 = .{ 0, @as(f32, @floatFromInt(h)) };
                     const uvwh: [2]f32 = .{ @as(f32, @floatFromInt(w)), @as(f32, @floatFromInt(h)) };
                     const uvw0: [2]f32 = .{ @as(f32, @floatFromInt(w)), 0 };
-                    emitQuad(alloc, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv0h, uvwh, uvw0, @floatFromInt(mkey.layer));
+                    emitQuad(alloc, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv0h, uvwh, uvw0, @floatFromInt(mkey.layer), if (mkey.apply_tint) 1.0 else 0.0);
                     // clear mask
                     var zz: usize = 0;
                     while (zz < h) : (zz += 1) {
@@ -3043,23 +3122,24 @@ pub const Client = struct {
                     const uv11: [2]f32 = .{ 1, 1 };
                     const uv10: [2]f32 = .{ 1, 0 };
 
-                    if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this + 1, @as(i32, @intCast(lz)))) {
-                        emitQuad(alloc, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.top_layer));
-                    }
+                    // Top faces are already emitted via greedy rectangles above; skip here to avoid z-fighting
+                    // if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this + 1, @as(i32, @intCast(lz)))) {
+                    //     emitQuad(alloc, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.top_layer), 0.0);
+                    // }
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this - 1, @as(i32, @intCast(lz)))) {
-                        emitQuad(alloc, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
+                        emitQuad(alloc, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
                     }
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) - 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                        emitQuad(alloc, out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
+                        emitQuad(alloc, out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
                     }
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) + 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                        emitQuad(alloc, out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
+                        emitQuad(alloc, out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
                     }
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) - 1)) {
-                        emitQuad(alloc, out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
+                        emitQuad(alloc, out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
                     }
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) + 1)) {
-                        emitQuad(alloc, out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer));
+                        emitQuad(alloc, out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
                     }
                 }
             }
@@ -3151,6 +3231,9 @@ pub const Client = struct {
                 }
             }
 
+            // Mark region tint dirty (biome tints may have changed in updated chunks)
+            if (self.region_tint_cache.getPtr(mr.rpos)) |entry| entry.dirty = true;
+
             // free CPU verts
             if (mr.verts.len > 0) std.heap.page_allocator.free(mr.verts);
             processed += 1;
@@ -3233,7 +3316,7 @@ pub const Client = struct {
         }
         self.sim.worlds_mutex.unlock();
 
-        var vs_loc: shd_mod.VsParams = .{ .mvp = vs_in.mvp };
+        var vs_loc: shd_mod.VsParams = .{ .mvp = vs_in.mvp, .region_info = .{ 0, 0, 1.0 / 512.0, 0 } };
 
         // reset per-frame rebuild counter
         self.rebuilds_issued_this_frame = 0;
@@ -3247,6 +3330,11 @@ pub const Client = struct {
             self.ensureRegionMesh(rp, expected_chunks);
             const rmesh = self.region_mesh_cache.getPtr(rp) orelse continue;
             if (rmesh.vbuf.id == 0 or rmesh.draws.len == 0) continue;
+
+            // Set region uniforms (origin in blocks and inv region dim)
+            const region_origin_x: f32 = @floatFromInt(rp.x * 32 * @as(i32, @intCast(constants.chunk_size_x)));
+            const region_origin_z: f32 = @floatFromInt(rp.z * 32 * @as(i32, @intCast(constants.chunk_size_z)));
+            vs_loc.region_info = .{ region_origin_x, region_origin_z, 1.0 / 512.0, 0 };
 
             // Bind region buffer once
             var b = self.bind;
@@ -3268,6 +3356,13 @@ pub const Client = struct {
                     const vis_sec = aabbContainsPoint(minp_s, maxp_s, cam) or aabbInFrustum(self.frustum_planes, minp_s, maxp_s, 0.5);
                     if (!vis_sec) continue;
                 }
+                // ensure per-region tint view bound for this region
+                const tint_view = self.ensureRegionTintView(rp);
+                var bdraw = self.bind;
+                bdraw.vertex_buffers[0] = rmesh.vbuf;
+                bdraw.views[1] = self.grass_view;
+                if (tint_view.id != 0) bdraw.views[3] = tint_view;
+                sg.applyBindings(bdraw);
                 sg.applyUniforms(0, sg.asRange(&vs_loc));
                 sg.draw(d.first, d.count, 1);
                 _ = self.last_visible_frame_chunk.put(d.chunk_pos, self.frame_index) catch {};
@@ -3507,6 +3602,124 @@ pub const Client = struct {
         return m;
     }
 
+    fn ensureRegionTintView(self: *Client, rpos: simulation.RegionPos) sg.View {
+        // Return cached view if available
+        if (self.region_tint_cache.getPtr(rpos)) |entry| {
+            entry.last_used = self.frame_index;
+            if (entry.dirty) {
+                // rebuild pixels and recreate image (simpler than crafting updateImage subimages)
+                var pixels: [512 * 512 * 4]u8 = [_]u8{0} ** (512 * 512 * 4);
+                self.fillRegionTintPixels(rpos, &pixels);
+                if (entry.view.id != 0) sg.destroyView(entry.view);
+                if (entry.img.id != 0) sg.destroyImage(entry.img);
+                const new_img = sg.makeImage(.{
+                    .width = 512,
+                    .height = 512,
+                    .pixel_format = .RGBA8,
+                    .data = .{ .subimage = .{
+                        .{ sg.asRange(pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                        .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                        .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                        .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                        .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                        .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                    } },
+                });
+                const new_view = if (new_img.id != 0) sg.makeView(.{ .texture = .{ .image = new_img } }) else self.white_view;
+                entry.img = new_img;
+                entry.view = new_view;
+                entry.dirty = false;
+            }
+            return entry.view;
+        }
+        // Build 512x512 RGBA8 tint from biomes at Y=0 across the region
+        var pixels: [512 * 512 * 4]u8 = [_]u8{0} ** (512 * 512 * 4);
+        self.fillRegionTintPixels(rpos, &pixels);
+        // Upload image and create view
+        const img = sg.makeImage(.{
+            .width = 512,
+            .height = 512,
+            .pixel_format = .RGBA8,
+            .data = .{ .subimage = .{
+                .{ sg.asRange(pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
+            } },
+        });
+        const view = if (img.id != 0) sg.makeView(.{ .texture = .{ .image = img } }) else self.white_view;
+        _ = self.region_tint_cache.put(rpos, .{ .img = img, .view = view, .last_used = self.frame_index, .dirty = false }) catch {};
+        return if (view.id != 0) view else self.white_view;
+    }
+
+    fn fillRegionTintPixels(self: *Client, rpos: simulation.RegionPos, pixels: *[512 * 512 * 4]u8) void {
+        // Fill the 512x512 RGBA8 pixels for the given region from biome tints at Y=0
+        const wk = "minecraft:overworld";
+        // Default to white
+        var i: usize = 0;
+        while (i < pixels.len) : (i += 4) {
+            pixels.*[i + 0] = 255;
+            pixels.*[i + 1] = 255;
+            pixels.*[i + 2] = 255;
+            pixels.*[i + 3] = 255;
+        }
+        self.sim.worlds_mutex.lock();
+        const ws = self.sim.worlds_state.getPtr(wk);
+        if (ws) |wsp| {
+            const base_cx: i32 = rpos.x * 32;
+            const base_cz: i32 = rpos.z * 32;
+            var cz_off: i32 = 0;
+            while (cz_off < 32) : (cz_off += 1) {
+                var cx_off: i32 = 0;
+                while (cx_off < 32) : (cx_off += 1) {
+                    const cpos = gs.ChunkPos{ .x = base_cx + cx_off, .z = base_cz + cz_off };
+                    const rp = simulation.RegionPos{ .x = @divFloor(cpos.x, 32), .z = @divFloor(cpos.z, 32) };
+                    if (wsp.regions.getPtr(rp)) |rs| {
+                        if (rs.chunk_index.get(cpos)) |cidx| {
+                            const ch = rs.chunks.items[cidx];
+                            const sb: i32 = @as(i32, @intCast(wsp.sections_below));
+                            const sy0: usize = if (sb > 0) @intCast(sb - 1) else 0;
+                            if (sy0 < ch.sections.len) {
+                                const s = ch.sections[sy0];
+                                const bpi_biome: u6 = bitsFor(s.biome_palette.len);
+                                var lz: usize = 0;
+                                while (lz < 16) : (lz += 1) {
+                                    var lx: usize = 0;
+                                    while (lx < 16) : (lx += 1) {
+                                        const idx3d: usize = lz * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + 0;
+                                        var tint_rgb: [3]f32 = .{ 1, 1, 1 };
+                                        if (s.biome_palette.len > 0 and s.biome_indices_bits.len > 0) {
+                                            const pidx_u32: u32 = unpackBitsGet(s.biome_indices_bits, idx3d, bpi_biome);
+                                            const pidx: usize = @intCast(pidx_u32);
+                                            if (pidx < s.biome_palette.len) {
+                                                const biome_id = s.biome_palette[pidx];
+                                                if (self.sim.reg.getBiomeTint(biome_id, "grass")) |c|
+                                                    tint_rgb = c;
+                                            }
+                                        }
+                                        const px: usize = (@as(usize, @intCast(cx_off)) * 16) + lx;
+                                        const pz: usize = (@as(usize, @intCast(cz_off)) * 16) + lz;
+                                        const off: usize = (pz * 512 + px) * 4;
+                                        const r = std.math.clamp(tint_rgb[0], 0.0, 1.0);
+                                        const g = std.math.clamp(tint_rgb[1], 0.0, 1.0);
+                                        const b = std.math.clamp(tint_rgb[2], 0.0, 1.0);
+                                        pixels.*[off + 0] = @intFromFloat(r * 255.0);
+                                        pixels.*[off + 1] = @intFromFloat(g * 255.0);
+                                        pixels.*[off + 2] = @intFromFloat(b * 255.0);
+                                        pixels.*[off + 3] = 255;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.sim.worlds_mutex.unlock();
+    }
+
     fn drawPlayerAabb(self: *Client, vs_in: *const shd_mod.VsParams) void {
         // Construct a solid box from the client's local predicted AABB
         const hx = self.local_aabb_half_extents[0];
@@ -3527,11 +3740,11 @@ pub const Client = struct {
         const uv10 = [2]f32{ 1, 0 };
         const addTri = struct {
             fn call(list: *[36]Vertex, idx: *usize, p0: [3]f32, p1: [3]f32, p2: [3]f32, t0: [2]f32, t1: [2]f32, t2: [2]f32) void {
-                list.*[idx.*] = .{ .pos = p0, .uv = t0, .layer = 0 };
+                list.*[idx.*] = .{ .pos = p0, .uv = t0, .layer = 0, .apply_tint = 0 };
                 idx.* += 1;
-                list.*[idx.*] = .{ .pos = p1, .uv = t1, .layer = 0 };
+                list.*[idx.*] = .{ .pos = p1, .uv = t1, .layer = 0, .apply_tint = 0 };
                 idx.* += 1;
-                list.*[idx.*] = .{ .pos = p2, .uv = t2, .layer = 0 };
+                list.*[idx.*] = .{ .pos = p2, .uv = t2, .layer = 0, .apply_tint = 0 };
                 idx.* += 1;
             }
         }.call;
@@ -3556,7 +3769,7 @@ pub const Client = struct {
         if (i != verts.len) return; // safety
         // Use the 3D pipeline (depth test on). Override binding to use green texture and UI buffer.
         sg.applyPipeline(self.pip);
-        var vs_params: shd_mod.VsParams = .{ .mvp = vs_in.mvp };
+        var vs_params: shd_mod.VsParams = .{ .mvp = vs_in.mvp, .region_info = .{ 0, 0, 1.0 / 512.0, 0 } };
         sg.applyUniforms(0, sg.asRange(&vs_params));
         var b = self.bind;
         b.vertex_buffers[0] = self.aabb_vbuf;

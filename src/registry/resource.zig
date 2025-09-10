@@ -33,6 +33,15 @@ pub const BlockRes = union(enum) {
         face_path: []const u8,
         other_path: []const u8,
     },
+    /// AxisAlignedTintedPrimary: primary face on +Y (top) uses primary_face_path and is tinted
+    /// using a biome tint key (e.g., "grass"); the -Y (bottom) face and the four sides use other textures.
+    /// Future: allow selecting primary axis; for now only +Y is supported.
+    AxisAlignedTintedPrimary: struct {
+        primary_face_path: []const u8, // +Y face
+        bottom_face_path: []const u8, // -Y face
+        side_face_path: []const u8, // X/Z faces
+        tint_key: []const u8, // biome tint key to apply on primary face
+    },
 };
 
 pub const Registry = struct {
@@ -53,6 +62,12 @@ pub const Registry = struct {
                 .Facing => |f| {
                     self.allocator.free(@constCast(f.face_path));
                     self.allocator.free(@constCast(f.other_path));
+                },
+                .AxisAlignedTintedPrimary => |a| {
+                    self.allocator.free(@constCast(a.primary_face_path));
+                    self.allocator.free(@constCast(a.bottom_face_path));
+                    self.allocator.free(@constCast(a.side_face_path));
+                    self.allocator.free(@constCast(a.tint_key));
                 },
                 .Void => {},
             }
@@ -81,6 +96,15 @@ pub const Registry = struct {
         try self.replace(block_key, res);
     }
 
+    pub fn setAxisAlignedTintedPrimary(self: *Registry, block_key: []const u8, primary_face_path_in: []const u8, bottom_face_path_in: []const u8, side_face_path_in: []const u8, tint_key_in: []const u8) !void {
+        const p = try self.allocator.dupe(u8, primary_face_path_in);
+        const b = try self.allocator.dupe(u8, bottom_face_path_in);
+        const s = try self.allocator.dupe(u8, side_face_path_in);
+        const tk = try self.allocator.dupe(u8, tint_key_in);
+        const res = BlockRes{ .AxisAlignedTintedPrimary = .{ .primary_face_path = p, .bottom_face_path = b, .side_face_path = s, .tint_key = tk } };
+        try self.replace(block_key, res);
+    }
+
     pub fn get(self: *const Registry, block_key: []const u8) ?BlockRes {
         if (self.by_block.get(block_key)) |r| return r;
         return null;
@@ -94,6 +118,12 @@ pub const Registry = struct {
                 .Facing => |f| {
                     self.allocator.free(@constCast(f.face_path));
                     self.allocator.free(@constCast(f.other_path));
+                },
+                .AxisAlignedTintedPrimary => |a| {
+                    self.allocator.free(@constCast(a.primary_face_path));
+                    self.allocator.free(@constCast(a.bottom_face_path));
+                    self.allocator.free(@constCast(a.side_face_path));
+                    self.allocator.free(@constCast(a.tint_key));
                 },
                 .Void => {},
             }
