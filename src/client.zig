@@ -259,7 +259,9 @@ const firstPersonHorizontalScheme: ControlScheme = .{
     .makeViewProj = cs_fph_makeViewProj,
 };
 
-const Vertex = struct { pos: [3]f32, uv: [2]f32, layer: f32, apply_tint: f32 };
+const Vertex = struct { pos: [3]f32, uv: [2]f32, rect_min: [2]f32, rect_size: [2]f32, layer: f32, apply_tint: f32 };
+
+const AtlasUv = struct { aidx: u32, u0: f32, v0: f32, u1: f32, v1: f32 };
 
 // ThirdPersonIsometric control scheme
 fn cs_iso_onMouseMove(ctx: *anyopaque, ev: sapp.Event) void {
@@ -395,14 +397,14 @@ inline fn wrap01m(v: f32) f32 {
     return if (f == 0.0 and v > 0.0) 1.0 else f;
 }
 
-inline fn emitQuad(allocator: std.mem.Allocator, list: *std.ArrayList(Vertex), v0: [3]f32, v1: [3]f32, v2: [3]f32, v3: [3]f32, uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32, layer: f32, apply_tint: f32) void {
-    // Store tile-local UVs (may be >1) and the texture-array layer index; shader applies fract
-    list.append(allocator, .{ .pos = v0, .uv = uv0, .layer = layer, .apply_tint = apply_tint }) catch return;
-    list.append(allocator, .{ .pos = v1, .uv = uv1, .layer = layer, .apply_tint = apply_tint }) catch return;
-    list.append(allocator, .{ .pos = v2, .uv = uv2, .layer = layer, .apply_tint = apply_tint }) catch return;
-    list.append(allocator, .{ .pos = v0, .uv = uv0, .layer = layer, .apply_tint = apply_tint }) catch return;
-    list.append(allocator, .{ .pos = v2, .uv = uv2, .layer = layer, .apply_tint = apply_tint }) catch return;
-    list.append(allocator, .{ .pos = v3, .uv = uv3, .layer = layer, .apply_tint = apply_tint }) catch return;
+inline fn emitQuad(allocator: std.mem.Allocator, list: *std.ArrayList(Vertex), v0: [3]f32, v1: [3]f32, v2: [3]f32, v3: [3]f32, uv0: [2]f32, uv1: [2]f32, uv2: [2]f32, uv3: [2]f32, rect_min: [2]f32, rect_size: [2]f32, layer: f32, apply_tint: f32) void {
+    // Store tile-space UVs and atlas rect; shader applies fract and scales into atlas space
+    list.append(allocator, .{ .pos = v0, .uv = uv0, .rect_min = rect_min, .rect_size = rect_size, .layer = layer, .apply_tint = apply_tint }) catch return;
+    list.append(allocator, .{ .pos = v1, .uv = uv1, .rect_min = rect_min, .rect_size = rect_size, .layer = layer, .apply_tint = apply_tint }) catch return;
+    list.append(allocator, .{ .pos = v2, .uv = uv2, .rect_min = rect_min, .rect_size = rect_size, .layer = layer, .apply_tint = apply_tint }) catch return;
+    list.append(allocator, .{ .pos = v0, .uv = uv0, .rect_min = rect_min, .rect_size = rect_size, .layer = layer, .apply_tint = apply_tint }) catch return;
+    list.append(allocator, .{ .pos = v2, .uv = uv2, .rect_min = rect_min, .rect_size = rect_size, .layer = layer, .apply_tint = apply_tint }) catch return;
+    list.append(allocator, .{ .pos = v3, .uv = uv3, .rect_min = rect_min, .rect_size = rect_size, .layer = layer, .apply_tint = apply_tint }) catch return;
 }
 
 // Cached mesh types (region-level aggregation)
@@ -515,12 +517,12 @@ fn buildQuadVerts(out: []Vertex, x0: f32, y0: f32, size: f32) usize {
     if (out.len < 6) return 0;
     const x1: f32 = x0 + size;
     const y1: f32 = y0 + size;
-    out[0] = .{ .pos = .{ x0, y0 }, .uv = .{ 0, 0 }, .layer = 0, .apply_tint = 0 };
-    out[1] = .{ .pos = .{ x1, y0 }, .uv = .{ 1, 0 }, .layer = 0, .apply_tint = 0 };
-    out[2] = .{ .pos = .{ x1, y1 }, .uv = .{ 1, 1 }, .layer = 0, .apply_tint = 0 };
-    out[3] = .{ .pos = .{ x0, y0 }, .uv = .{ 0, 0 }, .layer = 0, .apply_tint = 0 };
-    out[4] = .{ .pos = .{ x1, y1 }, .uv = .{ 1, 1 }, .layer = 0, .apply_tint = 0 };
-    out[5] = .{ .pos = .{ x0, y1 }, .uv = .{ 0, 1 }, .layer = 0, .apply_tint = 0 };
+    out[0] = .{ .pos = .{ x0, y0 }, .uv = .{ 0, 0 }, .rect_min = .{ 0, 0 }, .rect_size = .{ 1, 1 }, .layer = 0, .apply_tint = 0 };
+    out[1] = .{ .pos = .{ x1, y0 }, .uv = .{ 1, 0 }, .rect_min = .{ 0, 0 }, .rect_size = .{ 1, 1 }, .layer = 0, .apply_tint = 0 };
+    out[2] = .{ .pos = .{ x1, y1 }, .uv = .{ 1, 1 }, .rect_min = .{ 0, 0 }, .rect_size = .{ 1, 1 }, .layer = 0, .apply_tint = 0 };
+    out[3] = .{ .pos = .{ x0, y0 }, .uv = .{ 0, 0 }, .rect_min = .{ 0, 0 }, .rect_size = .{ 1, 1 }, .layer = 0, .apply_tint = 0 };
+    out[4] = .{ .pos = .{ x1, y1 }, .uv = .{ 1, 1 }, .rect_min = .{ 0, 0 }, .rect_size = .{ 1, 1 }, .layer = 0, .apply_tint = 0 };
+    out[5] = .{ .pos = .{ x0, y1 }, .uv = .{ 0, 1 }, .rect_min = .{ 0, 0 }, .rect_size = .{ 1, 1 }, .layer = 0, .apply_tint = 0 };
     return 6;
 }
 
@@ -623,219 +625,294 @@ fn buildTextureArrayFromPaths(allocator: std.mem.Allocator, paths: []const []con
     return .{ .pixels = all_pixels, .w = tile_w, .h = tile_h };
 }
 
-fn addUniquePath(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), s: []const u8) !void {
+fn addUniqueId(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), s: []const u8) !void {
     // Avoid duplicates by linear scan (small N)
     for (list.items) |p| if (std.mem.eql(u8, p, s)) return;
     try list.append(allocator, s);
 }
 
-fn findIndexForPath(paths: []const []const u8, s: []const u8) ?usize {
+fn findIndexForId(ids: []const []const u8, s: []const u8) ?usize {
     var i: usize = 0;
-    while (i < paths.len) : (i += 1) if (std.mem.eql(u8, paths[i], s)) return i;
+    while (i < ids.len) : (i += 1) if (std.mem.eql(u8, ids[i], s)) return i;
     return null;
 }
 
-fn buildTextureArray(self: *Client) void {
-    // Collect unique paths from resource registry
-    var paths = std.ArrayList([]const u8).initCapacity(self.allocator, 0) catch {
+fn inferTileSide(len_rgba: usize) ?u32 {
+    if (len_rgba % 4 != 0) return null;
+    const pixels: usize = len_rgba / 4;
+    var s: u32 = 1;
+    while (@as(usize, s) * @as(usize, s) < pixels) : (s += 1) {}
+    if (@as(usize, s) * @as(usize, s) != pixels) return null;
+    if ((s & (s - 1)) != 0) return null;
+    return s;
+}
+
+fn loadAllTxtrSlices(_: *Client, allocator: std.mem.Allocator) !struct { pixels: []u8, w: u32, h: u32, ids: [][]const u8 } {
+    const texbin = @import("texture.zig");
+    // Collect all .txtr files under resources/
+    var ids = std.ArrayList([]const u8).empty;
+    var slices = std.ArrayList(struct { w: u32, h: u32, pixels: []u8 }).empty;
+    errdefer {
+        for (slices.items) |s| if (s.pixels.len > 0) allocator.free(s.pixels);
+        slices.deinit(allocator);
+        for (ids.items) |id| allocator.free(id);
+        ids.deinit(allocator);
+    }
+
+    var stack = std.ArrayList([]const u8).empty;
+    defer {
+        for (stack.items) |p| allocator.free(p);
+        stack.deinit(allocator);
+    }
+    try stack.append(allocator, try allocator.dupe(u8, "resources"));
+
+    while (stack.items.len > 0) {
+        const dir_path = stack.pop().?;
+        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch {
+            allocator.free(dir_path);
+            continue;
+        };
+        defer dir.close();
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            if (entry.kind == .directory) {
+                if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+                const child = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+                try stack.append(allocator, child);
+                continue;
+            }
+            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".txtr")) {
+                const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+                defer allocator.free(file_path);
+                // Read file
+                var f = try std.fs.cwd().openFile(file_path, .{});
+                defer f.close();
+                const stat = try f.stat();
+                const buf = try allocator.alloc(u8, stat.size);
+                errdefer allocator.free(buf);
+                _ = try f.readAll(buf);
+                // Parse
+                const tex = texbin.Binary.parse(buf) catch {
+                    allocator.free(buf);
+                    continue;
+                };
+                const side = inferTileSide(tex.rgba8.len) orelse {
+                    allocator.free(buf);
+                    continue;
+                };
+                // Own id slice and rgba copy (we own the buffer already; tex references it)
+                const id_bytes = try allocator.dupe(u8, tex.idSpan());
+                try ids.append(allocator, id_bytes);
+                // Move pixels ownership into slices; keep buf around until texture is appended
+                try slices.append(allocator, .{ .w = side, .h = side, .pixels = buf });
+            }
+        }
+        allocator.free(dir_path);
+    }
+
+    if (slices.items.len == 0) {
+        return .{ .pixels = &[_]u8{}, .w = 1, .h = 1, .ids = &[_][]const u8{} };
+    }
+
+    // Determine max tile size
+    var max_w: u32 = 0;
+    var max_h: u32 = 0;
+    for (slices.items) |s| {
+        if (s.w > max_w) max_w = s.w;
+        if (s.h > max_h) max_h = s.h;
+    }
+    const tile_w: u32 = if (max_w == 0) 16 else max_w;
+    const tile_h: u32 = if (max_h == 0) 16 else max_h;
+
+    // Concatenate slices (each slice is tightly packed w*h*4)
+    const total_bytes: usize = @as(usize, slices.items.len) * @as(usize, tile_w) * @as(usize, tile_h) * 4;
+    var all_pixels = try allocator.alloc(u8, total_bytes);
+    @memset(all_pixels, 0);
+
+    var i: usize = 0;
+    while (i < slices.items.len) : (i += 1) {
+        const s = slices.items[i];
+        var py: u32 = 0;
+        while (py < s.h) : (py += 1) {
+            const src_off: usize = @as(usize, py) * @as(usize, s.w) * 4;
+            const dst_slice_base: usize = i * (@as(usize, tile_w) * @as(usize, tile_h) * 4);
+            const dst_row_off: usize = dst_slice_base + (@as(usize, py) * @as(usize, tile_w) * 4);
+            const copy_bytes: usize = @as(usize, s.w) * 4;
+            @memcpy(all_pixels[dst_row_off .. dst_row_off + copy_bytes], s.pixels[src_off .. src_off + copy_bytes]);
+        }
+        // free slice pixel buffer now that it's copied
+        allocator.free(s.pixels);
+    }
+    // free ArrayList backing storage for slices
+    slices.deinit(allocator);
+
+    return .{ .pixels = all_pixels, .w = tile_w, .h = tile_h, .ids = try ids.toOwnedSlice(allocator) };
+}
+
+fn buildBlockAtlases(self: *Client) void {
+    const texbin = @import("texture.zig");
+    const atlas = @import("atlas.zig");
+    // Gather inputs (ids and rgba8) from resources/*.txtr
+    var ids = std.ArrayList([]const u8).empty; // will be transferred into self.atlas_id_storage to keep keys alive
+    var inputs = std.ArrayList(atlas.TextureRef).empty;
+    var bufs = std.ArrayList([]u8).empty;
+    var ids_cstr = std.ArrayList([]u8).empty;
+    defer {
+        // ids are transferred to self.atlas_id_storage to keep key memory alive
+        // (freed in Client.deinit)
+        // ids.deinit is called after transfer below
+        // free owned buffers after use below
+        for (bufs.items) |b| if (b.len > 0) self.allocator.free(b);
+        bufs.deinit(self.allocator);
+        // free owned 0-terminated id copies
+        for (ids_cstr.items) |c| self.allocator.free(c);
+        ids_cstr.deinit(self.allocator);
+        inputs.deinit(self.allocator);
+    }
+
+    var stack = std.ArrayList([]const u8).empty;
+    defer {
+        for (stack.items) |p| self.allocator.free(p);
+        stack.deinit(self.allocator);
+    }
+    const root = self.allocator.dupe(u8, "resources") catch return;
+    stack.append(self.allocator, root) catch return;
+    while (stack.items.len > 0) {
+        const dir_path = stack.pop().?;
+        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch {
+            self.allocator.free(dir_path);
+            continue;
+        };
+        defer dir.close();
+        var it = dir.iterate();
+        while (it.next() catch null) |entry| {
+            if (entry.kind == .directory) {
+                if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+                const child = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+                stack.append(self.allocator, child) catch {};
+                continue;
+            }
+            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".txtr")) {
+                const file_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+                defer self.allocator.free(file_path);
+                var f = std.fs.cwd().openFile(file_path, .{}) catch continue;
+                defer f.close();
+                const st = f.stat() catch continue;
+                const buf = self.allocator.alloc(u8, st.size) catch continue;
+                if ((f.readAll(buf) catch 0) != st.size) {
+                    self.allocator.free(buf);
+                    continue;
+                }
+                const tx = texbin.Binary.parse(buf) catch {
+                    self.allocator.free(buf);
+                    continue;
+                };
+                // Own the buffer; tx.rgba8 references it
+                bufs.append(self.allocator, buf) catch {};
+                const id_bytes = tx.idSpan();
+                const id_owned = self.allocator.dupe(u8, id_bytes) catch continue;
+                ids.append(self.allocator, id_owned) catch {};
+                // make an owned 0-terminated copy for TextureRef.id
+                const id_c = self.allocator.alloc(u8, id_bytes.len + 1) catch continue;
+                @memcpy(id_c[0..id_bytes.len], id_bytes);
+                id_c[id_bytes.len] = 0;
+                ids_cstr.append(self.allocator, id_c) catch {};
+                const id_c_view: [:0]const u8 = id_c[0..id_bytes.len :0];
+                inputs.append(self.allocator, .{ .id = id_c_view, .rgba8 = tx.rgba8 }) catch {};
+            }
+        }
+        self.allocator.free(dir_path);
+    }
+    if (inputs.items.len == 0) {
+        // Fallback: create a 1x1 white atlas so rendering can proceed
+        var white = [_]u8{ 255, 255, 255, 255 };
+        self.atlas_imgs[0] = sg.makeImage(.{
+            .type = ._2D,
+            .width = 1,
+            .height = 1,
+            .num_mipmaps = 1,
+            .pixel_format = .RGBA8,
+            .data = .{ .subimage = .{ .{ sg.asRange(white[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} } } },
+        });
+        self.atlas_views[0] = sg.makeView(.{ .texture = .{ .image = self.atlas_imgs[0] } });
+        self.atlas_count = 1;
         self.textures_ready = true;
         return;
-    };
-    defer paths.deinit(self.allocator);
-    var it = self.sim.reg.resources.by_block.valueIterator();
-    while (it.next()) |res| {
-        switch (res.*) {
-            .Uniform => |u| addUniquePath(self.allocator, &paths, u.all_path) catch {},
-            .Facing => |f| {
-                addUniquePath(self.allocator, &paths, f.face_path) catch {};
-                addUniquePath(self.allocator, &paths, f.other_path) catch {};
-            },
-            .AxisAlignedTintedPrimary => |a| {
-                addUniquePath(self.allocator, &paths, a.primary_face_path) catch {};
-                addUniquePath(self.allocator, &paths, a.bottom_face_path) catch {};
-                addUniquePath(self.allocator, &paths, a.side_face_path) catch {};
-            },
-            .Void => {},
+    }
+
+    // Plan and compose atlases
+    const cfg: atlas.Config = .{ .max_width = 4096, .max_height = 4096, .padding = 1, .case_insensitive = true };
+    const plan = atlas.planDynamic(self.allocator, cfg, inputs.items) catch return;
+    defer {
+        self.allocator.free(plan.atlas_meta);
+        self.allocator.free(plan.entries);
+    }
+
+    self.atlas_count = @min(@as(u32, @intCast(plan.atlas_meta.len)), @as(u32, 4));
+    var out_pixels = std.ArrayList([]u8).empty;
+    defer {
+        for (out_pixels.items) |p| if (p.len > 0) self.allocator.free(p);
+        out_pixels.deinit(self.allocator);
+    }
+
+    var outs = std.ArrayList(@import("atlas.zig").OutAtlas).empty;
+    defer outs.deinit(self.allocator);
+
+    var i: usize = 0;
+    while (i < self.atlas_count) : (i += 1) {
+        const w = plan.atlas_meta[i].width;
+        const h = plan.atlas_meta[i].height;
+        const px = self.allocator.alloc(u8, @as(usize, w) * @as(usize, h) * 4) catch break;
+        out_pixels.append(self.allocator, px) catch {};
+        outs.append(self.allocator, .{ .pixels = px, .width = w, .height = h }) catch {};
+    }
+    atlas.compose(plan, outs.items, inputs.items) catch return;
+
+    // Upload atlases and build views
+    i = 0;
+    while (i < self.atlas_count) : (i += 1) {
+        if (self.atlas_imgs[i].id != 0) sg.destroyImage(self.atlas_imgs[i]);
+        if (self.atlas_views[i].id != 0) sg.destroyView(self.atlas_views[i]);
+        self.atlas_imgs[i] = sg.makeImage(.{
+            .type = ._2D,
+            .width = @intCast(plan.atlas_meta[i].width),
+            .height = @intCast(plan.atlas_meta[i].height),
+            .num_mipmaps = 1,
+            .pixel_format = .RGBA8,
+            .data = .{ .subimage = .{ .{ sg.asRange(out_pixels.items[i]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} } } },
+        });
+        self.atlas_views[i] = sg.makeView(.{ .texture = .{ .image = self.atlas_imgs[i] } });
+    }
+
+    // Build atlas_uvs_by_id
+    self.atlas_uvs_by_id.clearRetainingCapacity();
+    inline for ([_]u32{0}) |_| {}
+    var mapped: usize = 0;
+    for (ids.items, 0..) |id_bytes, idx| {
+        _ = idx;
+        // Find entry by matching span against entries (strip 0-terminator on entry id)
+        var ei: usize = 0;
+        while (ei < plan.entries.len) : (ei += 1) {
+            const e = plan.entries[ei];
+            const entry_id = e.id[0..e.id.len];
+            var matched = std.mem.eql(u8, entry_id, id_bytes);
+            if (!matched and entry_id.len <= id_bytes.len) {
+                matched = std.mem.eql(u8, entry_id, id_bytes[0..entry_id.len]);
+            }
+            if (matched) {
+                // Transfer ownership of id_bytes into atlas_id_storage so map key memory stays alive
+                if (self.atlas_id_storage.append(self.allocator, id_bytes) catch null) |_| {}
+                const uv = AtlasUv{ .aidx = e.atlas_index, .u0 = e.uv.u0, .v0 = e.uv.v0, .u1 = e.uv.u1, .v1 = e.uv.v1 };
+                if (self.atlas_uvs_by_id.put(id_bytes, uv) catch null) |_| {}
+                mapped += 1;
+                break;
+            }
         }
     }
-    if (paths.items.len == 0) {
-        // Nothing to do: create a 1x1x1 fallback array texture
-        var one = [_]u8{ 255, 0, 255, 255 };
-        self.grass_img = sg.makeImage(.{
-            .type = .ARRAY,
-            .width = 1,
-            .height = 1,
-            .num_slices = 1,
-            .pixel_format = .RGBA8,
-            .num_mipmaps = 1,
-            .data = .{
-                .subimage = .{
-                    .{ sg.asRange(one[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                },
-            },
-        });
-        self.default_layer = 0;
-        self.top_layer = 0;
-        self.side_layer = 0;
-        self.textures_ready = true;
-        return;
-    }
-
-    // Clear any previous layer map entries
-    self.layers_by_path.clearRetainingCapacity();
-
-    const built = buildTextureArrayFromPaths(self.allocator, paths.items) catch {
-        // Fallback as above on failure
-        var one = [_]u8{ 255, 0, 255, 255 };
-        self.grass_img = sg.makeImage(.{
-            .type = .ARRAY,
-            .width = 1,
-            .height = 1,
-            .num_slices = 1,
-            .pixel_format = .RGBA8,
-            .num_mipmaps = 1,
-            .data = .{
-                .subimage = .{
-                    .{ sg.asRange(one[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                },
-            },
-        });
-        self.default_layer = 0;
-        self.top_layer = 0;
-        self.side_layer = 0;
-        self.textures_ready = true;
-        return;
-    };
-    defer self.allocator.free(built.pixels);
-
-    // Upload array image to GPU (slices concatenated in built.pixels)
-    self.grass_img = sg.makeImage(.{
-        .type = .ARRAY,
-        .width = @intCast(built.w),
-        .height = @intCast(built.h),
-        .num_slices = @intCast(paths.items.len),
-        .num_mipmaps = 1,
-        .pixel_format = .RGBA8,
-        .data = .{ .subimage = .{
-            .{ sg.asRange(built.pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-            .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-            .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-            .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-            .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-            .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-        } },
-    });
-
-    // Populate layer map for each source path
-    var i_paths: usize = 0;
-    while (i_paths < paths.items.len) : (i_paths += 1) {
-        _ = self.layers_by_path.put(paths.items[i_paths], @intCast(i_paths)) catch {};
-    }
-
-    // Choose defaults: prefer minecraft:dirt, then grass face, then stone, then 0
-    var chosen: bool = false;
-    if (!chosen) {
-        if (self.sim.reg.resources.get("minecraft:dirt")) |r_dirt| switch (r_dirt) {
-            .Uniform => |u| if (findIndexForPath(paths.items, u.all_path)) |idx| {
-                self.default_layer = @intCast(idx);
-                chosen = true;
-            },
-            else => {},
-        };
-    }
-    if (!chosen) {
-        if (self.sim.reg.resources.get("minecraft:grass_block")) |res| switch (res) {
-            .Facing => |f| if (findIndexForPath(paths.items, f.face_path)) |idx| {
-                self.default_layer = @intCast(idx);
-                chosen = true;
-            },
-            .AxisAlignedTintedPrimary => |a| if (findIndexForPath(paths.items, a.primary_face_path)) |idx| {
-                self.default_layer = @intCast(idx);
-                chosen = true;
-            },
-            .Uniform => |u| if (findIndexForPath(paths.items, u.all_path)) |idx| {
-                self.default_layer = @intCast(idx);
-                chosen = true;
-            },
-            .Void => {},
-        };
-    }
-    if (!chosen) {
-        if (self.sim.reg.resources.get("minecraft:stone")) |r_stone| switch (r_stone) {
-            .Uniform => |u| if (findIndexForPath(paths.items, u.all_path)) |idx| {
-                self.default_layer = @intCast(idx);
-                chosen = true;
-            },
-            else => {},
-        };
-    }
-    if (!chosen) {
-        self.default_layer = 0;
-    }
-
-    // Per-face defaults
-    // Top: prefer grass_block face; otherwise dirt; otherwise default
-    var top_set = false;
-    if (!top_set) {
-        if (self.sim.reg.resources.get("minecraft:grass_block")) |res| switch (res) {
-            .Facing => |f| if (findIndexForPath(paths.items, f.face_path)) |idx| {
-                self.top_layer = @intCast(idx);
-                top_set = true;
-            },
-            .AxisAlignedTintedPrimary => |a| if (findIndexForPath(paths.items, a.primary_face_path)) |idx| {
-                self.top_layer = @intCast(idx);
-                top_set = true;
-            },
-            else => {},
-        };
-    }
-    if (!top_set) {
-        if (self.sim.reg.resources.get("minecraft:dirt")) |r_dirt2| switch (r_dirt2) {
-            .Uniform => |u| if (findIndexForPath(paths.items, u.all_path)) |idx| {
-                self.top_layer = @intCast(idx);
-                top_set = true;
-            },
-            else => {},
-        };
-    }
-    if (!top_set) self.top_layer = self.default_layer;
-
-    // Side: prefer grass_block other (dirt), fallback to dirt, then default
-    var side_set = false;
-    if (!side_set) {
-        if (self.sim.reg.resources.get("minecraft:grass_block")) |res2| switch (res2) {
-            .Facing => |f| if (findIndexForPath(paths.items, f.other_path)) |idx| {
-                self.side_layer = @intCast(idx);
-                side_set = true;
-            },
-            .AxisAlignedTintedPrimary => |a| if (findIndexForPath(paths.items, a.side_face_path)) |idx| {
-                self.side_layer = @intCast(idx);
-                side_set = true;
-            },
-            else => {},
-        };
-    }
-    if (!side_set) {
-        if (self.sim.reg.resources.get("minecraft:dirt")) |r_dirt3| switch (r_dirt3) {
-            .Uniform => |u| if (findIndexForPath(paths.items, u.all_path)) |idx| {
-                self.side_layer = @intCast(idx);
-                side_set = true;
-            },
-            else => {},
-        };
-    }
-    if (!side_set) self.side_layer = self.default_layer;
-
+    // After transfer, drop the temporary list structure but NOT the strings
+    ids.deinit(self.allocator);
+    // mapped count only used in debug builds; intentionally unused in release
+    // Mark textures ready after successful atlas upload and mapping
     self.textures_ready = true;
 }
 
@@ -878,11 +955,12 @@ pub const Client = struct {
     // dedicated dynamic buffer for outline (lines) to avoid multiple updates per buffer per frame
     outline_vbuf: sg.Buffer = .{},
     bind: sg.Bindings = .{},
-    // We reuse grass_* for the texture array image/view binding for now
-    grass_img: sg.Image = .{},
-    grass_view: sg.View = .{},
+    // Atlases and bindings
+    atlas_imgs: [4]sg.Image = .{ .{}, .{}, .{}, .{} },
+    atlas_views: [4]sg.View = .{ .{}, .{}, .{}, .{} },
+    atlas_count: u32 = 0,
     sampler: sg.Sampler = .{},
-    // Debug solid-color textures (as 1-slice arrays)
+    // Debug solid-color textures (2D)
     green_img: sg.Image = .{},
     green_view: sg.View = .{},
     black_img: sg.Image = .{},
@@ -892,8 +970,10 @@ pub const Client = struct {
 
     // Per-region tint cache
     region_tint_cache: std.AutoHashMap(simulation.RegionPos, RegionTintEntry) = undefined,
-    // Layer map per texture path
-    layers_by_path: std.StringHashMap(LayerId) = undefined,
+    // Atlas UV map per texture identifier
+    atlas_uvs_by_id: std.StringHashMap(AtlasUv) = undefined,
+    // Storage for owned atlas id strings kept alive for the map keys
+    atlas_id_storage: std.ArrayList([]const u8) = undefined,
 
     // Cached region meshes keyed by region position
     region_mesh_cache: std.AutoHashMap(simulation.RegionPos, RegionMesh) = undefined,
@@ -1007,7 +1087,8 @@ pub const Client = struct {
             .sim = sim,
             .player_id = player_id,
             .account_name = acc,
-            .layers_by_path = std.StringHashMap(LayerId).init(allocator),
+            .atlas_uvs_by_id = std.StringHashMap(AtlasUv).init(allocator),
+            .atlas_id_storage = std.ArrayList([]const u8).initCapacity(allocator, 0) catch unreachable,
             .region_mesh_cache = std.AutoHashMap(simulation.RegionPos, RegionMesh).init(allocator),
             .last_visible_frame_chunk = std.AutoHashMap(gs.ChunkPos, u32).init(allocator),
             .last_visible_frame_region = std.AutoHashMap(simulation.RegionPos, u32).init(allocator),
@@ -1094,12 +1175,15 @@ pub const Client = struct {
         if (self.vbuf.id != 0) sg.destroyBuffer(self.vbuf);
         if (self.aabb_vbuf.id != 0) sg.destroyBuffer(self.aabb_vbuf);
         if (self.outline_vbuf.id != 0) sg.destroyBuffer(self.outline_vbuf);
-        if (self.grass_view.id != 0) sg.destroyView(self.grass_view);
+        // atlas views
+        var ai: usize = 0;
+        while (ai < self.atlas_views.len) : (ai += 1) if (self.atlas_views[ai].id != 0) sg.destroyView(self.atlas_views[ai]);
         if (self.green_view.id != 0) sg.destroyView(self.green_view);
         if (self.black_view.id != 0) sg.destroyView(self.black_view);
         if (self.white_view.id != 0) sg.destroyView(self.white_view);
         if (self.sampler.id != 0) sg.destroySampler(self.sampler);
-        if (self.grass_img.id != 0) sg.destroyImage(self.grass_img);
+        ai = 0;
+        while (ai < self.atlas_imgs.len) : (ai += 1) if (self.atlas_imgs[ai].id != 0) sg.destroyImage(self.atlas_imgs[ai]);
         if (self.green_img.id != 0) sg.destroyImage(self.green_img);
         if (self.black_img.id != 0) sg.destroyImage(self.black_img);
         if (self.white_img.id != 0) sg.destroyImage(self.white_img);
@@ -1145,7 +1229,10 @@ pub const Client = struct {
         }
         self.region_tint_cache.deinit();
 
-        self.layers_by_path.deinit();
+        // Free atlas id storage (keys)
+        for (self.atlas_id_storage.items) |s| self.allocator.free(s);
+        self.atlas_id_storage.deinit(self.allocator);
+        self.atlas_uvs_by_id.deinit();
         self.last_visible_frame_chunk.deinit();
         self.last_visible_frame_region.deinit();
 
@@ -1203,9 +1290,11 @@ pub const Client = struct {
         pdesc.label = "chunk-pipeline";
         pdesc.shader = self.shd;
         pdesc.layout.attrs[0].format = .FLOAT3; // pos
-        pdesc.layout.attrs[1].format = .FLOAT2; // uv
-        pdesc.layout.attrs[2].format = .FLOAT; // layer
-        pdesc.layout.attrs[3].format = .FLOAT; // apply_tint (0 or 1)
+        pdesc.layout.attrs[1].format = .FLOAT2; // uv (tile-space)
+        pdesc.layout.attrs[2].format = .FLOAT2; // rect_min
+        pdesc.layout.attrs[3].format = .FLOAT2; // rect_size
+        pdesc.layout.attrs[4].format = .FLOAT; // layer
+        pdesc.layout.attrs[5].format = .FLOAT; // apply_tint (0 or 1)
         pdesc.primitive_type = .TRIANGLES;
         pdesc.cull_mode = .BACK;
         // Front-face winding should match our emitted CCW triangles
@@ -1255,14 +1344,21 @@ pub const Client = struct {
         self.outline_vbuf_capacity_bytes = outline_initial_bytes;
         self.pass_action.depth = .{ .load_action = .CLEAR, .clear_value = 1.0 };
 
-        // Build texture array from registry resource paths (map already initialized in init)
-        buildTextureArray(self);
-
-        // create a view and sampler for the array (reusing grass_* fields)
-        self.grass_view = sg.makeView(.{ .texture = .{ .image = self.grass_img } });
+        // Build block atlases and register atlas UVs
+        buildBlockAtlases(self);
+        // sampler used for all texture sampling
         self.sampler = sg.makeSampler(.{ .min_filter = .NEAREST, .mag_filter = .NEAREST, .mipmap_filter = .NEAREST, .wrap_u = .CLAMP_TO_EDGE, .wrap_v = .CLAMP_TO_EDGE });
-        // shader expects VIEW_tex_array at slot 1 and SMP_tex_sampler at slot 2
-        self.bind.views[1] = self.grass_view;
+        // shader expects atlas0 at slot 1, and atlas1..3 at 5..7; sampler at slot 2
+        if (self.atlas_count > 0) self.bind.views[1] = self.atlas_views[0];
+        if (self.atlas_count > 1) self.bind.views[5] = self.atlas_views[1];
+        if (self.atlas_count > 2) self.bind.views[6] = self.atlas_views[2];
+        if (self.atlas_count > 3) self.bind.views[7] = self.atlas_views[3];
+        // Fill any missing atlas view slots with a valid fallback
+        const fallback_view = if (self.atlas_count > 0) self.atlas_views[0] else self.white_view;
+        if (self.bind.views[1].id == 0) self.bind.views[1] = fallback_view;
+        if (self.bind.views[5].id == 0) self.bind.views[5] = fallback_view;
+        if (self.bind.views[6].id == 0) self.bind.views[6] = fallback_view;
+        if (self.bind.views[7].id == 0) self.bind.views[7] = fallback_view;
         self.bind.samplers[2] = self.sampler;
         // chunk tint will use view slot 3 and sampler slot 4 (reuse same sampler)
         self.bind.samplers[4] = self.sampler;
@@ -1271,10 +1367,9 @@ pub const Client = struct {
         {
             var green = [_]u8{ 0, 255, 0, 255 };
             self.green_img = sg.makeImage(.{
-                .type = .ARRAY,
+                .type = ._2D,
                 .width = 1,
                 .height = 1,
-                .num_slices = 1,
                 .num_mipmaps = 1,
                 .pixel_format = .RGBA8,
                 .data = .{ .subimage = .{ .{ sg.asRange(green[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} } } },
@@ -1307,10 +1402,9 @@ pub const Client = struct {
         {
             var black = [_]u8{ 0, 0, 0, 255 };
             self.black_img = sg.makeImage(.{
-                .type = .ARRAY,
+                .type = ._2D,
                 .width = 1,
                 .height = 1,
-                .num_slices = 1,
                 .num_mipmaps = 1,
                 .pixel_format = .RGBA8,
                 .data = .{ .subimage = .{ .{ sg.asRange(black[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} } } },
@@ -1512,7 +1606,7 @@ pub const Client = struct {
         var vs_params: shd_mod.VsParams = .{ .mvp = mvp, .region_info = .{ 0, 0, 1.0 / 512.0, 0 } };
 
         // Render cached meshes (build on demand)
-        if (self.grass_img.id != 0) {
+        if (self.atlas_count > 0) {
             sg.applyPipeline(self.pip);
             sg.applyUniforms(0, sg.asRange(&vs_params));
             self.renderWorldCached(&vs_params);
@@ -2162,7 +2256,7 @@ pub const Client = struct {
         var vi: usize = 0;
         const make_vert = struct {
             fn call(p: [3]f32) Vertex {
-                return .{ .pos = p, .uv = .{ 0, 0 }, .layer = 0, .apply_tint = 0 };
+                return .{ .pos = p, .uv = .{ 0, 0 }, .rect_min = .{ 0, 0 }, .rect_size = .{ 1, 1 }, .layer = 0, .apply_tint = 0 };
             }
         }.call;
         const normalize3 = struct {
@@ -2542,8 +2636,8 @@ pub const Client = struct {
         const PalInfo = struct {
             draw: bool,
             solid: bool,
-            top_layer: LayerId,
-            side_layer: LayerId,
+            top_uv: AtlasUv,
+            side_uv: AtlasUv,
             top_apply_tint: bool,
         };
         var pal_info = std.ArrayList(PalInfo).initCapacity(self.allocator, pal_len) catch {
@@ -2556,8 +2650,8 @@ pub const Client = struct {
             var pinfo: PalInfo = .{
                 .draw = true,
                 .solid = true,
-                .top_layer = self.top_layer,
-                .side_layer = self.side_layer,
+                .top_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
+                .side_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
                 .top_apply_tint = false,
             };
             if (bid < self.sim.reg.blocks.items.len) {
@@ -2574,24 +2668,19 @@ pub const Client = struct {
                         pinfo.solid = false;
                     },
                     .Uniform => |u| {
-                        const layer: LayerId = self.layers_by_path.get(u.all_path) orelse self.default_layer;
-                        pinfo.top_layer = layer;
-                        pinfo.side_layer = layer;
+                        if (self.atlas_uvs_by_id.get(u.all_id)) |uv| {
+                            pinfo.top_uv = uv;
+                            pinfo.side_uv = uv;
+                        }
                     },
                     .Facing => |f| {
-                        const top_layer: LayerId = self.layers_by_path.get(f.face_path) orelse self.default_layer;
-                        const side_layer: LayerId = self.layers_by_path.get(f.other_path) orelse self.default_layer;
-                        pinfo.top_layer = top_layer;
-                        pinfo.side_layer = side_layer;
+                        if (self.atlas_uvs_by_id.get(f.face_id)) |uvt| pinfo.top_uv = uvt;
+                        if (self.atlas_uvs_by_id.get(f.other_id)) |uvs| pinfo.side_uv = uvs;
                     },
                     .AxisAlignedTintedPrimary => |a| {
-                        const top_layer: LayerId = self.layers_by_path.get(a.primary_face_path) orelse self.default_layer;
-                        const side_layer: LayerId = self.layers_by_path.get(a.side_face_path) orelse self.default_layer;
-                        const bottom_layer: LayerId = self.layers_by_path.get(a.bottom_face_path) orelse self.default_layer;
-                        _ = bottom_layer;
-                        pinfo.top_layer = top_layer;
-                        pinfo.side_layer = side_layer;
-                        // bottom uses side_layer when we emit bottom quads below; tint applies only to top
+                        if (self.atlas_uvs_by_id.get(a.primary_face_id)) |uvt| pinfo.top_uv = uvt;
+                        if (self.atlas_uvs_by_id.get(a.side_face_id)) |uvs| pinfo.side_uv = uvs;
+                        _ = a.bottom_face_id; // bottom uses side_uv
                         pinfo.top_apply_tint = true;
                     },
                 };
@@ -2600,10 +2689,10 @@ pub const Client = struct {
         }
 
         // Greedy meshing for +Y (top) faces per Y-slice to drastically reduce vertex count
-        const FaceMat = struct { layer: LayerId, apply_tint: bool };
+        const FaceMat = struct { uv: AtlasUv, apply_tint: bool };
         const Mat = struct {
             fn eq(a: FaceMat, b: FaceMat) bool {
-                return a.layer == b.layer and a.apply_tint == b.apply_tint;
+                return a.apply_tint == b.apply_tint and a.uv.aidx == b.uv.aidx and a.uv.u0 == b.uv.u0 and a.uv.v0 == b.uv.v0 and a.uv.u1 == b.uv.u1 and a.uv.v1 == b.uv.v1;
             }
         };
         const MaskCell = struct { present: bool, m: FaceMat };
@@ -2627,7 +2716,7 @@ pub const Client = struct {
                     if (!info.draw) continue;
                     // top visible if neighbor above not solid
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(mx)), abs_y + 1, @as(i32, @intCast(mz)))) {
-                        mask[idx] = .{ .present = true, .m = .{ .layer = info.top_layer, .apply_tint = info.top_apply_tint } };
+                        mask[idx] = .{ .present = true, .m = .{ .uv = info.top_uv, .apply_tint = info.top_apply_tint } };
                     }
                 }
             }
@@ -2660,12 +2749,16 @@ pub const Client = struct {
                     const wx1: f32 = base_x + @as(f32, @floatFromInt(mx + w));
                     const wz1: f32 = base_z + @as(f32, @floatFromInt(mz + h));
                     const wy1: f32 = @as(f32, @floatFromInt(abs_y + 1));
-                    // UVs repeat across the merged area (0..w, 0..h)
+                    // Greedy top face: tile-space UVs span the rectangle size (w x h)
+                    const du: f32 = mkey.uv.u1 - mkey.uv.u0;
+                    const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
+                    const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
+                    const rsize = [2]f32{ du, dv };
                     const uv00: [2]f32 = .{ 0, 0 };
-                    const uv0h: [2]f32 = .{ 0, @as(f32, @floatFromInt(h)) };
-                    const uvwh: [2]f32 = .{ @as(f32, @floatFromInt(w)), @as(f32, @floatFromInt(h)) };
-                    const uvw0: [2]f32 = .{ @as(f32, @floatFromInt(w)), 0 };
-                    emitQuad(self.allocator, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv0h, uvwh, uvw0, @floatFromInt(mkey.layer), if (mkey.apply_tint) 1.0 else 0.0);
+                    const uv0h: [2]f32 = .{ 0, @floatFromInt(h) };
+                    const uvwh: [2]f32 = .{ @floatFromInt(w), @floatFromInt(h) };
+                    const uvw0: [2]f32 = .{ @floatFromInt(w), 0 };
+                    emitQuad(self.allocator, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv0h, uvwh, uvw0, rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
                     // clear mask for used cells
                     var zz: usize = 0;
                     while (zz < h) : (zz += 1) {
@@ -2697,26 +2790,32 @@ pub const Client = struct {
 
                     const abs_y_this: i32 = section_base_y + @as(i32, @intCast(ly));
 
-                    const uv00: [2]f32 = .{ 0, 0 };
-                    const uv01: [2]f32 = .{ 0, 1 };
-                    const uv11: [2]f32 = .{ 1, 1 };
-                    const uv10: [2]f32 = .{ 1, 0 };
+                    // Side/bottom faces: 0..1 tile UVs mapped into atlas rect
+                    const du_s: f32 = info.side_uv.u1 - info.side_uv.u0;
+                    const dv_s: f32 = info.side_uv.v1 - info.side_uv.v0;
+                    const rmin = [2]f32{ info.side_uv.u0, info.side_uv.v0 };
+                    const rsize = [2]f32{ du_s, dv_s };
+                    // Tile-space UVs chosen to map atlas top to world top (v=1 at top)
+                    const t00: [2]f32 = .{ 0, 1 };
+                    const t01: [2]f32 = .{ 0, 0 };
+                    const t11: [2]f32 = .{ 1, 0 };
+                    const t10: [2]f32 = .{ 1, 1 };
 
                     if (false) {}
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this - 1, @as(i32, @intCast(lz)))) {
-                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
+                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, t00, t01, t11, t10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
                     }
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) - 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                        emitQuad(self.allocator, out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
+                        emitQuad(self.allocator, out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, t00, t01, t11, t10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
                     }
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) + 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                        emitQuad(self.allocator, out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
+                        emitQuad(self.allocator, out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, t00, t01, t11, t10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
                     }
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) - 1)) {
-                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
+                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, t00, t01, t11, t10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
                     }
                     if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) + 1)) {
-                        emitQuad(self.allocator, out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
+                        emitQuad(self.allocator, out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, t00, t01, t11, t10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
                     }
                 }
             }
@@ -2970,8 +3069,8 @@ pub const Client = struct {
         const PalInfo = struct {
             draw: bool,
             solid: bool,
-            top_layer: LayerId,
-            side_layer: LayerId,
+            top_uv: AtlasUv,
+            side_uv: AtlasUv,
             top_apply_tint: bool,
         };
         var pal_info = std.ArrayList(PalInfo).initCapacity(self.allocator, pal_len) catch {
@@ -2984,8 +3083,8 @@ pub const Client = struct {
             var pinfo: PalInfo = .{
                 .draw = true,
                 .solid = true,
-                .top_layer = self.top_layer,
-                .side_layer = self.side_layer,
+                .top_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
+                .side_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
                 .top_apply_tint = false,
             };
             if (bid < self.sim.reg.blocks.items.len) {
@@ -3002,23 +3101,19 @@ pub const Client = struct {
                         pinfo.solid = false;
                     },
                     .Uniform => |u| {
-                        const layer: LayerId = self.layers_by_path.get(u.all_path) orelse self.default_layer;
-                        pinfo.top_layer = layer;
-                        pinfo.side_layer = layer;
+                        if (self.atlas_uvs_by_id.get(u.all_id)) |uv| {
+                            pinfo.top_uv = uv;
+                            pinfo.side_uv = uv;
+                        }
                     },
                     .Facing => |f| {
-                        const top_layer: LayerId = self.layers_by_path.get(f.face_path) orelse self.default_layer;
-                        const side_layer: LayerId = self.layers_by_path.get(f.other_path) orelse self.default_layer;
-                        pinfo.top_layer = top_layer;
-                        pinfo.side_layer = side_layer;
+                        if (self.atlas_uvs_by_id.get(f.face_id)) |uvt| pinfo.top_uv = uvt;
+                        if (self.atlas_uvs_by_id.get(f.other_id)) |uvs| pinfo.side_uv = uvs;
                     },
                     .AxisAlignedTintedPrimary => |a| {
-                        const top_layer: LayerId = self.layers_by_path.get(a.primary_face_path) orelse self.default_layer;
-                        const side_layer: LayerId = self.layers_by_path.get(a.side_face_path) orelse self.default_layer;
-                        const bottom_layer: LayerId = self.layers_by_path.get(a.bottom_face_path) orelse self.default_layer;
-                        _ = bottom_layer; // currently sides/bottom emitted with side_layer
-                        pinfo.top_layer = top_layer;
-                        pinfo.side_layer = side_layer;
+                        if (self.atlas_uvs_by_id.get(a.primary_face_id)) |uvt| pinfo.top_uv = uvt;
+                        if (self.atlas_uvs_by_id.get(a.side_face_id)) |uvs| pinfo.side_uv = uvs;
+                        _ = a.bottom_face_id; // currently sides/bottom use side_uv
                         pinfo.top_apply_tint = true;
                     },
                 };
@@ -3027,10 +3122,10 @@ pub const Client = struct {
         }
 
         // Greedy top faces per Y-slice
-        const FaceMat = struct { layer: LayerId, apply_tint: bool };
+        const FaceMat = struct { uv: AtlasUv, apply_tint: bool };
         const Mat = struct {
             fn eq(a: FaceMat, b: FaceMat) bool {
-                return a.layer == b.layer and a.apply_tint == b.apply_tint;
+                return a.apply_tint == b.apply_tint and a.uv.aidx == b.uv.aidx and a.uv.u0 == b.uv.u0 and a.uv.v0 == b.uv.v0 and a.uv.u1 == b.uv.u1 and a.uv.v1 == b.uv.v1;
             }
         };
         const section_base_y: i32 = @as(i32, @intCast(sy * constants.section_height)) - @as(i32, @intCast(snap.sections_below)) * @as(i32, @intCast(constants.section_height));
@@ -3051,7 +3146,7 @@ pub const Client = struct {
                     const info = pal_info.items[pidx];
                     if (!info.draw) continue;
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(mx)), abs_y + 1, @as(i32, @intCast(mz)))) {
-                        mask[idxm] = .{ .present = true, .m = .{ .layer = info.top_layer, .apply_tint = info.top_apply_tint } };
+                        mask[idxm] = .{ .present = true, .m = .{ .uv = info.top_uv, .apply_tint = info.top_apply_tint } };
                     }
                 }
             }
@@ -3084,11 +3179,15 @@ pub const Client = struct {
                     const wx1: f32 = base_x + @as(f32, @floatFromInt(mx + w));
                     const wz1: f32 = base_z + @as(f32, @floatFromInt(mz + h));
                     const wy1: f32 = @as(f32, @floatFromInt(abs_y + 1));
+                    const du: f32 = mkey.uv.u1 - mkey.uv.u0;
+                    const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
+                    const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
+                    const rsize = [2]f32{ du, dv };
                     const uv00: [2]f32 = .{ 0, 0 };
-                    const uv0h: [2]f32 = .{ 0, @as(f32, @floatFromInt(h)) };
-                    const uvwh: [2]f32 = .{ @as(f32, @floatFromInt(w)), @as(f32, @floatFromInt(h)) };
-                    const uvw0: [2]f32 = .{ @as(f32, @floatFromInt(w)), 0 };
-                    emitQuad(alloc, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv0h, uvwh, uvw0, @floatFromInt(mkey.layer), if (mkey.apply_tint) 1.0 else 0.0);
+                    const uv0h: [2]f32 = .{ 0, @floatFromInt(h) };
+                    const uvwh: [2]f32 = .{ @floatFromInt(w), @floatFromInt(h) };
+                    const uvw0: [2]f32 = .{ @floatFromInt(w), 0 };
+                    emitQuad(alloc, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv0h, uvwh, uvw0, rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
                     // clear mask
                     var zz: usize = 0;
                     while (zz < h) : (zz += 1) {
@@ -3117,29 +3216,34 @@ pub const Client = struct {
                     const wz1: f32 = wz0 + 1.0;
 
                     const abs_y_this: i32 = section_base_y + @as(i32, @intCast(ly));
-                    const uv00: [2]f32 = .{ 0, 0 };
-                    const uv01: [2]f32 = .{ 0, 1 };
-                    const uv11: [2]f32 = .{ 1, 1 };
-                    const uv10: [2]f32 = .{ 1, 0 };
+                    // Tile-space 0..1 mapping with V flipped so atlas top maps to world top
+                    const du_s: f32 = info.side_uv.u1 - info.side_uv.u0;
+                    const dv_s: f32 = info.side_uv.v1 - info.side_uv.v0;
+                    const rmin = [2]f32{ info.side_uv.u0, info.side_uv.v0 };
+                    const rsize = [2]f32{ du_s, dv_s };
+                    const uv00: [2]f32 = .{ 0, 1 };
+                    const uv01: [2]f32 = .{ 0, 0 };
+                    const uv11: [2]f32 = .{ 1, 0 };
+                    const uv10: [2]f32 = .{ 1, 1 };
 
                     // Top faces are already emitted via greedy rectangles above; skip here to avoid z-fighting
                     // if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this + 1, @as(i32, @intCast(lz)))) {
-                    //     emitQuad(alloc, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.top_layer), 0.0);
+                    //     emitQuad(alloc, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv01, uv11, uv10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
                     // }
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this - 1, @as(i32, @intCast(lz)))) {
-                        emitQuad(alloc, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
+                        emitQuad(alloc, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
                     }
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) - 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                        emitQuad(alloc, out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
+                        emitQuad(alloc, out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, uv00, uv01, uv11, uv10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
                     }
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) + 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                        emitQuad(alloc, out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
+                        emitQuad(alloc, out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, uv00, uv01, uv11, uv10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
                     }
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) - 1)) {
-                        emitQuad(alloc, out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
+                        emitQuad(alloc, out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, uv00, uv01, uv11, uv10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
                     }
                     if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) + 1)) {
-                        emitQuad(alloc, out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, @floatFromInt(info.side_layer), 0.0);
+                        emitQuad(alloc, out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
                     }
                 }
             }
@@ -3336,10 +3440,9 @@ pub const Client = struct {
             const region_origin_z: f32 = @floatFromInt(rp.z * 32 * @as(i32, @intCast(constants.chunk_size_z)));
             vs_loc.region_info = .{ region_origin_x, region_origin_z, 1.0 / 512.0, 0 };
 
-            // Bind region buffer once
+            // Prepare base bindings; per-draw we will set views and apply
             var b = self.bind;
             b.vertex_buffers[0] = rmesh.vbuf;
-            sg.applyBindings(b);
 
             // Draw visible sections in this region
             var di: usize = 0;
@@ -3360,7 +3463,10 @@ pub const Client = struct {
                 const tint_view = self.ensureRegionTintView(rp);
                 var bdraw = self.bind;
                 bdraw.vertex_buffers[0] = rmesh.vbuf;
-                bdraw.views[1] = self.grass_view;
+                if (self.atlas_count > 0) bdraw.views[1] = self.atlas_views[0];
+                if (self.atlas_count > 1) bdraw.views[5] = self.atlas_views[1];
+                if (self.atlas_count > 2) bdraw.views[6] = self.atlas_views[2];
+                if (self.atlas_count > 3) bdraw.views[7] = self.atlas_views[3];
                 if (tint_view.id != 0) bdraw.views[3] = tint_view;
                 sg.applyBindings(bdraw);
                 sg.applyUniforms(0, sg.asRange(&vs_loc));
@@ -3740,11 +3846,11 @@ pub const Client = struct {
         const uv10 = [2]f32{ 1, 0 };
         const addTri = struct {
             fn call(list: *[36]Vertex, idx: *usize, p0: [3]f32, p1: [3]f32, p2: [3]f32, t0: [2]f32, t1: [2]f32, t2: [2]f32) void {
-                list.*[idx.*] = .{ .pos = p0, .uv = t0, .layer = 0, .apply_tint = 0 };
+                list.*[idx.*] = .{ .pos = p0, .uv = t0, .rect_min = .{ 0, 0 }, .rect_size = .{ 1, 1 }, .layer = 0, .apply_tint = 0 };
                 idx.* += 1;
-                list.*[idx.*] = .{ .pos = p1, .uv = t1, .layer = 0, .apply_tint = 0 };
+                list.*[idx.*] = .{ .pos = p1, .uv = t1, .rect_min = .{ 0, 0 }, .rect_size = .{ 1, 1 }, .layer = 0, .apply_tint = 0 };
                 idx.* += 1;
-                list.*[idx.*] = .{ .pos = p2, .uv = t2, .layer = 0, .apply_tint = 0 };
+                list.*[idx.*] = .{ .pos = p2, .uv = t2, .rect_min = .{ 0, 0 }, .rect_size = .{ 1, 1 }, .layer = 0, .apply_tint = 0 };
                 idx.* += 1;
             }
         }.call;

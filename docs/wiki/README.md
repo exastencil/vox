@@ -9,6 +9,7 @@ This folder contains technical documentation and design notes for the Vox Aetatu
 - Eighth-Subdivision Geometry (Octant Bitmask): See `geometry-eighths.md`.
 - Constants and Limits (quick reference): See `constants-and-limits.md`.
 - Minecraft Technical Summary (reference): See `minecraft-technical-summary.md` for an overview of systems we aim to replicate as a baseline for the engine and the base game mods.
+- Texture Atlases and Sampling: See `rendering-texture-atlases.md` for the current texture pipeline (2D atlases, shader IO, tiling, and bindings).
 - World Generation Stages and Hooks: See `worldgen-stages.md` for the staged pipeline, chunk statuses, and mod hook points.
 
 Over time we will expand this with:

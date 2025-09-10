@@ -4,9 +4,12 @@
 
 @vs vs
 in vec3 pos;
-// tile-local UVs (may be >1.0 to indicate repeats)
+// tile-space UVs (may be >1.0 to indicate repeats)
 in vec2 uv0;
-// per-vertex texture array layer index (as float; integer layer = floor(layer_f))
+// atlas rect (min and size) used to convert tile-space to atlas-space
+in vec2 rect_min;
+in vec2 rect_size;
+// per-vertex atlas index (as float; integer layer = floor(layer_f))
 in float layer_f;
 // whether this face should apply biome tint (0.0 or 1.0)
 in float apply_tint_f;
@@ -20,6 +23,8 @@ layout(binding=0) uniform vs_params {
 };
 
 out vec2 v_uv_tile;
+out vec2 v_rect_min;
+out vec2 v_rect_size;
 out float v_layer;
 out float v_apply_tint;
 out vec2 v_chunk_uv;
@@ -27,6 +32,8 @@ out vec2 v_chunk_uv;
 void main() {
     gl_Position = mvp * vec4(pos, 1.0);
     v_uv_tile = uv0;
+    v_rect_min = rect_min;
+    v_rect_size = rect_size;
     v_layer = layer_f;
     v_apply_tint = apply_tint_f;
     // Compute region-local UVs in VS for simplicity
@@ -37,12 +44,18 @@ void main() {
 @end
 
 @fs fs
-in vec2 v_uv_tile;
-in float v_layer;
+in vec2 v_uv_tile;        // tile-space UVs (may be >1.0)
+in vec2 v_rect_min;        // atlas rect min
+in vec2 v_rect_size;       // atlas rect size
+in float v_layer;          // atlas index (0..N-1)
 in float v_apply_tint;
 in vec2 v_chunk_uv;
 
-layout(binding=1) uniform texture2DArray tex_array;
+// Up to 4 atlases bound at fixed slots; expand if needed
+layout(binding=1) uniform texture2D atlas0;
+layout(binding=5) uniform texture2D atlas1;
+layout(binding=6) uniform texture2D atlas2;
+layout(binding=7) uniform texture2D atlas3;
 layout(binding=2) uniform sampler tex_sampler;
 // Per-region tint texture (RGBA8)
 layout(binding=3) uniform texture2D chunk_tint_tex;
@@ -50,11 +63,23 @@ layout(binding=4) uniform sampler chunk_tint_smp;
 
 out vec4 frag_color;
 
+vec3 sample_atlas(float idx, vec2 uv) {
+    // Choose atlas by index; keep small and predictable branching
+    if (idx < 0.5) {
+        return texture(sampler2D(atlas0, tex_sampler), uv).rgb;
+    } else if (idx < 1.5) {
+        return texture(sampler2D(atlas1, tex_sampler), uv).rgb;
+    } else if (idx < 2.5) {
+        return texture(sampler2D(atlas2, tex_sampler), uv).rgb;
+    } else {
+        return texture(sampler2D(atlas3, tex_sampler), uv).rgb;
+    }
+}
+
 void main() {
-    // Repeat the tile using fract in tile-local space and sample the selected array layer
-    vec2 tiled = fract(v_uv_tile);
-    float layer = floor(v_layer + 0.5);
-    vec3 c = texture(sampler2DArray(tex_array, tex_sampler), vec3(tiled, layer)).rgb;
+    // Convert tile-space to atlas-space: rect_min + fract(tile_uv) * rect_size
+    vec2 uv_atlas = v_rect_min + fract(v_uv_tile) * v_rect_size;
+    vec3 c = sample_atlas(floor(v_layer + 0.5), uv_atlas);
     if (v_apply_tint > 0.5) {
         vec3 tint = texture(sampler2D(chunk_tint_tex, chunk_tint_smp), v_chunk_uv).rgb;
         c *= tint;

@@ -213,16 +213,17 @@ pub fn decodeRGBA8(allocator: std.mem.Allocator, bytes: []const u8) !Image {
         2 => { // RGB8 -> RGBA8
             const out_len: usize = @as(usize, @intCast(h.width)) * @as(usize, @intCast(h.height)) * out_bpp;
             var out = try allocator.alloc(u8, out_len);
-            var src_i: usize = 0;
-            var dst_i: usize = 0;
-            while (src_i < raw.len) : ({
-                src_i += 3;
-                dst_i += 4;
+            var si: usize = 0;
+            var di: usize = 0;
+            while (si < raw.len) : ({
+                si += 1;
+                di += 4;
             }) {
-                out[dst_i + 0] = raw[src_i + 0];
-                out[dst_i + 1] = raw[src_i + 1];
-                out[dst_i + 2] = raw[src_i + 2];
-                out[dst_i + 3] = 0xFF;
+                const src_i = si - 1;
+                out[di + 0] = raw[src_i + 0];
+                out[di + 1] = raw[src_i + 1];
+                out[di + 2] = raw[src_i + 2];
+                out[di + 3] = 0xFF;
             }
             allocator.free(raw);
             return .{ .width = h.width, .height = h.height, .pixels = out };
@@ -267,7 +268,7 @@ pub fn decodeRGBA8(allocator: std.mem.Allocator, bytes: []const u8) !Image {
                 }) {
                     const pidx = raw[si];
                     if (pidx >= palette_len) return error.InvalidPNG;
-                    const p = pidx * 3;
+                    const p: usize = @as(usize, pidx) * 3;
                     out[di + 0] = palette[p + 0];
                     out[di + 1] = palette[p + 1];
                     out[di + 2] = palette[p + 2];

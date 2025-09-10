@@ -48,24 +48,24 @@ fn init(ctx: ?*anyopaque) !void {
     _ = regp.addBlock("minecraft:glass") catch {};
     const water_id: ids.BlockStateId = regp.addBlock("minecraft:water") catch 0;
 
-    // Register texture paths for uniform blocks (client/full will load these)
-    regp.resources.setUniformPath("minecraft:dirt", "resources/textures/blocks/minecraft/dirt.png") catch {};
-    regp.resources.setUniformPath("minecraft:bedrock", "resources/textures/blocks/minecraft/bedrock.png") catch {};
-    regp.resources.setUniformPath("minecraft:sand", "resources/textures/blocks/minecraft/sand.png") catch {};
-    regp.resources.setUniformPath("minecraft:gravel", "resources/textures/blocks/minecraft/gravel.png") catch {};
-    regp.resources.setUniformPath("minecraft:glass", "resources/textures/blocks/minecraft/glass.png") catch {};
-    regp.resources.setUniformPath("minecraft:oak_planks", "resources/textures/blocks/minecraft/planks_oak.png") catch {};
-    regp.resources.setUniformPath("minecraft:oak_leaves", "resources/textures/blocks/minecraft/leaves_oak.png") catch {};
-    regp.resources.setUniformPath("minecraft:stone", "resources/textures/blocks/minecraft/stone.png") catch {};
-    regp.resources.setUniformPath("minecraft:cobblestone", "resources/textures/blocks/minecraft/cobblestone.png") catch {};
+    // Register texture identifiers for uniform blocks (client/full will load .txtr by id)
+    regp.resources.setUniformId("minecraft:dirt", "minecraft:dirt") catch {};
+    regp.resources.setUniformId("minecraft:bedrock", "minecraft:bedrock") catch {};
+    regp.resources.setUniformId("minecraft:sand", "minecraft:sand") catch {};
+    regp.resources.setUniformId("minecraft:gravel", "minecraft:gravel") catch {};
+    regp.resources.setUniformId("minecraft:glass", "minecraft:glass") catch {};
+    regp.resources.setUniformId("minecraft:oak_planks", "minecraft:planks_oak") catch {};
+    regp.resources.setUniformId("minecraft:oak_leaves", "minecraft:leaves_oak") catch {};
+    regp.resources.setUniformId("minecraft:stone", "minecraft:stone") catch {};
+    regp.resources.setUniformId("minecraft:cobblestone", "minecraft:cobblestone") catch {};
 
     // Axis-aligned tinted primary: top uses grass_top and is tinted by biome key "grass";
     // bottom and sides use dirt
-    regp.resources.setAxisAlignedTintedPrimary(
+    regp.resources.setAxisAlignedTintedPrimaryIds(
         "minecraft:grass_block",
-        "resources/textures/blocks/minecraft/grass_top.png",
-        "resources/textures/blocks/minecraft/dirt.png",
-        "resources/textures/blocks/minecraft/dirt.png",
+        "minecraft:grass_block_top", // +Y primary
+        "minecraft:dirt", // -Y bottom should be dirt
+        "minecraft:grass_block_side", // sides use grass_side
         "grass",
     ) catch {};
 
@@ -77,7 +77,7 @@ fn init(ctx: ?*anyopaque) !void {
     // Use layers: grass_block, dirt, dirt, stone (repeat), bedrock at bottom.
     const bedrock_id: ids.BlockStateId = regp.addBlock("minecraft:bedrock") catch 0;
 
-    // Sections: put 4 below and 0 above (4*32=128 below origin)
+    // Sections: put 1 below and 4 above (-31 -> 127)
     regp.worlds.addWorldWithGen(
         "minecraft:overworld",
         "Overworld",

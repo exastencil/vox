@@ -121,6 +121,15 @@ pub fn build(b: *Build) !void {
     const exe_full = b.addExecutable(.{ .name = "vox-aetatum", .root_module = root_mod_full });
     const exe_server = b.addExecutable(.{ .name = "vox-server", .root_module = root_mod_server });
 
+    // Texture packer tool
+    const root_mod_texpacker = b.createModule(.{
+        .root_source_file = b.path("src/bin/texture_packer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "vox", .module = mod_vox } },
+    });
+    const exe_texpacker = b.addExecutable(.{ .name = "texture-packer", .root_module = root_mod_texpacker });
+
     // Link macOS frameworks for native cursor warping when targeting macOS
     if (target.result.os.tag == .macos) {
         exe_full.linkFramework("CoreGraphics");
@@ -156,10 +165,17 @@ pub fn build(b: *Build) !void {
     // Install all artifacts
     b.installArtifact(exe_full);
     b.installArtifact(exe_server);
+    b.installArtifact(exe_texpacker);
 
     // Named build steps for each target
     b.step("full", "Build the full target (client + simulation in one process)").dependOn(&exe_full.step);
     b.step("server", "Build the server target (headless, authoritative simulation)").dependOn(&exe_server.step);
+    b.step("texture-packer", "Build the texture-packer tool").dependOn(&exe_texpacker.step);
+
+    // Convenience run step for texture packer
+    const run_texpacker = b.addRunArtifact(exe_texpacker);
+    if (b.args) |args| run_texpacker.addArgs(args);
+    b.step("pack-texture", "Run texture-packer (pass: <png_path> <identifier>)").dependOn(&run_texpacker.step);
 
     // Default run: full
     const run_full = b.addRunArtifact(exe_full);
@@ -180,6 +196,26 @@ pub fn build(b: *Build) !void {
         }),
     });
     test_step.dependOn(&tests_noise.step);
+
+    // Texture serialization tests
+    const tests_texture = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/texture.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&tests_texture.step);
+
+    // Atlas packer tests
+    const tests_atlas = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/atlas.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&tests_atlas.step);
 
     // Additional registry and module tests re-enabled
 
