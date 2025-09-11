@@ -15,146 +15,22 @@ const shd_mod = @import("shaders/chunk_shd.zig");
 const uvmap = @import("uvmap.zig");
 const builtin = @import("builtin");
 
+// Client-only modules (facade-only imports for now)
+const client_platform_mod = @import("client/platform.zig");
+const client_controls_mod = @import("client/controls.zig");
+const client_camera_mod = @import("client/camera.zig");
+const client_interaction_mod = @import("client/interaction.zig");
+const client_prediction_mod = @import("client/prediction.zig");
+const client_textures_mod = @import("client/textures.zig");
+const client_atlas_builder_mod = @import("client/atlas_builder.zig");
+const client_renderer_mod = @import("client/renderer.zig");
+const client_mesher_mod = @import("client/mesher.zig");
+const client_mesher_threads_mod = @import("client/mesher_threads.zig");
+const client_mesher_scheduler_mod = @import("client/mesher_scheduler.zig");
 // macOS-only: warp the mouse cursor to a point that is guaranteed to be inside our app window.
 // For now, we use the center of the main display, which is typically within the window
 // (our window defaults to 1920x1080 and is centered on launch). This avoids the first click
 // going to another app if the cursor started outside our window.
-inline fn macosWarpCursorIntoAppWindow() void {
-    if (builtin.os.tag != .macos) return;
-    const cg = @cImport({
-        @cInclude("CoreGraphics/CoreGraphics.h");
-    });
-    const display = cg.CGMainDisplayID();
-    const bounds = cg.CGDisplayBounds(display);
-    const cx: cg.CGFloat = bounds.origin.x + (bounds.size.width / 2.0);
-    const cy: cg.CGFloat = bounds.origin.y + (bounds.size.height / 2.0);
-    const pt = cg.CGPointMake(cx, cy);
-    _ = cg.CGWarpMouseCursorPosition(pt);
-}
-
-fn loadOrFallback(allocator: std.mem.Allocator, path: []const u8) sg.Image {
-    const png = @import("png.zig");
-    const loaded: ?png.Image = blk: {
-        const res = png.loadFileRGBA8(allocator, path) catch |e| {
-            std.log.warn("texture: failed to load '{s}': {s}", .{ path, @errorName(e) });
-            break :blk null;
-        };
-        break :blk res;
-    };
-    if (loaded) |img| {
-        defer allocator.free(img.pixels);
-        return sg.makeImage(.{
-            .width = @intCast(img.width),
-            .height = @intCast(img.height),
-            .pixel_format = .RGBA8,
-            .data = .{ .subimage = .{
-                .{ sg.asRange(img.pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-            } },
-        });
-    } else {
-        // Generate a magenta/black checkerboard fallback with exactly 4 squares (2x2) per face
-        const w: usize = 16;
-        const h: usize = 16;
-        const tile: usize = 8; // 2 squares across each axis, 8x8 each
-        var pixels = allocator.alloc(u8, w * h * 4) catch {
-            var one = [_]u8{ 255, 0, 255, 255 };
-            return sg.makeImage(.{
-                .width = 1,
-                .height = 1,
-                .pixel_format = .RGBA8,
-                .data = .{ .subimage = .{
-                    .{ sg.asRange(one[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                    .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                } },
-            });
-        };
-        defer allocator.free(pixels);
-        var y: usize = 0;
-        while (y < h) : (y += 1) {
-            var x: usize = 0;
-            while (x < w) : (x += 1) {
-                const cx = (x / tile) & 1;
-                const cy = (y / tile) & 1;
-                const is_magenta = (cx ^ cy) == 0;
-                const idx = (y * w + x) * 4;
-                if (is_magenta) {
-                    pixels[idx + 0] = 255;
-                    pixels[idx + 1] = 0;
-                    pixels[idx + 2] = 255;
-                    pixels[idx + 3] = 255;
-                } else {
-                    pixels[idx + 0] = 0;
-                    pixels[idx + 1] = 0;
-                    pixels[idx + 2] = 0;
-                    pixels[idx + 3] = 255;
-                }
-            }
-        }
-        return sg.makeImage(.{
-            .width = @intCast(w),
-            .height = @intCast(h),
-            .pixel_format = .RGBA8,
-            .data = .{ .subimage = .{
-                .{ sg.asRange(pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-            } },
-        });
-    }
-}
-
-const Camera = struct {
-    pos: [3]f32 = .{ 0, 0, 0 },
-    yaw: f32 = 0.0,
-    pitch: f32 = 0.0,
-    roll: f32 = 0.0,
-    // Derived forward direction from yaw/pitch
-    dir: [3]f32 = .{ 0, 0, -1 },
-
-    fn computeDir(yaw: f32, pitch: f32) [3]f32 {
-        // Assuming yaw around +Y, pitch around +X, radians
-        const cy = @cos(yaw);
-        const sy = @sin(yaw);
-        const cp = @cos(pitch);
-        const sp = @sin(pitch);
-        // Forward in right-handed Y-up: x = cp*cy, y = sp, z = cp*sy
-        return .{ cp * cy, sp, cp * sy };
-    }
-
-    fn setYawPitch(self: *Camera, yaw: f32, pitch: f32) void {
-        self.yaw = yaw;
-        self.pitch = pitch;
-        self.dir = computeDir(yaw, pitch);
-    }
-
-    fn setDir(self: *Camera, dir_in: [3]f32) void {
-        // normalize and update yaw/pitch to match
-        const dx = dir_in[0];
-        const dy = dir_in[1];
-        const dz = dir_in[2];
-        const len: f32 = @sqrt(dx * dx + dy * dy + dz * dz);
-        if (len > 0.000001) {
-            const nx = dx / len;
-            const ny = dy / len;
-            const nz = dz / len;
-            self.dir = .{ nx, ny, nz };
-            self.pitch = std.math.asin(std.math.clamp(ny, -1.0, 1.0));
-            self.yaw = std.math.atan2(nz, nx);
-        }
-    }
-};
 
 // Control scheme abstraction encapsulating how input affects camera and player
 const ViewProj = struct { view: [16]f32, proj: [16]f32 };
@@ -243,7 +119,7 @@ fn cs_fph_updateCamera(ctx: *anyopaque) void {
 fn cs_fph_makeViewProj(ctx: *anyopaque, w_px: f32, h_px: f32) ViewProj {
     const self: *Client = @ptrCast(@alignCast(ctx));
     const aspect_wh: f32 = if (h_px > 0) (w_px / h_px) else 1.0;
-    const proj = Client.makePerspective(60.0 * std.math.pi / 180.0, aspect_wh, 0.1, 1000.0);
+    const proj = client_camera_mod.makePerspective(60.0 * std.math.pi / 180.0, aspect_wh, 0.1, 1000.0);
     const view = self.makeViewNoRoll(self.camera.pos, self.camera.yaw, self.camera.pitch);
     return .{ .view = view, .proj = proj };
 }
@@ -263,8 +139,6 @@ const firstPersonHorizontalScheme: ControlScheme = .{
 };
 
 const Vertex = struct { pos: [3]f32, uv: [2]f32, rect_min: [2]f32, rect_size: [2]f32, layer: f32, apply_tint: f32 };
-
-const AtlasUv = struct { aidx: u32, u0: f32, v0: f32, u1: f32, v1: f32 };
 
 // ThirdPersonIsometric control scheme
 fn cs_iso_onMouseMove(ctx: *anyopaque, ev: sapp.Event) void {
@@ -364,24 +238,10 @@ fn cs_iso_updateCamera(ctx: *anyopaque) void {
     // Note: In isometric mode, the player's look vector remains independent of the camera.
 }
 
-fn makeOrthoCentered(half_width: f32, half_height: f32, znear: f32, zfar: f32) [16]f32 {
-    var m: [16]f32 = [_]f32{0} ** 16;
-    // column-major
-    m[0] = if (half_width != 0) (1.0 / half_width) else 0.0;
-    m[5] = if (half_height != 0) (1.0 / half_height) else 0.0;
-    m[10] = if ((zfar - znear) != 0) (-2.0 / (zfar - znear)) else 0.0;
-    m[15] = 1.0;
-    // translate is zero for symmetric bounds
-    m[12] = 0.0;
-    m[13] = 0.0;
-    m[14] = -(zfar + znear) / (zfar - znear);
-    return m;
-}
-
 fn cs_iso_makeViewProj(ctx: *anyopaque, w_px: f32, h_px: f32) ViewProj {
     const self: *Client = @ptrCast(@alignCast(ctx));
     const aspect_wh: f32 = if (h_px > 0) (w_px / h_px) else 1.0;
-    const proj = Client.makePerspective(60.0 * std.math.pi / 180.0, aspect_wh, 0.1, 1000.0);
+    const proj = client_camera_mod.makePerspective(60.0 * std.math.pi / 180.0, aspect_wh, 0.1, 1000.0);
     const view = self.makeViewNoRoll(self.camera.pos, self.iso_yaw, self.iso_pitch);
     return .{ .view = view, .proj = proj };
 }
@@ -412,47 +272,24 @@ inline fn emitQuad(allocator: std.mem.Allocator, list: *std.ArrayList(Vertex), v
 
 // Cached mesh types (region-level aggregation)
 const SectionMesh = struct { first: u32 = 0, count: u32 = 0 };
-const SectionDraw = struct { chunk_pos: gs.ChunkPos, sy: u16, first: u32, count: u32 };
-const RegionMesh = struct {
-    vbuf: sg.Buffer = .{},
-    draws: []SectionDraw,
-    built_chunk_count: usize = 0,
-    dirty: bool = false,
-    inflight: bool = false,
-    last_built_frame: u32 = 0,
-};
+const SectionDraw = client_mesher_mod.SectionDraw;
+const cache_mod = @import("client/mesher_cache.zig");
+const RegionMesh = cache_mod.RegionMesh;
 
-const MeshingJob = struct { rpos: simulation.RegionPos };
-const MeshingResult = struct { rpos: simulation.RegionPos, built_chunk_count: usize, verts: []Vertex, draws: []SectionDraw };
+const MeshingJob = client_mesher_mod.MeshingJob;
+const MeshingResult = client_mesher_mod.MeshingResult;
 
 // Snapshot types for background meshing
-const SectionSnapshot = struct {
-    palette: []gs.BlockState,
-    blocks_indices_bits: []u32,
-};
-
-const ChunkSnapshot = struct {
-    pos: gs.ChunkPos,
-    sections: []SectionSnapshot,
-};
-
-const RegionSnapshot = struct {
-    rpos: simulation.RegionPos,
-    base_cx: i32,
-    base_cz: i32,
-    section_count_y: u16,
-    sections_below: u16,
-    chunks: []ChunkSnapshot,
-    // 32x32 grid mapping local (x,z) -> chunk index or -1
-    grid_map: []i32,
-};
+const SectionSnapshot = client_mesher_mod.SectionSnapshot;
+const ChunkSnapshot = client_mesher_mod.ChunkSnapshot;
+const RegionSnapshot = client_mesher_mod.RegionSnapshot;
 
 // Temporary slice-ref structs for capturing under lock, then copying outside the lock
-const SectionSliceRefs = struct { pal_ptr: [*]const gs.BlockState, pal_len: usize, bits_ptr: [*]const u32, bits_len: usize };
-const ChunkSliceRefs = struct { pos: gs.ChunkPos, sections: []SectionSliceRefs };
-const RegionSliceRefs = struct { rpos: simulation.RegionPos, section_count_y: u16, sections_below: u16, base_cx: i32, base_cz: i32, chunks: []ChunkSliceRefs };
+const SectionSliceRefs = client_mesher_mod.SectionSliceRefs;
+const ChunkSliceRefs = client_mesher_mod.ChunkSliceRefs;
+const RegionSliceRefs = client_mesher_mod.RegionSliceRefs;
 
-const REGION_MESH_BUDGET: usize = 128; // generous, regions are fewer than chunks
+const REGION_MESH_BUDGET: usize = @import("client/mesher_cache.zig").REGION_MESH_BUDGET; // generous, regions are fewer than chunks
 
 // Texture-array layer identifier
 const LayerId = u16;
@@ -597,394 +434,6 @@ fn buildQuadVerts(out: []Vertex, x0: f32, y0: f32, size: f32) usize {
 
 const UvRect = struct { u0: f32, v0: f32, u1: f32, v1: f32, w: u32, h: u32 };
 
-fn makeFallbackTile(allocator: std.mem.Allocator, size: usize) !struct { w: u32, h: u32, pixels: []u8 } {
-    const w: usize = size;
-    const h: usize = size;
-    const tile: usize = @max(1, size / 2); // exactly 2x2 squares per face
-    var pixels = try allocator.alloc(u8, w * h * 4);
-    errdefer allocator.free(pixels);
-    var y: usize = 0;
-    while (y < h) : (y += 1) {
-        var x: usize = 0;
-        while (x < w) : (x += 1) {
-            const cx = (x / tile) & 1;
-            const cy = (y / tile) & 1;
-            const is_magenta = (cx ^ cy) == 0;
-            const idx = (y * w + x) * 4;
-            if (is_magenta) {
-                pixels[idx + 0] = 255;
-                pixels[idx + 1] = 0;
-                pixels[idx + 2] = 255;
-                pixels[idx + 3] = 255;
-            } else {
-                pixels[idx + 0] = 0;
-                pixels[idx + 1] = 0;
-                pixels[idx + 2] = 0;
-                pixels[idx + 3] = 255;
-            }
-        }
-    }
-    return .{ .w = @intCast(w), .h = @intCast(h), .pixels = pixels };
-}
-
-fn buildTextureArrayFromPaths(allocator: std.mem.Allocator, paths: []const []const u8) !struct {
-    pixels: []u8, // concatenated slices (N * w * h * 4)
-    w: u32,
-    h: u32,
-} {
-    const png = @import("png.zig");
-    // Load all images (or fallback tiles) and record dims
-    const N = paths.len;
-    var loaded = try allocator.alloc(struct { w: u32, h: u32, pixels: []u8 }, N);
-    errdefer {
-        var j: usize = 0;
-        while (j < loaded.len) : (j += 1) {
-            if (loaded[j].pixels.len > 0) allocator.free(loaded[j].pixels);
-        }
-        allocator.free(loaded);
-    }
-
-    var max_w: u32 = 0;
-    var max_h: u32 = 0;
-    var i: usize = 0;
-    while (i < N) : (i += 1) {
-        const img: ?png.Image = blk: {
-            const res = png.loadFileRGBA8(allocator, paths[i]) catch |e| {
-                std.log.warn("texture: failed to load '{s}': {s}", .{ paths[i], @errorName(e) });
-                break :blk null;
-            };
-            break :blk res;
-        };
-        if (img) |im| {
-            loaded[i].w = im.width;
-            loaded[i].h = im.height;
-            loaded[i].pixels = im.pixels; // take ownership
-        } else {
-            const fb = try makeFallbackTile(allocator, 16);
-            loaded[i].w = fb.w;
-            loaded[i].h = fb.h;
-            loaded[i].pixels = fb.pixels;
-        }
-        if (loaded[i].w > max_w) max_w = loaded[i].w;
-        if (loaded[i].h > max_h) max_h = loaded[i].h;
-    }
-    const tile_w: u32 = if (max_w == 0) 16 else max_w;
-    const tile_h: u32 = if (max_h == 0) 16 else max_h;
-
-    // Concatenate slices (each slice is tightly packed w*h*4)
-    var all_pixels = try allocator.alloc(u8, @as(usize, N) * @as(usize, tile_w) * @as(usize, tile_h) * 4);
-    @memset(all_pixels, 0);
-    i = 0;
-    while (i < N) : (i += 1) {
-        var py: u32 = 0;
-        while (py < loaded[i].h) : (py += 1) {
-            const src_off: usize = @as(usize, py) * @as(usize, loaded[i].w) * 4;
-            const dst_slice_base: usize = i * (@as(usize, tile_w) * @as(usize, tile_h) * 4);
-            const dst_row_off: usize = dst_slice_base + (@as(usize, py) * @as(usize, tile_w) * 4);
-            const copy_bytes: usize = @as(usize, loaded[i].w) * 4;
-            @memcpy(all_pixels[dst_row_off .. dst_row_off + copy_bytes], loaded[i].pixels[src_off .. src_off + copy_bytes]);
-        }
-    }
-
-    // Free individual tiles; keep concatenated pixels
-    i = 0;
-    while (i < N) : (i += 1) allocator.free(loaded[i].pixels);
-    allocator.free(loaded);
-
-    return .{ .pixels = all_pixels, .w = tile_w, .h = tile_h };
-}
-
-fn addUniqueId(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), s: []const u8) !void {
-    // Avoid duplicates by linear scan (small N)
-    for (list.items) |p| if (std.mem.eql(u8, p, s)) return;
-    try list.append(allocator, s);
-}
-
-fn findIndexForId(id_list: []const []const u8, s: []const u8) ?usize {
-    var i: usize = 0;
-    while (i < id_list.len) : (i += 1) if (std.mem.eql(u8, id_list[i], s)) return i;
-    return null;
-}
-
-fn inferTileSide(len_rgba: usize) ?u32 {
-    if (len_rgba % 4 != 0) return null;
-    const pixels: usize = len_rgba / 4;
-    var s: u32 = 1;
-    while (@as(usize, s) * @as(usize, s) < pixels) : (s += 1) {}
-    if (@as(usize, s) * @as(usize, s) != pixels) return null;
-    if ((s & (s - 1)) != 0) return null;
-    return s;
-}
-
-fn loadAllTxtrSlices(_: *Client, allocator: std.mem.Allocator) !struct { pixels: []u8, w: u32, h: u32, ids: [][]const u8 } {
-    const texbin = @import("texture.zig");
-    // Collect all .txtr files under resources/
-    var id_list = std.ArrayList([]const u8).empty;
-    var slices = std.ArrayList(struct { w: u32, h: u32, pixels: []u8 }).empty;
-    errdefer {
-        for (slices.items) |s| if (s.pixels.len > 0) allocator.free(s.pixels);
-        slices.deinit(allocator);
-        for (id_list.items) |id| allocator.free(id);
-        id_list.deinit(allocator);
-    }
-
-    var stack = std.ArrayList([]const u8).empty;
-    defer {
-        for (stack.items) |p| allocator.free(p);
-        stack.deinit(allocator);
-    }
-    try stack.append(allocator, try allocator.dupe(u8, "resources"));
-
-    while (stack.items.len > 0) {
-        const dir_path = stack.pop().?;
-        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch {
-            allocator.free(dir_path);
-            continue;
-        };
-        defer dir.close();
-        var it = dir.iterate();
-        while (try it.next()) |entry| {
-            if (entry.kind == .directory) {
-                if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
-                const child = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
-                try stack.append(allocator, child);
-                continue;
-            }
-            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".txtr")) {
-                const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
-                defer allocator.free(file_path);
-                // Read file
-                var f = try std.fs.cwd().openFile(file_path, .{});
-                defer f.close();
-                const stat = try f.stat();
-                const buf = try allocator.alloc(u8, stat.size);
-                errdefer allocator.free(buf);
-                _ = try f.readAll(buf);
-                // Parse
-                const tex = texbin.Binary.parse(buf) catch {
-                    allocator.free(buf);
-                    continue;
-                };
-                const side = inferTileSide(tex.rgba8.len) orelse {
-                    allocator.free(buf);
-                    continue;
-                };
-                // Own id slice and rgba copy (we own the buffer already; tex references it)
-                const id_bytes = try allocator.dupe(u8, tex.idSpan());
-                try id_list.append(allocator, id_bytes);
-                // Move pixels ownership into slices; keep buf around until texture is appended
-                try slices.append(allocator, .{ .w = side, .h = side, .pixels = buf });
-            }
-        }
-        allocator.free(dir_path);
-    }
-
-    if (slices.items.len == 0) {
-        return .{ .pixels = &[_]u8{}, .w = 1, .h = 1, .ids = &[_][]const u8{} };
-    }
-
-    // Determine max tile size
-    var max_w: u32 = 0;
-    var max_h: u32 = 0;
-    for (slices.items) |s| {
-        if (s.w > max_w) max_w = s.w;
-        if (s.h > max_h) max_h = s.h;
-    }
-    const tile_w: u32 = if (max_w == 0) 16 else max_w;
-    const tile_h: u32 = if (max_h == 0) 16 else max_h;
-
-    // Concatenate slices (each slice is tightly packed w*h*4)
-    const total_bytes: usize = @as(usize, slices.items.len) * @as(usize, tile_w) * @as(usize, tile_h) * 4;
-    var all_pixels = try allocator.alloc(u8, total_bytes);
-    @memset(all_pixels, 0);
-
-    var i: usize = 0;
-    while (i < slices.items.len) : (i += 1) {
-        const s = slices.items[i];
-        var py: u32 = 0;
-        while (py < s.h) : (py += 1) {
-            const src_off: usize = @as(usize, py) * @as(usize, s.w) * 4;
-            const dst_slice_base: usize = i * (@as(usize, tile_w) * @as(usize, tile_h) * 4);
-            const dst_row_off: usize = dst_slice_base + (@as(usize, py) * @as(usize, tile_w) * 4);
-            const copy_bytes: usize = @as(usize, s.w) * 4;
-            @memcpy(all_pixels[dst_row_off .. dst_row_off + copy_bytes], s.pixels[src_off .. src_off + copy_bytes]);
-        }
-        // free slice pixel buffer now that it's copied
-        allocator.free(s.pixels);
-    }
-    // free ArrayList backing storage for slices
-    slices.deinit(allocator);
-
-    return .{ .pixels = all_pixels, .w = tile_w, .h = tile_h, .ids = try id_list.toOwnedSlice(allocator) };
-}
-
-fn buildBlockAtlases(self: *Client) void {
-    const texbin = @import("texture.zig");
-    const atlas = @import("atlas.zig");
-    // Gather inputs (ids and rgba8) from resources/*.txtr
-    var id_list = std.ArrayList([]const u8).empty; // will be transferred into self.atlas_id_storage to keep keys alive
-    var inputs = std.ArrayList(atlas.TextureRef).empty;
-    var bufs = std.ArrayList([]u8).empty;
-    var ids_cstr = std.ArrayList([]u8).empty;
-    defer {
-        // id_list items are transferred to self.atlas_id_storage to keep key memory alive
-        // (freed in Client.deinit)
-        // id_list.deinit is called after transfer below
-        // free owned buffers after use below
-        for (bufs.items) |b| if (b.len > 0) self.allocator.free(b);
-        bufs.deinit(self.allocator);
-        // free owned 0-terminated id copies
-        for (ids_cstr.items) |c| self.allocator.free(c);
-        ids_cstr.deinit(self.allocator);
-        inputs.deinit(self.allocator);
-    }
-
-    var stack = std.ArrayList([]const u8).empty;
-    defer {
-        for (stack.items) |p| self.allocator.free(p);
-        stack.deinit(self.allocator);
-    }
-    const root = self.allocator.dupe(u8, "resources") catch return;
-    stack.append(self.allocator, root) catch return;
-    while (stack.items.len > 0) {
-        const dir_path = stack.pop().?;
-        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch {
-            self.allocator.free(dir_path);
-            continue;
-        };
-        defer dir.close();
-        var it = dir.iterate();
-        while (it.next() catch null) |entry| {
-            if (entry.kind == .directory) {
-                if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
-                const child = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
-                stack.append(self.allocator, child) catch {};
-                continue;
-            }
-            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".txtr")) {
-                const file_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
-                defer self.allocator.free(file_path);
-                var f = std.fs.cwd().openFile(file_path, .{}) catch continue;
-                defer f.close();
-                const st = f.stat() catch continue;
-                const buf = self.allocator.alloc(u8, st.size) catch continue;
-                if ((f.readAll(buf) catch 0) != st.size) {
-                    self.allocator.free(buf);
-                    continue;
-                }
-                const tx = texbin.Binary.parse(buf) catch {
-                    self.allocator.free(buf);
-                    continue;
-                };
-                // Own the buffer; tx.rgba8 references it
-                bufs.append(self.allocator, buf) catch {};
-                const id_bytes = tx.idSpan();
-                const id_owned = self.allocator.dupe(u8, id_bytes) catch continue;
-                id_list.append(self.allocator, id_owned) catch {};
-                // make an owned 0-terminated copy for TextureRef.id
-                const id_c = self.allocator.alloc(u8, id_bytes.len + 1) catch continue;
-                @memcpy(id_c[0..id_bytes.len], id_bytes);
-                id_c[id_bytes.len] = 0;
-                ids_cstr.append(self.allocator, id_c) catch {};
-                const id_c_view: [:0]const u8 = id_c[0..id_bytes.len :0];
-                inputs.append(self.allocator, .{ .id = id_c_view, .rgba8 = tx.rgba8 }) catch {};
-            }
-        }
-        self.allocator.free(dir_path);
-    }
-    if (inputs.items.len == 0) {
-        // Fallback: create a 1x1 white atlas so rendering can proceed
-        var white = [_]u8{ 255, 255, 255, 255 };
-        self.atlas_imgs[0] = sg.makeImage(.{
-            .type = ._2D,
-            .width = 1,
-            .height = 1,
-            .num_mipmaps = 1,
-            .pixel_format = .RGBA8,
-            .data = .{ .subimage = .{ .{ sg.asRange(white[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} } } },
-        });
-        self.atlas_views[0] = sg.makeView(.{ .texture = .{ .image = self.atlas_imgs[0] } });
-        self.atlas_count = 1;
-        self.textures_ready = true;
-        return;
-    }
-
-    // Plan and compose atlases
-    const cfg: atlas.Config = .{ .max_width = 4096, .max_height = 4096, .padding = 1, .case_insensitive = true };
-    const plan = atlas.planDynamic(self.allocator, cfg, inputs.items) catch return;
-    defer {
-        self.allocator.free(plan.atlas_meta);
-        self.allocator.free(plan.entries);
-    }
-
-    self.atlas_count = @min(@as(u32, @intCast(plan.atlas_meta.len)), @as(u32, 4));
-    var out_pixels = std.ArrayList([]u8).empty;
-    defer {
-        for (out_pixels.items) |p| if (p.len > 0) self.allocator.free(p);
-        out_pixels.deinit(self.allocator);
-    }
-
-    var outs = std.ArrayList(@import("atlas.zig").OutAtlas).empty;
-    defer outs.deinit(self.allocator);
-
-    var i: usize = 0;
-    while (i < self.atlas_count) : (i += 1) {
-        const w = plan.atlas_meta[i].width;
-        const h = plan.atlas_meta[i].height;
-        const px = self.allocator.alloc(u8, @as(usize, w) * @as(usize, h) * 4) catch break;
-        out_pixels.append(self.allocator, px) catch {};
-        outs.append(self.allocator, .{ .pixels = px, .width = w, .height = h }) catch {};
-    }
-    atlas.compose(plan, outs.items, inputs.items) catch return;
-
-    // Upload atlases and build views
-    i = 0;
-    while (i < self.atlas_count) : (i += 1) {
-        if (self.atlas_imgs[i].id != 0) sg.destroyImage(self.atlas_imgs[i]);
-        if (self.atlas_views[i].id != 0) sg.destroyView(self.atlas_views[i]);
-        self.atlas_imgs[i] = sg.makeImage(.{
-            .type = ._2D,
-            .width = @intCast(plan.atlas_meta[i].width),
-            .height = @intCast(plan.atlas_meta[i].height),
-            .num_mipmaps = 1,
-            .pixel_format = .RGBA8,
-            .data = .{ .subimage = .{ .{ sg.asRange(out_pixels.items[i]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} } } },
-        });
-        self.atlas_views[i] = sg.makeView(.{ .texture = .{ .image = self.atlas_imgs[i] } });
-    }
-
-    // Build atlas_uvs_by_id
-    self.atlas_uvs_by_id.clearRetainingCapacity();
-    inline for ([_]u32{0}) |_| {}
-    var mapped: usize = 0;
-    for (id_list.items, 0..) |id_bytes, idx| {
-        _ = idx;
-        // Find entry by matching span against entries (strip 0-terminator on entry id)
-        var ei: usize = 0;
-        while (ei < plan.entries.len) : (ei += 1) {
-            const e = plan.entries[ei];
-            const entry_id = e.id[0..e.id.len];
-            var matched = std.mem.eql(u8, entry_id, id_bytes);
-            if (!matched and entry_id.len <= id_bytes.len) {
-                matched = std.mem.eql(u8, entry_id, id_bytes[0..entry_id.len]);
-            }
-            if (matched) {
-                // Transfer ownership of id_bytes into atlas_id_storage so map key memory stays alive
-                if (self.atlas_id_storage.append(self.allocator, id_bytes) catch null) |_| {}
-                const uv = AtlasUv{ .aidx = e.atlas_index, .u0 = e.uv.u0, .v0 = e.uv.v0, .u1 = e.uv.u1, .v1 = e.uv.v1 };
-                if (self.atlas_uvs_by_id.put(id_bytes, uv) catch null) |_| {}
-                mapped += 1;
-                break;
-            }
-        }
-    }
-    // After transfer, drop the temporary list structure but NOT the strings
-    id_list.deinit(self.allocator);
-    // mapped count only used in debug builds; intentionally unused in release
-    // Mark textures ready after successful atlas upload and mapping
-    self.textures_ready = true;
-}
-
 pub const Client = struct {
     allocator: std.mem.Allocator,
     sim: *simulation.Simulation,
@@ -1040,7 +489,7 @@ pub const Client = struct {
     // Per-region tint cache
     region_tint_cache: std.AutoHashMap(simulation.RegionPos, RegionTintEntry) = undefined,
     // Atlas UV map per texture identifier
-    atlas_uvs_by_id: std.StringHashMap(AtlasUv) = undefined,
+    atlas_uvs_by_id: std.StringHashMap(client_atlas_builder_mod.AtlasUv) = undefined,
     // Storage for owned atlas id strings kept alive for the map keys
     atlas_id_storage: std.ArrayList([]const u8) = undefined,
 
@@ -1087,7 +536,7 @@ pub const Client = struct {
     dbg_last_adopted: u32 = 0,
 
     // Camera mirrored from player entity (position only; orientation is client-local)
-    camera: Camera = .{},
+    camera: client_camera_mod.Camera = .{},
 
     // Control schemes
     control_schemes: []const ControlScheme = &[_]ControlScheme{},
@@ -1156,7 +605,7 @@ pub const Client = struct {
             .sim = sim,
             .player_id = player_id,
             .account_name = acc,
-            .atlas_uvs_by_id = std.StringHashMap(AtlasUv).init(allocator),
+            .atlas_uvs_by_id = std.StringHashMap(client_atlas_builder_mod.AtlasUv).init(allocator),
             .atlas_id_storage = std.ArrayList([]const u8).initCapacity(allocator, 0) catch unreachable,
             .region_mesh_cache = std.AutoHashMap(simulation.RegionPos, RegionMesh).init(allocator),
             .last_visible_frame_chunk = std.AutoHashMap(gs.ChunkPos, u32).init(allocator),
@@ -1174,69 +623,7 @@ pub const Client = struct {
     }
 
     fn mesherThreadMain(self: *Client) void {
-        // mark started (debug)
-        self.mesher_started = true;
-        const alloc = std.heap.page_allocator;
-        while (true) {
-            // Wait for a job
-            self.mesher_mutex.lock();
-            while (self.mesher_running and self.mesher_jobs.items.len == 0) self.mesher_cv.wait(&self.mesher_mutex);
-            if (!self.mesher_running) {
-                self.mesher_mutex.unlock();
-                return;
-            }
-            const job = self.mesher_jobs.items[self.mesher_jobs.items.len - 1];
-            _ = self.mesher_jobs.pop();
-            self.mesher_mutex.unlock();
-
-            // Under world lock: gather slice refs only (no large allocations or copies)
-            self.sim.worlds_mutex.lock();
-            const ws_ptr = self.sim.worlds_state.getPtr("minecraft:overworld") orelse {
-                self.sim.worlds_mutex.unlock();
-                continue;
-            };
-            const rs_ptr = ws_ptr.regions.getPtr(job.rpos) orelse {
-                self.sim.worlds_mutex.unlock();
-                continue;
-            };
-            var refs = self.buildRegionRefsUnderLock(alloc, ws_ptr, rs_ptr, job.rpos);
-            self.sim.worlds_mutex.unlock();
-
-            if (refs.chunks.len == 0) {
-                self.freeRegionRefs(alloc, &refs);
-                continue;
-            }
-
-            // Outside the world lock: copy data into an owned snapshot and free refs
-            var snap = self.copySnapshotFromRefs(alloc, &refs);
-            self.freeRegionRefs(alloc, &refs);
-
-            if (snap.chunks.len == 0) {
-                self.freeRegionSnapshot(alloc, &snap);
-                continue;
-            }
-
-            // Mesh from snapshot (no locks)
-            const result = self.meshRegionFromSnapshot(alloc, &snap);
-            self.freeRegionSnapshot(alloc, &snap);
-
-            // Publish result
-            self.mesher_mutex.lock();
-            self.mesher_results.append(self.allocator, result) catch {
-                if (result.verts.len > 0) alloc.free(result.verts);
-                if (result.draws.len > 0) self.allocator.free(result.draws);
-            };
-            self.mesher_mutex.unlock();
-        }
-    }
-
-    // Enable/disable raw mouse input if supported by the sokol app wrapper
-    fn setRawMouse(on: bool) void {
-        if (@hasDecl(sapp, "rawMouseSupported") and @hasDecl(sapp, "enableRawMouse")) {
-            if (sapp.rawMouseSupported()) {
-                sapp.enableRawMouse(on);
-            }
-        } else {}
+        client_mesher_threads_mod.mesherThreadMain(self);
     }
 
     pub fn deinit(self: *Client) void {
@@ -1262,24 +649,7 @@ pub const Client = struct {
         if (self.shd.id != 0) sg.destroyShader(self.shd);
 
         // Stop mesher threads
-        if (self.mesher_running) {
-            self.mesher_mutex.lock();
-            self.mesher_running = false;
-            self.mesher_cv.broadcast();
-            self.mesher_mutex.unlock();
-            var i: usize = 0;
-            while (i < self.mesher_threads.items.len) : (i += 1) self.mesher_threads.items[i].join();
-            self.mesher_threads.deinit(self.allocator);
-            // Free any pending results
-            var r: usize = 0;
-            while (r < self.mesher_results.items.len) : (r += 1) {
-                const mr = self.mesher_results.items[r];
-                std.heap.page_allocator.free(mr.verts);
-                self.allocator.free(mr.draws);
-            }
-            self.mesher_results.deinit(self.allocator);
-            self.mesher_jobs.deinit(self.allocator);
-        }
+        client_mesher_threads_mod.stopMesherThreads(self);
 
         // Deinitialize atlas map (values only; keys are borrowed from registry)
         // Destroy cached region meshes
@@ -1415,7 +785,7 @@ pub const Client = struct {
         self.pass_action.depth = .{ .load_action = .CLEAR, .clear_value = 1.0 };
 
         // Build block atlases and register atlas UVs
-        buildBlockAtlases(self);
+        client_atlas_builder_mod.buildBlockAtlases(self);
         // sampler used for all texture sampling
         self.sampler = sg.makeSampler(.{ .min_filter = .NEAREST, .mag_filter = .NEAREST, .mipmap_filter = .NEAREST, .wrap_u = .CLAMP_TO_EDGE, .wrap_v = .CLAMP_TO_EDGE });
         // shader expects atlas0 at slot 1, and atlas1..3 at 5..7; sampler at slot 2
@@ -1529,47 +899,18 @@ pub const Client = struct {
             self.initLocalFromSim();
             self.control_schemes[self.current_scheme].updateCamera(self);
             // Now that we are ready, warp the cursor inside the app (macOS) and capture the mouse
-            macosWarpCursorIntoAppWindow();
+            client_platform_mod.macosWarpCursorIntoAppWindow();
             sapp.lockMouse(true);
-            setRawMouse(true);
+            client_platform_mod.setRawMouse(true);
         }
     }
 
     fn startMesherIfNeeded(self: *Client) void {
-        if (!self.mesher_started) {
-            self.mesher_running = true;
-            const thread_count: usize = 4;
-            self.mesher_threads.ensureTotalCapacity(self.allocator, thread_count) catch return;
-            var ti: usize = 0;
-            while (ti < thread_count) : (ti += 1) {
-                const th = std.Thread.spawn(.{}, mesherThreadMain, .{self}) catch break;
-                self.mesher_threads.appendAssumeCapacity(th);
-            }
-            self.mesher_started = true;
-        }
+        client_mesher_threads_mod.startMesherIfNeeded(self);
     }
 
     fn pumpMesherScheduleAndAdopt(self: *Client) void {
-        // Snapshot regions and chunk counts, schedule jobs, and adopt results without drawing
-        const wk = "minecraft:overworld";
-        var regions = std.ArrayList(struct { rpos: simulation.RegionPos, chunk_count: usize }).initCapacity(self.allocator, 0) catch return;
-        defer regions.deinit(self.allocator);
-        self.sim.worlds_mutex.lock();
-        const ws = self.sim.worlds_state.getPtr(wk);
-        if (ws) |ws_ptr| {
-            var reg_it = ws_ptr.regions.iterator();
-            while (reg_it.next()) |rentry| {
-                regions.append(self.allocator, .{ .rpos = rentry.key_ptr.*, .chunk_count = rentry.value_ptr.chunks.items.len }) catch {};
-            }
-        }
-        self.sim.worlds_mutex.unlock();
-        // reset issuance counter for this prepass
-        self.rebuilds_issued_this_frame = 0;
-        var i: usize = 0;
-        while (i < regions.items.len) : (i += 1) self.ensureRegionMesh(regions.items[i].rpos, regions.items[i].chunk_count);
-        self.dbg_last_scheduled = self.rebuilds_issued_this_frame;
-        // adopt after scheduling
-        self.adoptMesherResults();
+        client_mesher_scheduler_mod.pumpMesherScheduleAndAdopt(self);
     }
 
     pub fn frame(self: *Client) void {
@@ -1657,7 +998,7 @@ pub const Client = struct {
         if (dt_clamped > 0.0) self.localPhysicsStep(dt_clamped);
         self.control_schemes[self.current_scheme].updateCamera(self);
         // Update highlight target for this frame
-        self.updateHighlightTarget();
+        client_interaction_mod.updateHighlightTarget(self);
         // Notify simulation no more than once per tick
         self.maybeSendLookToSim();
         self.maybeSendMoveToSim();
@@ -1668,10 +1009,10 @@ pub const Client = struct {
         const vp = self.control_schemes[self.current_scheme].makeViewProj(self, w_px, h_px);
         var view_adj = vp.view;
         if (self.metal_transpose_view3x3) {
-            view_adj = self.transposeView3x3WithEye(view_adj);
+            view_adj = client_camera_mod.transposeView3x3WithEye(view_adj, self.camera.pos);
         }
         // standard MVP (proj*view)
-        const mvp: [16]f32 = matMul(vp.proj, view_adj);
+        const mvp: [16]f32 = client_camera_mod.matMul(vp.proj, view_adj);
         self.updateFrustum(mvp);
         var vs_params: shd_mod.VsParams = .{ .mvp = mvp, .region_info = .{ 0, 0, 1.0 / 512.0, 0 } };
 
@@ -1679,7 +1020,7 @@ pub const Client = struct {
         if (self.atlas_count > 0) {
             sg.applyPipeline(self.pip);
             sg.applyUniforms(0, sg.asRange(&vs_params));
-            self.renderWorldCached(&vs_params);
+            client_renderer_mod.renderWorldCached(self, &vs_params);
         }
 
         // Optional continuous probe logging
@@ -1687,11 +1028,11 @@ pub const Client = struct {
         // Cached rendering handled above
 
         // Draw targeted block outline (if any)
-        self.drawTargetOutline(&vs_params);
+        client_interaction_mod.drawTargetOutline(self, &vs_params);
 
         // Draw player bounding box in solid green for debugging camera orbit (disabled in first-person)
         if (!std.mem.eql(u8, self.control_schemes[self.current_scheme].name, "FirstPersonHorizontal")) {
-            self.drawPlayerAabb(&vs_params);
+            client_renderer_mod.drawPlayerAabb(self, &vs_params);
         }
 
         if (self.show_debug) {
@@ -1730,20 +1071,10 @@ pub const Client = struct {
             sdtx.color3b(255, 255, 255);
             sdtx.puts(line);
 
-            // Left-side debug: player's position and look vector
-            // Gather current player entity safely
-            self.sim.connections_mutex.lock();
-            var pos: [3]f32 = .{ 0, 0, 0 };
-            var look: [3]f32 = .{ 0, 0, 0 };
-            const idx_opt_dbg = self.sim.entity_by_player.get(self.player_id);
-            if (idx_opt_dbg) |idx_dbg| {
-                if (idx_dbg < self.sim.dynamic_entities.items.len) {
-                    const e_dbg = self.sim.dynamic_entities.items[idx_dbg];
-                    pos = e_dbg.pos;
-                    look = e_dbg.look_dir;
-                }
-            }
-            self.sim.connections_mutex.unlock();
+            // Left-side debug: show client-local predicted position and current look dir
+            // This reflects the camera you control this frame.
+            const pos: [3]f32 = self.camera.pos;
+            const look: [3]f32 = self.local_dir;
 
             var pbuf: [96:0]u8 = undefined;
             const ptxt_slice = std.fmt.bufPrint(pbuf[0 .. pbuf.len - 1], "Position: {d:.1} {d:.1} {d:.1}", .{ pos[0], pos[1], pos[2] }) catch "Position: ?";
@@ -1898,15 +1229,15 @@ pub const Client = struct {
                 .FOCUSED => {
                     // On macOS, the system may require a user interaction before lock fully takes effect.
                     // Warp the cursor inside the app to ensure the next click cannot hit another app.
-                    macosWarpCursorIntoAppWindow();
+                    client_platform_mod.macosWarpCursorIntoAppWindow();
                     // Lock the mouse immediately when the window gains focus to avoid stray first clicks
                     sapp.lockMouse(true);
-                    setRawMouse(true);
+                    client_platform_mod.setRawMouse(true);
                 },
                 .UNFOCUSED => {
                     // Always release on focus loss
                     sapp.lockMouse(false);
-                    setRawMouse(false);
+                    client_platform_mod.setRawMouse(false);
                     self.clearMovementInputs();
                 },
                 else => {},
@@ -1957,7 +1288,7 @@ pub const Client = struct {
                 if (ev.key_code == .ESCAPE) {
                     // Release mouse when ESC is pressed
                     sapp.lockMouse(false);
-                    setRawMouse(false);
+                    client_platform_mod.setRawMouse(false);
                     self.clearMovementInputs();
                 }
                 switch (ev.key_code) {
@@ -1970,16 +1301,16 @@ pub const Client = struct {
             },
             .FOCUSED => {
                 // On macOS, warp the cursor inside the app window to prevent the first click going elsewhere
-                macosWarpCursorIntoAppWindow();
+                client_platform_mod.macosWarpCursorIntoAppWindow();
                 // Lock the mouse when the window gains focus
                 sapp.lockMouse(true);
                 // Enable raw mouse input if supported
-                setRawMouse(true);
+                client_platform_mod.setRawMouse(true);
             },
             .UNFOCUSED => {
                 // Release the mouse when the window loses focus
                 sapp.lockMouse(false);
-                setRawMouse(false);
+                client_platform_mod.setRawMouse(false);
                 self.clearMovementInputs();
             },
             .KEY_DOWN => {
@@ -1996,14 +1327,14 @@ pub const Client = struct {
                 // If the mouse is unlocked (e.g., after ESC), clicking the window should re-lock it
                 if (!sapp.mouseLocked()) {
                     // Before re-locking, warp cursor inside window on macOS to keep interaction local
-                    macosWarpCursorIntoAppWindow();
+                    client_platform_mod.macosWarpCursorIntoAppWindow();
                     sapp.lockMouse(true);
-                    setRawMouse(true);
+                    client_platform_mod.setRawMouse(true);
                 } else {
                     // When in first-person scheme, left-click breaks the targeted block within reach
                     if (std.mem.eql(u8, self.control_schemes[self.current_scheme].name, "FirstPersonHorizontal")) {
                         if (ev.mouse_button == .LEFT) {
-                            self.tryBreakBlockUnderCrosshair();
+                            client_interaction_mod.tryBreakBlockUnderCrosshair(self);
                         }
                     }
                 }
@@ -2093,495 +1424,6 @@ pub const Client = struct {
         self.camera.pos = .{ self.local_pos[0], eye_y, self.local_pos[2] };
         self.camera.setYawPitch(self.local_yaw, self.local_pitch);
         self.camera.roll = 0;
-    }
-
-    fn updateHighlightTarget(self: *Client) void {
-        self.highlight_has = false;
-        if (!self.ready or !self.textures_ready) return;
-        const wk = "minecraft:overworld";
-        const eye = self.camera.pos;
-        var dir = self.local_dir;
-        const dl: f32 = @sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
-        if (dl < 0.000001) return;
-        dir[0] /= dl;
-        dir[1] /= dl;
-        dir[2] /= dl;
-        const reach: f32 = self.reach_distance;
-        const step: f32 = 0.05;
-        self.sim.worlds_mutex.lock();
-        const ws = self.sim.worlds_state.getPtr(wk);
-        if (ws) |wsp| {
-            var t: f32 = 0.0;
-            while (t <= reach) : (t += step) {
-                const px = eye[0] + dir[0] * t;
-                const py = eye[1] + dir[1] * t;
-                const pz = eye[2] + dir[2] * t;
-                const ix: i32 = @intFromFloat(@floor(px));
-                const iy: i32 = @intFromFloat(@floor(py));
-                const iz: i32 = @intFromFloat(@floor(pz));
-                const cx: i32 = @divFloor(ix, @as(i32, @intCast(constants.chunk_size_x)));
-                const cz: i32 = @divFloor(iz, @as(i32, @intCast(constants.chunk_size_z)));
-                const lx_i: i32 = @mod(ix, @as(i32, @intCast(constants.chunk_size_x)));
-                const lz_i: i32 = @mod(iz, @as(i32, @intCast(constants.chunk_size_z)));
-                const lx: usize = @intCast(lx_i);
-                const lz: usize = @intCast(lz_i);
-                const rp = simulation.RegionPos{ .x = @divFloor(cx, 32), .z = @divFloor(cz, 32) };
-                const rs = wsp.regions.getPtr(rp) orelse continue;
-                const cidx = rs.chunk_index.get(.{ .x = cx, .z = cz }) orelse continue;
-                const ch = rs.chunks.items[cidx];
-                const total_y: i32 = @intCast(ch.sections.len * constants.section_height);
-                const ny0: i32 = iy + @as(i32, @intCast(wsp.sections_below)) * @as(i32, @intCast(constants.section_height));
-                if (ny0 < 0 or ny0 >= total_y) continue;
-                const sy: usize = @intCast(@divTrunc(ny0, @as(i32, @intCast(constants.section_height))));
-                const ly: usize = @intCast(@mod(ny0, @as(i32, @intCast(constants.section_height))));
-                if (sy >= ch.sections.len) continue;
-                const s = ch.sections[sy];
-                const bpi: u6 = bitsFor(s.palette.len);
-                const idx3d: usize = lz * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
-                const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx3d, bpi));
-                if (pidx >= s.palette.len) continue;
-                const bid: u32 = s.palette[pidx].block_id;
-                if (bid == 0) continue;
-                if (bid < self.sim.reg.blocks.items.len and !self.sim.reg.blocks.items[@intCast(bid)].collision) continue;
-                // set highlight
-                self.highlight_has = true;
-                self.highlight_min = .{ @as(f32, @floatFromInt(ix)), @as(f32, @floatFromInt(iy)), @as(f32, @floatFromInt(iz)) };
-                self.highlight_max = .{ self.highlight_min[0] + 1.0, self.highlight_min[1] + 1.0, self.highlight_min[2] + 1.0 };
-                break;
-            }
-        }
-        self.sim.worlds_mutex.unlock();
-    }
-
-    fn drawTargetOutline(self: *Client, vs_in: *const shd_mod.VsParams) void {
-        if (!self.highlight_has) return;
-        // Compute 6px screen-space thickness in world units at the block center
-        const mn = self.highlight_min;
-        const mx = self.highlight_max;
-        const center = [3]f32{ (mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5, (mn[2] + mx[2]) * 0.5 };
-        const cam = self.camera.pos;
-        const dx = center[0] - cam[0];
-        const dy = center[1] - cam[1];
-        const dz = center[2] - cam[2];
-        const depth: f32 = @sqrt(dx * dx + dy * dy + dz * dz);
-        const h_px_f: f32 = @floatFromInt(sapp.height());
-        if (h_px_f <= 0) return;
-        const fovy: f32 = 60.0 * std.math.pi / 180.0;
-        const px: f32 = 3.0;
-        const thickness_world: f32 = (2.0 * depth * @tan(fovy * 0.5)) * (px / h_px_f);
-        const half_t: f32 = thickness_world * 0.5;
-
-        // Unit vector from camera to block center (used to determine front-facing faces)
-        const cam_to_center = if (depth > 0.000001)
-            .{ dx / depth, dy / depth, dz / depth }
-        else
-            .{ 0.0, 0.0, 1.0 };
-        // Face order: 0:-X(minX), 1:+X(maxX), 2:-Y(minY), 3:+Y(maxY), 4:-Z(minZ), 5:+Z(maxZ)
-        const front_faces = [_]bool{
-            cam_to_center[0] > 0.0, // -X
-            cam_to_center[0] < 0.0, // +X
-            cam_to_center[1] > 0.0, // -Y
-            cam_to_center[1] < 0.0, // +Y
-            cam_to_center[2] > 0.0, // -Z
-            cam_to_center[2] < 0.0, // +Z
-        };
-
-        // Determine per-face visibility using frustum and occlusion (ray to face center)
-        var face_visible = [_]bool{false} ** 6;
-        const hx: i32 = @intFromFloat(@floor(mn[0]));
-        const hy: i32 = @intFromFloat(@floor(mn[1]));
-        const hz: i32 = @intFromFloat(@floor(mn[2]));
-        const face_centers = [_][3]f32{
-            .{ @as(f32, @floatFromInt(hx)), @as(f32, @floatFromInt(hy)) + 0.5, @as(f32, @floatFromInt(hz)) + 0.5 }, // -X
-            .{ @as(f32, @floatFromInt(hx)) + 1.0, @as(f32, @floatFromInt(hy)) + 0.5, @as(f32, @floatFromInt(hz)) + 0.5 }, // +X
-            .{ @as(f32, @floatFromInt(hx)) + 0.5, @as(f32, @floatFromInt(hy)), @as(f32, @floatFromInt(hz)) + 0.5 }, // -Y
-            .{ @as(f32, @floatFromInt(hx)) + 0.5, @as(f32, @floatFromInt(hy)) + 1.0, @as(f32, @floatFromInt(hz)) + 0.5 }, // +Y
-            .{ @as(f32, @floatFromInt(hx)) + 0.5, @as(f32, @floatFromInt(hy)) + 0.5, @as(f32, @floatFromInt(hz)) }, // -Z
-            .{ @as(f32, @floatFromInt(hx)) + 0.5, @as(f32, @floatFromInt(hy)) + 0.5, @as(f32, @floatFromInt(hz)) + 1.0 }, // +Z
-        };
-        const face_normals = [_][3]f32{
-            .{ -1.0, 0.0, 0.0 }, .{ 1.0, 0.0, 0.0 }, .{ 0.0, -1.0, 0.0 }, .{ 0.0, 1.0, 0.0 }, .{ 0.0, 0.0, -1.0 }, .{ 0.0, 0.0, 1.0 },
-        };
-        const wk = "minecraft:overworld";
-        const ray_visible = struct {
-            fn call(cli: *Client, ws: *const simulation.WorldState, tx: i32, ty: i32, tz: i32, face_center: [3]f32, face_normal: [3]f32, cam_pos: [3]f32) bool {
-                // Ray from camera to slightly in front of face center
-                const eps: f32 = 0.001;
-                const target = .{ face_center[0] - face_normal[0] * eps, face_center[1] - face_normal[1] * eps, face_center[2] - face_normal[2] * eps };
-                var rx = target[0] - cam_pos[0];
-                var ry = target[1] - cam_pos[1];
-                var rz = target[2] - cam_pos[2];
-                const dist: f32 = @sqrt(rx * rx + ry * ry + rz * rz);
-                if (dist <= 0.00001) return true;
-                rx /= dist;
-                ry /= dist;
-                rz /= dist;
-                var t: f32 = 0.0;
-                const step: f32 = 0.05;
-                while (t <= dist) : (t += step) {
-                    const rxp = cam_pos[0] + rx * t;
-                    const ryp = cam_pos[1] + ry * t;
-                    const rzp = cam_pos[2] + rz * t;
-                    const ix: i32 = @intFromFloat(@floor(rxp));
-                    const iy: i32 = @intFromFloat(@floor(ryp));
-                    const iz: i32 = @intFromFloat(@floor(rzp));
-                    // Reached target block => visible
-                    if (ix == tx and iy == ty and iz == tz) return true;
-                    // Query world occupancy (solid blocks occlude)
-                    const cx: i32 = @divFloor(ix, @as(i32, @intCast(constants.chunk_size_x)));
-                    const cz: i32 = @divFloor(iz, @as(i32, @intCast(constants.chunk_size_z)));
-                    const rp = simulation.RegionPos{ .x = @divFloor(cx, 32), .z = @divFloor(cz, 32) };
-                    const rs = ws.regions.getPtr(rp) orelse continue;
-                    const cidx = rs.chunk_index.get(.{ .x = cx, .z = cz }) orelse continue;
-                    const ch = rs.chunks.items[cidx];
-                    const total_y: i32 = @intCast(ch.sections.len * constants.section_height);
-                    const ny0: i32 = iy + @as(i32, @intCast(ws.sections_below)) * @as(i32, @intCast(constants.section_height));
-                    if (ny0 < 0 or ny0 >= total_y) continue;
-                    const sy: usize = @intCast(@divTrunc(ny0, @as(i32, @intCast(constants.section_height))));
-                    const ly: usize = @intCast(@mod(ny0, @as(i32, @intCast(constants.section_height))));
-                    if (sy >= ch.sections.len) continue;
-                    const s = ch.sections[sy];
-                    const bpi: u6 = bitsFor(s.palette.len);
-                    const lx_i: i32 = @mod(ix, @as(i32, @intCast(constants.chunk_size_x)));
-                    const lz_i: i32 = @mod(iz, @as(i32, @intCast(constants.chunk_size_z)));
-                    const lx: usize = @intCast(lx_i);
-                    const lz: usize = @intCast(lz_i);
-                    const idx3d: usize = lz * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
-                    const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx3d, bpi));
-                    if (pidx >= s.palette.len) continue;
-                    const bid: u32 = s.palette[pidx].block_id;
-                    if (bid == 0) continue;
-                    if (bid < cli.sim.reg.blocks.items.len) {
-                        if (cli.sim.reg.blocks.items[@intCast(bid)].collision) {
-                            // occluded by another solid block
-                            return false;
-                        }
-                    } else {
-                        // unknown: treat as solid
-                        return false;
-                    }
-                }
-                return true; // no occluders found until target
-            }
-        }.call;
-
-        // Acquire world state to test occlusions
-        self.sim.worlds_mutex.lock();
-        const ws = self.sim.worlds_state.getPtr(wk);
-        if (ws) |wsp| {
-            var fi: usize = 0;
-            while (fi < 6) : (fi += 1) {
-                if (!front_faces[fi]) {
-                    face_visible[fi] = false;
-                    continue;
-                }
-                // Frustum test on face center
-                const fc = face_centers[fi];
-                var in_frustum = true;
-                if (self.frustum_valid) {
-                    in_frustum = aabbInFrustum(self.frustum_planes, fc, fc, 0.0);
-                }
-                if (!in_frustum) {
-                    face_visible[fi] = false;
-                    continue;
-                }
-                // Occlusion ray test
-                face_visible[fi] = ray_visible(self, wsp, hx, hy, hz, fc, face_normals[fi], cam);
-            }
-        }
-        self.sim.worlds_mutex.unlock();
-
-        // Define all 12 edges of the AABB
-        const p000 = [3]f32{ mn[0], mn[1], mn[2] };
-        const p001 = [3]f32{ mn[0], mn[1], mx[2] };
-        const p010 = [3]f32{ mn[0], mx[1], mn[2] };
-        const p011 = [3]f32{ mn[0], mx[1], mx[2] };
-        const p100 = [3]f32{ mx[0], mn[1], mn[2] };
-        const p101 = [3]f32{ mx[0], mn[1], mx[2] };
-        const p110 = [3]f32{ mx[0], mx[1], mn[2] };
-        const p111 = [3]f32{ mx[0], mx[1], mx[2] };
-        const edges = [_][2][3]f32{
-            .{ p000, p100 }, .{ p100, p101 }, .{ p101, p001 }, .{ p001, p000 }, // bottom
-            .{ p010, p110 }, .{ p110, p111 }, .{ p111, p011 }, .{ p011, p010 }, // top
-            .{ p000, p010 }, .{ p100, p110 }, .{ p101, p111 }, .{ p001, p011 }, // verticals
-        };
-        // For each edge, list the two adjacent faces using the face order above
-        const edge_faces = [_][2]u3{
-            .{ 2, 4 }, // p000-p100: -Y, -Z
-            .{ 2, 1 }, // p100-p101: -Y, +X
-            .{ 2, 5 }, // p101-p001: -Y, +Z
-            .{ 2, 0 }, // p001-p000: -Y, -X
-            .{ 3, 4 }, // p010-p110: +Y, -Z
-            .{ 3, 1 }, // p110-p111: +Y, +X
-            .{ 3, 5 }, // p111-p011: +Y, +Z
-            .{ 3, 0 }, // p011-p010: +Y, -X
-            .{ 0, 4 }, // p000-p010: -X, -Z
-            .{ 1, 4 }, // p100-p110: +X, -Z
-            .{ 1, 5 }, // p101-p111: +X, +Z
-            .{ 0, 5 }, // p001-p011: -X, +Z
-        };
-
-        // Build quads (two triangles per edge) facing the camera using a screen-space thickness
-        var verts: [12 * 6]Vertex = undefined; // 12 edges * 2 tris * 3 verts
-        var vi: usize = 0;
-        const make_vert = struct {
-            fn call(p: [3]f32) Vertex {
-                return .{ .pos = p, .uv = .{ 0, 0 }, .rect_min = .{ 0, 0 }, .rect_size = .{ 1, 1 }, .layer = 0, .apply_tint = 0 };
-            }
-        }.call;
-        const normalize3 = struct {
-            fn call(v: [3]f32) [3]f32 {
-                const l: f32 = @sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-                if (l > 0.000001) return .{ v[0] / l, v[1] / l, v[2] / l };
-                return .{ 0, 0, 0 };
-            }
-        }.call;
-        const cross3 = struct {
-            fn call(a: [3]f32, b: [3]f32) [3]f32 {
-                return .{ a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0] };
-            }
-        }.call;
-        const addTri = struct {
-            fn call(list: *[12 * 6]Vertex, idx: *usize, a: [3]f32, b: [3]f32, c: [3]f32) void {
-                list.*[idx.*] = make_vert(a);
-                idx.* += 1;
-                list.*[idx.*] = make_vert(b);
-                idx.* += 1;
-                list.*[idx.*] = make_vert(c);
-                idx.* += 1;
-            }
-        }.call;
-
-        var ei: usize = 0;
-        while (ei < edges.len) : (ei += 1) {
-            const a = edges[ei][0];
-            const b = edges[ei][1];
-            // Edge visibility: draw if either adjacent face is visible (including both)
-            const f0: usize = @intCast(edge_faces[ei][0]);
-            const f1: usize = @intCast(edge_faces[ei][1]);
-            if (!face_visible[f0] and !face_visible[f1]) continue;
-
-            const mid = [3]f32{ (a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, (a[2] + b[2]) * 0.5 };
-            const d = normalize3(.{ b[0] - a[0], b[1] - a[1], b[2] - a[2] });
-            const vdir = normalize3(.{ mid[0] - cam[0], mid[1] - cam[1], mid[2] - cam[2] });
-            var n = normalize3(cross3(d, vdir));
-            // Fallback if edge is parallel to view direction
-            if (@abs(n[0]) + @abs(n[1]) + @abs(n[2]) < 0.00001) {
-                n = normalize3(cross3(d, .{ 0, 1, 0 }));
-                if (@abs(n[0]) + @abs(n[1]) + @abs(n[2]) < 0.00001) {
-                    n = normalize3(cross3(d, .{ 1, 0, 0 }));
-                }
-            }
-            const off = .{ n[0] * half_t, n[1] * half_t, n[2] * half_t };
-            const q0 = [3]f32{ a[0] - off[0], a[1] - off[1], a[2] - off[2] };
-            const q1 = [3]f32{ a[0] + off[0], a[1] + off[1], a[2] + off[2] };
-            const q2 = [3]f32{ b[0] + off[0], b[1] + off[1], b[2] + off[2] };
-            const q3 = [3]f32{ b[0] - off[0], b[1] - off[1], b[2] - off[2] };
-            // Two triangles (culling disabled in pipeline, winding doesn't matter)
-            addTri(&verts, &vi, q0, q1, q2);
-            addTri(&verts, &vi, q0, q2, q3);
-        }
-        if (vi == 0) return;
-
-        // Use outline triangle pipeline and black texture; renders through geometry (depth compare: ALWAYS)
-        sg.applyPipeline(self.pip_outline);
-        var vs_params: shd_mod.VsParams = .{ .mvp = vs_in.mvp, .region_info = .{ 0, 0, 1.0 / 512.0, 0 } };
-        sg.applyUniforms(0, sg.asRange(&vs_params));
-        var b = self.bind;
-        b.vertex_buffers[0] = self.outline_vbuf;
-        if (self.black_view.id != 0) b.views[1] = self.black_view;
-        sg.applyBindings(b);
-        const needed_bytes: usize = vi * @sizeOf(Vertex);
-        if (self.outline_vbuf_capacity_bytes < needed_bytes) {
-            if (self.outline_vbuf.id != 0) sg.destroyBuffer(self.outline_vbuf);
-            self.outline_vbuf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true, .stream_update = true }, .size = @intCast(needed_bytes) });
-            self.outline_vbuf_capacity_bytes = needed_bytes;
-        }
-        sg.updateBuffer(self.outline_vbuf, sg.asRange(verts[0..vi]));
-        sg.draw(0, @intCast(vi), 1);
-    }
-
-    fn tryBreakBlockUnderCrosshair(self: *Client) void {
-        // Only operate when textures are ready and world is ready
-        if (!self.ready or !self.textures_ready) return;
-        const wk = "minecraft:overworld";
-        // Ray origin and direction
-        const eye = self.camera.pos;
-        var dir = self.local_dir;
-        // normalize dir
-        const dl: f32 = @sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
-        if (dl < 0.000001) return;
-        dir[0] /= dl;
-        dir[1] /= dl;
-        dir[2] /= dl;
-        const reach: f32 = self.reach_distance;
-        const step: f32 = 0.05; // small step for short reach
-
-        var hit_found = false;
-        var hit_x: i32 = 0;
-        var hit_y: i32 = 0;
-        var hit_z: i32 = 0;
-        var hit_cx: i32 = 0;
-        var hit_cz: i32 = 0;
-        var hit_lx: usize = 0;
-        var hit_lz: usize = 0;
-
-        self.sim.worlds_mutex.lock();
-        const ws = self.sim.worlds_state.getPtr(wk);
-        if (ws) |wsp| {
-            var t: f32 = 0.0;
-            while (t <= reach) : (t += step) {
-                const px = eye[0] + dir[0] * t;
-                const py = eye[1] + dir[1] * t;
-                const pz = eye[2] + dir[2] * t;
-                const ix: i32 = @intFromFloat(@floor(px));
-                const iy: i32 = @intFromFloat(@floor(py));
-                const iz: i32 = @intFromFloat(@floor(pz));
-                const cx: i32 = @divFloor(ix, @as(i32, @intCast(constants.chunk_size_x)));
-                const cz: i32 = @divFloor(iz, @as(i32, @intCast(constants.chunk_size_z)));
-                const lx_i: i32 = @mod(ix, @as(i32, @intCast(constants.chunk_size_x)));
-                const lz_i: i32 = @mod(iz, @as(i32, @intCast(constants.chunk_size_z)));
-                const lx: usize = @intCast(lx_i);
-                const lz: usize = @intCast(lz_i);
-                const rp = simulation.RegionPos{ .x = @divFloor(cx, 32), .z = @divFloor(cz, 32) };
-                const rs = wsp.regions.getPtr(rp) orelse continue;
-                const cidx = rs.chunk_index.get(.{ .x = cx, .z = cz }) orelse continue;
-                const ch = rs.chunks.items[cidx];
-                // y -> section-space
-                const total_y: i32 = @intCast(ch.sections.len * constants.section_height);
-                const ny0: i32 = iy + @as(i32, @intCast(wsp.sections_below)) * @as(i32, @intCast(constants.section_height));
-                if (ny0 < 0 or ny0 >= total_y) continue;
-                const sy: usize = @intCast(@divTrunc(ny0, @as(i32, @intCast(constants.section_height))));
-                const ly: usize = @intCast(@mod(ny0, @as(i32, @intCast(constants.section_height))));
-                if (sy >= ch.sections.len) continue;
-                const s = ch.sections[sy];
-                const bpi: u6 = bitsFor(s.palette.len);
-                const idx3d: usize = lz * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
-                const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx3d, bpi));
-                if (pidx >= s.palette.len) continue;
-                const bid: u32 = s.palette[pidx].block_id;
-                if (bid == 0) continue;
-                // respect collision flag
-                if (bid < self.sim.reg.blocks.items.len) {
-                    if (!self.sim.reg.blocks.items[@intCast(bid)].collision) continue;
-                }
-                // hit!
-                hit_found = true;
-                hit_x = ix;
-                hit_y = iy;
-                hit_z = iz;
-                hit_cx = cx;
-                hit_cz = cz;
-                hit_lx = lx;
-                hit_lz = lz;
-                break;
-            }
-
-            if (hit_found) {
-                // Set to air within the chunk under lock
-                const rp_hit = simulation.RegionPos{ .x = @divFloor(hit_cx, 32), .z = @divFloor(hit_cz, 32) };
-                if (wsp.regions.getPtr(rp_hit)) |rs_hit| {
-                    if (rs_hit.chunk_index.get(.{ .x = hit_cx, .z = hit_cz })) |cidx_hit| {
-                        var chp = &rs_hit.chunks.items[cidx_hit];
-                        // y -> section-space
-                        const ny0h: i32 = hit_y + @as(i32, @intCast(wsp.sections_below)) * @as(i32, @intCast(constants.section_height));
-                        if (ny0h >= 0) {
-                            const syh: usize = @intCast(@divTrunc(ny0h, @as(i32, @intCast(constants.section_height))));
-                            const lyh: usize = @intCast(@mod(ny0h, @as(i32, @intCast(constants.section_height))));
-                            if (syh < chp.sections.len) {
-                                const sref = chp.sections[syh];
-                                const pal_len = sref.palette.len;
-                                const bpi_set: u6 = bitsFor(pal_len);
-                                // find air palette index
-                                var air_pidx: ?u32 = null;
-                                var pi: usize = 0;
-                                while (pi < pal_len) : (pi += 1) {
-                                    if (sref.palette[pi].block_id == 0) {
-                                        air_pidx = @intCast(pi);
-                                        break;
-                                    }
-                                }
-                                if (air_pidx) |ap| {
-                                    const idx3d_set: usize = hit_lz * (constants.chunk_size_x * constants.section_height) + hit_lx * constants.section_height + lyh;
-                                    // write into mutable bit-packed buffer
-                                    const bits_mut: []u32 = @constCast(sref.blocks_indices_bits);
-                                    packBitsSet(bits_mut, idx3d_set, bpi_set, ap);
-                                    // Update heightmaps for this column (recompute top)
-                                    const col_idx: usize = hit_lz * constants.chunk_size_x + hit_lx;
-                                    const new_top: i32 = blk: {
-                                        var best: i32 = -1;
-                                        var sy_scan: i32 = @intCast(chp.sections.len);
-                                        while (sy_scan > 0) : (sy_scan -= 1) {
-                                            const sy_u: usize = @intCast(sy_scan - 1);
-                                            const sscan = chp.sections[sy_u];
-                                            const bpi_scan: u6 = bitsFor(sscan.palette.len);
-                                            var ly_scan: i32 = @intCast(constants.section_height);
-                                            while (ly_scan > 0) : (ly_scan -= 1) {
-                                                const ly_u: usize = @intCast(ly_scan - 1);
-                                                const idx_scan: usize = hit_lz * (constants.chunk_size_x * constants.section_height) + hit_lx * constants.section_height + ly_u;
-                                                const p_scan: usize = @intCast(unpackBitsGet(sscan.blocks_indices_bits, idx_scan, bpi_scan));
-                                                if (p_scan >= sscan.palette.len) continue;
-                                                const bid_scan: u32 = sscan.palette[p_scan].block_id;
-                                                if (bid_scan != 0) {
-                                                    // respect solid flag
-                                                    if (bid_scan < self.sim.reg.blocks.items.len and !self.sim.reg.blocks.items[@intCast(bid_scan)].collision) {
-                                                        continue;
-                                                    }
-                                                    const abs_y: i32 = (@as(i32, @intCast(sy_u)) * @as(i32, @intCast(constants.section_height)) + @as(i32, @intCast(ly_u))) - @as(i32, @intCast(wsp.sections_below)) * @as(i32, @intCast(constants.section_height));
-                                                    best = abs_y;
-                                                    break;
-                                                }
-                                            }
-                                            if (best >= 0) break;
-                                        }
-                                        break :blk best;
-                                    };
-                                    chp.heightmaps.world_surface[col_idx] = new_top;
-                                    chp.heightmaps.motion_blocking[col_idx] = new_top;
-                                    // mark region mesh dirty so it gets rebuilt
-                                    if (self.region_mesh_cache.getPtr(rp_hit)) |rm| {
-                                        rm.dirty = true;
-                                    }
-                                    // Also dirty neighbor region meshes if we edited a chunk-edge column,
-                                    // since their meshing samples cross-chunk solids.
-                                    var dxs: [2]i32 = .{ 0, 0 };
-                                    var dzs: [2]i32 = .{ 0, 0 };
-                                    var ncount: usize = 0;
-                                    if (hit_lx == 0) {
-                                        dxs[ncount] = -1;
-                                        dzs[ncount] = 0;
-                                        ncount += 1;
-                                    }
-                                    if (hit_lx == (@as(usize, @intCast(constants.chunk_size_x)) - 1)) {
-                                        dxs[ncount] = 1;
-                                        dzs[ncount] = 0;
-                                        ncount += 1;
-                                    }
-                                    if (hit_lz == 0) {
-                                        dxs[ncount] = 0;
-                                        dzs[ncount] = -1;
-                                        ncount += 1;
-                                    }
-                                    if (hit_lz == (@as(usize, @intCast(constants.chunk_size_z)) - 1)) {
-                                        dxs[ncount] = 0;
-                                        dzs[ncount] = 1;
-                                        ncount += 1;
-                                    }
-                                    var ni: usize = 0;
-                                    while (ni < ncount) : (ni += 1) {
-                                        const ncx: i32 = hit_cx + dxs[ni];
-                                        const ncz: i32 = hit_cz + dzs[ni];
-                                        const nrp = simulation.RegionPos{ .x = @divFloor(ncx, 32), .z = @divFloor(ncz, 32) };
-                                        if (self.region_mesh_cache.getPtr(nrp)) |rmn| rmn.dirty = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        self.sim.worlds_mutex.unlock();
     }
 
     // Apply currently-pressed movement keys to the client-local predicted player
@@ -2707,17 +1549,17 @@ pub const Client = struct {
             draw: bool,
             solid: bool,
             // Per-world-face materials
-            top_uv: AtlasUv,
+            top_uv: client_atlas_builder_mod.AtlasUv,
             top_apply_tint: bool,
-            bot_uv: AtlasUv,
+            bot_uv: client_atlas_builder_mod.AtlasUv,
             bot_apply_tint: bool,
-            nx_uv: AtlasUv,
+            nx_uv: client_atlas_builder_mod.AtlasUv,
             nx_apply_tint: bool,
-            px_uv: AtlasUv,
+            px_uv: client_atlas_builder_mod.AtlasUv,
             px_apply_tint: bool,
-            nz_uv: AtlasUv,
+            nz_uv: client_atlas_builder_mod.AtlasUv,
             nz_apply_tint: bool,
-            pz_uv: AtlasUv,
+            pz_uv: client_atlas_builder_mod.AtlasUv,
             pz_apply_tint: bool,
         };
         var pal_info = std.ArrayList(PalInfo).initCapacity(self.allocator, pal_len) catch {
@@ -2801,7 +1643,7 @@ pub const Client = struct {
         }
 
         // Greedy meshing for +Y (top) faces per Y-slice to drastically reduce vertex count
-        const FaceMat = struct { uv: AtlasUv, apply_tint: bool };
+        const FaceMat = struct { uv: client_atlas_builder_mod.AtlasUv, apply_tint: bool };
         const Mat = struct {
             fn eq(a: FaceMat, b: FaceMat) bool {
                 return a.apply_tint == b.apply_tint and a.uv.aidx == b.uv.aidx and a.uv.u0 == b.uv.u0 and a.uv.v0 == b.uv.v0 and a.uv.u1 == b.uv.u1 and a.uv.v1 == b.uv.v1;
@@ -3238,922 +2080,44 @@ pub const Client = struct {
 
     // Under world lock: capture slice refs for a region (no heavy copies)
     fn buildRegionRefsUnderLock(self: *Client, alloc: std.mem.Allocator, ws: *const simulation.WorldState, rs: *const simulation.RegionState, rpos: simulation.RegionPos) RegionSliceRefs {
-        _ = self;
-        var refs: RegionSliceRefs = .{ .rpos = rpos, .section_count_y = ws.sections_below + ws.sections_above, .sections_below = ws.sections_below, .base_cx = rpos.x * 32, .base_cz = rpos.z * 32, .chunks = &[_]ChunkSliceRefs{} };
-        const count: usize = rs.chunks.items.len;
-        if (count == 0) return refs;
-        var chunks = alloc.alloc(ChunkSliceRefs, count) catch return refs;
-        var i: usize = 0;
-        while (i < count) : (i += 1) {
-            const ch = rs.chunks.items[i];
-            const sec_count = ch.sections.len;
-            var secs: []SectionSliceRefs = &[_]SectionSliceRefs{};
-            if (sec_count > 0) secs = alloc.alloc(SectionSliceRefs, sec_count) catch &[_]SectionSliceRefs{};
-            var sy: usize = 0;
-            while (sy < secs.len) : (sy += 1) {
-                const s = ch.sections[sy];
-                secs[sy] = .{ .pal_ptr = s.palette.ptr, .pal_len = s.palette.len, .bits_ptr = s.blocks_indices_bits.ptr, .bits_len = s.blocks_indices_bits.len };
-            }
-            chunks[i] = .{ .pos = ch.pos, .sections = secs };
-        }
-        refs.chunks = chunks;
-        return refs;
+        return client_mesher_mod.buildRegionRefsUnderLock(self, alloc, ws, rs, rpos);
     }
 
     fn freeRegionRefs(self: *Client, alloc: std.mem.Allocator, refs: *RegionSliceRefs) void {
-        _ = self;
-        var i: usize = 0;
-        while (i < refs.chunks.len) : (i += 1) {
-            const ch = refs.chunks[i];
-            if (ch.sections.len > 0) alloc.free(ch.sections);
-        }
-        if (refs.chunks.len > 0) alloc.free(refs.chunks);
-        refs.* = .{ .rpos = refs.rpos, .section_count_y = refs.section_count_y, .sections_below = refs.sections_below, .base_cx = refs.base_cx, .base_cz = refs.base_cz, .chunks = &[_]ChunkSliceRefs{} };
+        client_mesher_mod.freeRegionRefs(self, alloc, refs);
     }
 
     // Outside world lock: copy refs into an owned RegionSnapshot
     fn copySnapshotFromRefs(self: *Client, alloc: std.mem.Allocator, refs: *const RegionSliceRefs) RegionSnapshot {
-        _ = self;
-        var snap: RegionSnapshot = .{
-            .rpos = refs.rpos,
-            .base_cx = refs.base_cx,
-            .base_cz = refs.base_cz,
-            .section_count_y = refs.section_count_y,
-            .sections_below = refs.sections_below,
-            .chunks = &[_]ChunkSnapshot{},
-            .grid_map = &[_]i32{},
-        };
-        const count: usize = refs.chunks.len;
-        if (count == 0) return snap;
-        var chunks = alloc.alloc(ChunkSnapshot, count) catch return snap;
-        var grid = alloc.alloc(i32, 32 * 32) catch {
-            alloc.free(chunks);
-            return snap;
-        };
-        var gi: usize = 0;
-        while (gi < grid.len) : (gi += 1) grid[gi] = -1;
-        var i: usize = 0;
-        while (i < count) : (i += 1) {
-            const chref = refs.chunks[i];
-            const pos = chref.pos;
-            const lx: i32 = pos.x - snap.base_cx;
-            const lz: i32 = pos.z - snap.base_cz;
-            if (!(lx >= 0 and lx < 32 and lz >= 0 and lz < 32)) {
-                chunks[i] = .{ .pos = pos, .sections = &[_]SectionSnapshot{} };
-                continue;
-            }
-            const m_idx: usize = @intCast(@as(usize, @intCast(lz)) * 32 + @as(usize, @intCast(lx)));
-            grid[m_idx] = @intCast(i);
-            var secs: []SectionSnapshot = &[_]SectionSnapshot{};
-            if (chref.sections.len > 0) secs = alloc.alloc(SectionSnapshot, chref.sections.len) catch &[_]SectionSnapshot{};
-            var sy: usize = 0;
-            while (sy < secs.len) : (sy += 1) {
-                const sref = chref.sections[sy];
-                var pal: []gs.BlockState = &[_]gs.BlockState{};
-                var bits: []u32 = &[_]u32{};
-                if (sref.pal_len > 0) {
-                    pal = alloc.alloc(gs.BlockState, sref.pal_len) catch &[_]gs.BlockState{};
-                    if (pal.len == sref.pal_len) @memcpy(pal[0..pal.len], sref.pal_ptr[0..sref.pal_len]);
-                }
-                if (sref.bits_len > 0) {
-                    bits = alloc.alloc(u32, sref.bits_len) catch &[_]u32{};
-                    if (bits.len == sref.bits_len) @memcpy(bits[0..bits.len], sref.bits_ptr[0..sref.bits_len]);
-                }
-                secs[sy] = .{ .palette = pal, .blocks_indices_bits = bits };
-            }
-            chunks[i] = .{ .pos = pos, .sections = secs };
-        }
-        snap.chunks = chunks;
-        snap.grid_map = grid;
-        return snap;
+        return client_mesher_mod.copySnapshotFromRefs(self, alloc, refs);
     }
 
     fn freeRegionSnapshot(self: *Client, alloc: std.mem.Allocator, snap: *RegionSnapshot) void {
-        _ = self;
-        // free sections and their arrays
-        var i: usize = 0;
-        while (i < snap.chunks.len) : (i += 1) {
-            const ch = snap.chunks[i];
-            var sy: usize = 0;
-            while (sy < ch.sections.len) : (sy += 1) {
-                const s = ch.sections[sy];
-                if (s.palette.len > 0) alloc.free(s.palette);
-                if (s.blocks_indices_bits.len > 0) alloc.free(s.blocks_indices_bits);
-            }
-            if (ch.sections.len > 0) alloc.free(ch.sections);
-        }
-        if (snap.chunks.len > 0) alloc.free(snap.chunks);
-        if (snap.grid_map.len > 0) alloc.free(snap.grid_map);
-        // reset
-        snap.* = .{ .rpos = snap.rpos, .base_cx = snap.base_cx, .base_cz = snap.base_cz, .section_count_y = snap.section_count_y, .sections_below = snap.sections_below, .chunks = &[_]ChunkSnapshot{}, .grid_map = &[_]i32{} };
+        client_mesher_mod.freeRegionSnapshot(self, alloc, snap);
     }
 
     fn snapGetChunkIndex(snap: *const RegionSnapshot, cx: i32, cz: i32) ?usize {
-        const lx: i32 = cx - snap.base_cx;
-        const lz: i32 = cz - snap.base_cz;
-        if (!(lx >= 0 and lx < 32 and lz >= 0 and lz < 32)) return null;
-        const idx: usize = @intCast(@as(usize, @intCast(lz)) * 32 + @as(usize, @intCast(lx)));
-        const val: i32 = snap.grid_map[idx];
-        if (val < 0) return null;
-        return @intCast(val);
+        return client_mesher_mod.snapGetChunkIndex(snap, cx, cz);
     }
 
     fn isSolidAtSnapshot(self: *Client, snap: *const RegionSnapshot, start_cx: i32, start_cz: i32, lx_in: i32, abs_y_in: i32, lz_in: i32) bool {
-        var lx = lx_in;
-        var lz = lz_in;
-        var cx = start_cx;
-        var cz = start_cz;
-        // cross-chunk X
-        if (lx < 0) {
-            cx -= 1;
-            lx += @as(i32, @intCast(constants.chunk_size_x));
-        } else if (lx >= @as(i32, @intCast(constants.chunk_size_x))) {
-            cx += 1;
-            lx -= @as(i32, @intCast(constants.chunk_size_x));
-        }
-        // cross-chunk Z
-        if (lz < 0) {
-            cz -= 1;
-            lz += @as(i32, @intCast(constants.chunk_size_z));
-        } else if (lz >= @as(i32, @intCast(constants.chunk_size_z))) {
-            cz += 1;
-            lz -= @as(i32, @intCast(constants.chunk_size_z));
-        }
-        const idx_opt = snapGetChunkIndex(snap, cx, cz);
-        if (idx_opt == null) {
-            // Outside this region snapshot: fall back to reading the live world state under lock
-            // so we don't create seams at region borders.
-            self.sim.worlds_mutex.lock();
-            const ws_ptr = self.sim.worlds_state.getPtr("minecraft:overworld");
-            if (ws_ptr) |ws_live| {
-                const rp = simulation.RegionPos{ .x = @divFloor(cx, 32), .z = @divFloor(cz, 32) };
-                if (ws_live.regions.getPtr(rp)) |rs_live| {
-                    if (rs_live.chunk_index.get(.{ .x = cx, .z = cz })) |cidx_live| {
-                        const ch_live = rs_live.chunks.items[cidx_live];
-                        const total_y_live: i32 = @intCast(ch_live.sections.len * constants.section_height);
-                        const ny0_live: i32 = abs_y_in + @as(i32, @intCast(snap.sections_below)) * @as(i32, @intCast(constants.section_height));
-                        if (!(ny0_live < 0 or ny0_live >= total_y_live)) {
-                            const sy_live: usize = @intCast(@divTrunc(ny0_live, @as(i32, @intCast(constants.section_height))));
-                            const ly_live: usize = @intCast(@mod(ny0_live, @as(i32, @intCast(constants.section_height))));
-                            if (sy_live < ch_live.sections.len) {
-                                const s_live = ch_live.sections[sy_live];
-                                const bpi_live: u6 = bitsFor(s_live.palette.len);
-                                const idx3d_live: usize = @as(usize, @intCast(lz)) * (constants.chunk_size_x * constants.section_height) + @as(usize, @intCast(lx)) * constants.section_height + ly_live;
-                                const pidx_live: usize = @intCast(unpackBitsGet(s_live.blocks_indices_bits, idx3d_live, bpi_live));
-                                if (pidx_live < s_live.palette.len) {
-                                    const bid_live: u32 = s_live.palette[pidx_live].block_id;
-                                    if (bid_live == 0) {
-                                        self.sim.worlds_mutex.unlock();
-                                        return false;
-                                    }
-                                    const solid_live: bool = if (bid_live < self.sim.reg.blocks.items.len) self.sim.reg.blocks.items[@intCast(bid_live)].collision else true;
-                                    self.sim.worlds_mutex.unlock();
-                                    return solid_live;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            self.sim.worlds_mutex.unlock();
-            // Default: treat as solid if we couldn't read neighbor
-            return true;
-        }
-        const ch = snap.chunks[idx_opt.?];
-        const total_y: i32 = @as(i32, @intCast(snap.section_count_y)) * @as(i32, @intCast(constants.section_height));
-        const ny0 = abs_y_in + @as(i32, @intCast(snap.sections_below)) * @as(i32, @intCast(constants.section_height));
-        if (ny0 < 0 or ny0 >= total_y) return false;
-        const sy: usize = @intCast(@divTrunc(ny0, @as(i32, @intCast(constants.section_height))));
-        const ly: usize = @intCast(@mod(ny0, @as(i32, @intCast(constants.section_height))));
-        if (sy >= ch.sections.len) return false;
-        const s = ch.sections[sy];
-        const bpi: u6 = bitsFor(s.palette.len);
-        const idx3d: usize = @as(usize, @intCast(lz)) * (constants.chunk_size_x * constants.section_height) + @as(usize, @intCast(lx)) * constants.section_height + ly;
-        const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx3d, bpi));
-        if (pidx >= s.palette.len) return false;
-        const bid: u32 = s.palette[pidx].block_id;
-        if (bid == 0) return false;
-        if (bid < self.sim.reg.blocks.items.len) return self.sim.reg.blocks.items[@intCast(bid)].collision;
-        return true;
+        return client_mesher_mod.isSolidAtSnapshot(self, snap, start_cx, start_cz, lx_in, abs_y_in, lz_in);
     }
 
     fn buildSectionVerticesFromSnapshot(self: *Client, snap: *const RegionSnapshot, ch: *const ChunkSnapshot, sy: usize, base_x: f32, base_z: f32, out: *std.ArrayList(Vertex), alloc: std.mem.Allocator) void {
-        const s = ch.sections[sy];
-        const pal_len = s.palette.len;
-        const bpi: u6 = bitsFor(pal_len);
-        const PalInfo = struct {
-            draw: bool,
-            solid: bool,
-            top_uv: AtlasUv,
-            top_apply_tint: bool,
-            bot_uv: AtlasUv,
-            bot_apply_tint: bool,
-            nx_uv: AtlasUv,
-            nx_apply_tint: bool,
-            px_uv: AtlasUv,
-            px_apply_tint: bool,
-            nz_uv: AtlasUv,
-            nz_apply_tint: bool,
-            pz_uv: AtlasUv,
-            pz_apply_tint: bool,
-        };
-        var pal_info = std.ArrayList(PalInfo).initCapacity(self.allocator, pal_len) catch {
-            return;
-        };
-        defer pal_info.deinit(self.allocator);
-        var pi: usize = 0;
-        while (pi < pal_len) : (pi += 1) {
-            const bid: u32 = s.palette[pi].block_id;
-            var pinfo: PalInfo = .{
-                .draw = true,
-                .solid = true,
-                .top_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
-                .top_apply_tint = false,
-                .bot_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
-                .bot_apply_tint = false,
-                .nx_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
-                .nx_apply_tint = false,
-                .px_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
-                .px_apply_tint = false,
-                .nz_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
-                .nz_apply_tint = false,
-                .pz_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
-                .pz_apply_tint = false,
-            };
-            if (bid < self.sim.reg.blocks.items.len) {
-                pinfo.solid = self.sim.reg.blocks.items[@intCast(bid)].collision;
-            }
-            if (bid == 0) {
-                pinfo.draw = false;
-                pinfo.solid = false;
-            } else {
-                const def = self.sim.reg.blocks.items[@intCast(bid)];
-                const state = s.palette[pi];
-                inline for (.{ 0, 1, 2, 3, 4, 5 }) |wf| {
-                    const rel: block.Face = worldToRelativeFace(state.direction, @intCast(wf));
-                    const fidx: usize = @intCast(def.face_config_index[@intFromEnum(rel)]);
-                    if (fidx < def.face_configs.len) {
-                        const fc = def.face_configs[fidx];
-                        if (fc.layers.len > 0) {
-                            switch (fc.layers[0]) {
-                                .Texture => |t| {
-                                    const uv_opt = self.atlas_uvs_by_id.get(t.tex);
-                                    if (uv_opt) |uv| {
-                                        switch (wf) {
-                                            3 => {
-                                                pinfo.top_uv = uv;
-                                                pinfo.top_apply_tint = (t.tint != null);
-                                            },
-                                            2 => {
-                                                pinfo.bot_uv = uv;
-                                                pinfo.bot_apply_tint = (t.tint != null);
-                                            },
-                                            0 => {
-                                                pinfo.nx_uv = uv;
-                                                pinfo.nx_apply_tint = (t.tint != null);
-                                            },
-                                            1 => {
-                                                pinfo.px_uv = uv;
-                                                pinfo.px_apply_tint = (t.tint != null);
-                                            },
-                                            4 => {
-                                                pinfo.nz_uv = uv;
-                                                pinfo.nz_apply_tint = (t.tint != null);
-                                            },
-                                            5 => {
-                                                pinfo.pz_uv = uv;
-                                                pinfo.pz_apply_tint = (t.tint != null);
-                                            },
-                                            else => {},
-                                        }
-                                    }
-                                },
-                            }
-                        }
-                    }
-                }
-            }
-            pal_info.appendAssumeCapacity(pinfo);
-        }
-
-        // Greedy top faces per Y-slice
-        const FaceMat = struct { uv: AtlasUv, apply_tint: bool };
-        const Mat = struct {
-            fn eq(a: FaceMat, b: FaceMat) bool {
-                return a.apply_tint == b.apply_tint and a.uv.aidx == b.uv.aidx and a.uv.u0 == b.uv.u0 and a.uv.v0 == b.uv.v0 and a.uv.u1 == b.uv.u1 and a.uv.v1 == b.uv.v1;
-            }
-        };
-        const section_base_y: i32 = @as(i32, @intCast(sy * constants.section_height)) - @as(i32, @intCast(snap.sections_below)) * @as(i32, @intCast(constants.section_height));
-        var ly_top: usize = 0;
-        while (ly_top < constants.section_height) : (ly_top += 1) {
-            const abs_y: i32 = section_base_y + @as(i32, @intCast(ly_top));
-            var mask: [constants.chunk_size_z * constants.chunk_size_x]struct { present: bool, m: FaceMat } = undefined;
-            // fill mask
-            var mz: usize = 0;
-            while (mz < constants.chunk_size_z) : (mz += 1) {
-                var mx: usize = 0;
-                while (mx < constants.chunk_size_x) : (mx += 1) {
-                    const idxm: usize = mz * constants.chunk_size_x + mx;
-                    mask[idxm].present = false;
-                    const src_idx: usize = mz * (constants.chunk_size_x * constants.section_height) + mx * constants.section_height + ly_top;
-                    const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, src_idx, bpi));
-                    if (pidx >= pal_info.items.len) continue;
-                    const info = pal_info.items[pidx];
-                    if (!info.draw) continue;
-                    if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(mx)), abs_y + 1, @as(i32, @intCast(mz)))) {
-                        mask[idxm] = .{ .present = true, .m = .{ .uv = info.top_uv, .apply_tint = info.top_apply_tint } };
-                    }
-                }
-            }
-            // rectangles
-            mz = 0;
-            while (mz < constants.chunk_size_z) : (mz += 1) {
-                var mx: usize = 0;
-                while (mx < constants.chunk_size_x) : (mx += 1) {
-                    const base_idx: usize = mz * constants.chunk_size_x + mx;
-                    if (!mask[base_idx].present) continue;
-                    const mkey: FaceMat = mask[base_idx].m;
-                    // width
-                    var w: usize = 1;
-                    while ((mx + w) < constants.chunk_size_x) : (w += 1) {
-                        const idx2 = mz * constants.chunk_size_x + (mx + w);
-                        if (!(mask[idx2].present and Mat.eq(mask[idx2].m, mkey))) break;
-                    }
-                    // height
-                    var h: usize = 1;
-                    outer: while ((mz + h) < constants.chunk_size_z) : (h += 1) {
-                        var kx: usize = 0;
-                        while (kx < w) : (kx += 1) {
-                            const idx3 = (mz + h) * constants.chunk_size_x + (mx + kx);
-                            if (!(mask[idx3].present and Mat.eq(mask[idx3].m, mkey))) break :outer;
-                        }
-                    }
-                    // emit quad
-                    const wx0: f32 = base_x + @as(f32, @floatFromInt(mx));
-                    const wz0: f32 = base_z + @as(f32, @floatFromInt(mz));
-                    const wx1: f32 = base_x + @as(f32, @floatFromInt(mx + w));
-                    const wz1: f32 = base_z + @as(f32, @floatFromInt(mz + h));
-                    const wy1: f32 = @as(f32, @floatFromInt(abs_y + 1));
-                    const du: f32 = mkey.uv.u1 - mkey.uv.u0;
-                    const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
-                    const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
-                    const rsize = [2]f32{ du, dv };
-                    const uv00_s: [2]f32 = .{ 0, 0 };
-                    const uvh0_s: [2]f32 = .{ @floatFromInt(h), 0 };
-                    const uvhw_s: [2]f32 = .{ @floatFromInt(h), @floatFromInt(w) };
-                    const uv0w_s: [2]f32 = .{ 0, @floatFromInt(w) };
-                    emitQuad(alloc, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00_s, uvh0_s, uvhw_s, uv0w_s, rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
-                    // clear mask
-                    var zz: usize = 0;
-                    while (zz < h) : (zz += 1) {
-                        var xx: usize = 0;
-                        while (xx < w) : (xx += 1) mask[(mz + zz) * constants.chunk_size_x + (mx + xx)].present = false;
-                    }
-                }
-            }
-        }
-
-        // Greedy bottom faces per Y-slice (-Y)
-        ly_top = 0;
-        while (ly_top < constants.section_height) : (ly_top += 1) {
-            const abs_y: i32 = section_base_y + @as(i32, @intCast(ly_top));
-            var mask: [constants.chunk_size_z * constants.chunk_size_x]struct { present: bool, m: FaceMat } = undefined;
-            var mz: usize = 0;
-            while (mz < constants.chunk_size_z) : (mz += 1) {
-                var mx: usize = 0;
-                while (mx < constants.chunk_size_x) : (mx += 1) {
-                    const idxm: usize = mz * constants.chunk_size_x + mx;
-                    mask[idxm].present = false;
-                    const src_idx: usize = mz * (constants.chunk_size_x * constants.section_height) + mx * constants.section_height + ly_top;
-                    const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, src_idx, bpi));
-                    if (pidx >= pal_info.items.len) continue;
-                    const info = pal_info.items[pidx];
-                    if (!info.draw) continue;
-                    if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(mx)), abs_y - 1, @as(i32, @intCast(mz)))) {
-                        mask[idxm] = .{ .present = true, .m = .{ .uv = info.bot_uv, .apply_tint = info.bot_apply_tint } };
-                    }
-                }
-            }
-            mz = 0;
-            while (mz < constants.chunk_size_z) : (mz += 1) {
-                var mx: usize = 0;
-                while (mx < constants.chunk_size_x) : (mx += 1) {
-                    const base_idx: usize = mz * constants.chunk_size_x + mx;
-                    if (!mask[base_idx].present) continue;
-                    const mkey: FaceMat = mask[base_idx].m;
-                    var w: usize = 1;
-                    while ((mx + w) < constants.chunk_size_x) : (w += 1) {
-                        const idx2 = mz * constants.chunk_size_x + (mx + w);
-                        if (!(mask[idx2].present and Mat.eq(mask[idx2].m, mkey))) break;
-                    }
-                    var h: usize = 1;
-                    outer_b: while ((mz + h) < constants.chunk_size_z) : (h += 1) {
-                        var kx: usize = 0;
-                        while (kx < w) : (kx += 1) {
-                            const idx3 = (mz + h) * constants.chunk_size_x + (mx + kx);
-                            if (!(mask[idx3].present and Mat.eq(mask[idx3].m, mkey))) break :outer_b;
-                        }
-                    }
-                    const wx0: f32 = base_x + @as(f32, @floatFromInt(mx));
-                    const wz0: f32 = base_z + @as(f32, @floatFromInt(mz));
-                    const wx1: f32 = base_x + @as(f32, @floatFromInt(mx + w));
-                    const wz1: f32 = base_z + @as(f32, @floatFromInt(mz + h));
-                    const wy0: f32 = @as(f32, @floatFromInt(abs_y));
-                    const du: f32 = mkey.uv.u1 - mkey.uv.u0;
-                    const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
-                    const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
-                    const rsize = [2]f32{ du, dv };
-                    const uv00_bs: [2]f32 = .{ 0, 0 };
-                    const uvw0_s: [2]f32 = .{ @floatFromInt(w), 0 };
-                    const uvwh_s: [2]f32 = .{ @floatFromInt(w), @floatFromInt(h) };
-                    const uv0h_s: [2]f32 = .{ 0, @floatFromInt(h) };
-                    emitQuad(alloc, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00_bs, uvw0_s, uvwh_s, uv0h_s, rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
-                    var zz: usize = 0;
-                    while (zz < h) : (zz += 1) {
-                        var xx: usize = 0;
-                        while (xx < w) : (xx += 1) mask[(mz + zz) * constants.chunk_size_x + (mx + xx)].present = false;
-                    }
-                }
-            }
-        }
-
-        // Greedy -X/+X per X-slice
-        var lx_face: usize = 0;
-        while (lx_face < constants.chunk_size_x) : (lx_face += 1) {
-            // -X
-            {
-                var mask_x: [constants.section_height * constants.chunk_size_z]struct { present: bool, m: FaceMat } = undefined;
-                var mz: usize = 0;
-                while (mz < constants.chunk_size_z) : (mz += 1) {
-                    var ly: usize = 0;
-                    while (ly < constants.section_height) : (ly += 1) {
-                        const idxm: usize = mz * constants.section_height + ly;
-                        mask_x[idxm].present = false;
-                        const src_idx: usize = mz * (constants.chunk_size_x * constants.section_height) + lx_face * constants.section_height + ly;
-                        const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, src_idx, bpi));
-                        if (pidx >= pal_info.items.len) continue;
-                        const info = pal_info.items[pidx];
-                        if (!info.draw) continue;
-                        const abs_y: i32 = section_base_y + @as(i32, @intCast(ly));
-                        if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx_face)) - 1, abs_y, @as(i32, @intCast(mz)))) {
-                            mask_x[idxm] = .{ .present = true, .m = .{ .uv = info.nx_uv, .apply_tint = info.nx_apply_tint } };
-                        }
-                    }
-                }
-                mz = 0;
-                while (mz < constants.chunk_size_z) : (mz += 1) {
-                    var ly0: usize = 0;
-                    while (ly0 < constants.section_height) : (ly0 += 1) {
-                        const base_idx: usize = mz * constants.section_height + ly0;
-                        if (!mask_x[base_idx].present) continue;
-                        const mkey: FaceMat = mask_x[base_idx].m;
-                        var w: usize = 1;
-                        while ((ly0 + w) < constants.section_height) : (w += 1) {
-                            const idx2 = mz * constants.section_height + (ly0 + w);
-                            if (!(mask_x[idx2].present and Mat.eq(mask_x[idx2].m, mkey))) break;
-                        }
-                        var h: usize = 1;
-                        outer_xn: while ((mz + h) < constants.chunk_size_z) : (h += 1) {
-                            var ky: usize = 0;
-                            while (ky < w) : (ky += 1) {
-                                const idx3 = (mz + h) * constants.section_height + (ly0 + ky);
-                                if (!(mask_x[idx3].present and Mat.eq(mask_x[idx3].m, mkey))) break :outer_xn;
-                            }
-                        }
-                        const x0: f32 = base_x + @as(f32, @floatFromInt(lx_face));
-                        const y0: f32 = @as(f32, @floatFromInt(section_base_y)) + @as(f32, @floatFromInt(ly0));
-                        const y1: f32 = y0 + @as(f32, @floatFromInt(w));
-                        const z0: f32 = base_z + @as(f32, @floatFromInt(mz));
-                        const z1: f32 = z0 + @as(f32, @floatFromInt(h));
-                        const du: f32 = mkey.uv.u1 - mkey.uv.u0;
-                        const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
-                        const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
-                        const rsize = [2]f32{ du, dv };
-                        const uvs_nx_s = uvmap.sideTileUVs(0, w, h);
-                        emitQuad(alloc, out, .{ x0, y0, z0 }, .{ x0, y0, z1 }, .{ x0, y1, z1 }, .{ x0, y1, z0 }, uvs_nx_s[0], uvs_nx_s[1], uvs_nx_s[2], uvs_nx_s[3], rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
-                        var hz: usize = 0;
-                        while (hz < h) : (hz += 1) {
-                            var wy: usize = 0;
-                            while (wy < w) : (wy += 1) mask_x[(mz + hz) * constants.section_height + (ly0 + wy)].present = false;
-                        }
-                    }
-                }
-            }
-            // +X
-            {
-                var mask_x: [constants.section_height * constants.chunk_size_z]struct { present: bool, m: FaceMat } = undefined;
-                var mz: usize = 0;
-                while (mz < constants.chunk_size_z) : (mz += 1) {
-                    var ly: usize = 0;
-                    while (ly < constants.section_height) : (ly += 1) {
-                        const idxm: usize = mz * constants.section_height + ly;
-                        mask_x[idxm].present = false;
-                        const src_idx: usize = mz * (constants.chunk_size_x * constants.section_height) + lx_face * constants.section_height + ly;
-                        const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, src_idx, bpi));
-                        if (pidx >= pal_info.items.len) continue;
-                        const info = pal_info.items[pidx];
-                        if (!info.draw) continue;
-                        const abs_y: i32 = section_base_y + @as(i32, @intCast(ly));
-                        if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx_face)) + 1, abs_y, @as(i32, @intCast(mz)))) {
-                            mask_x[idxm] = .{ .present = true, .m = .{ .uv = info.px_uv, .apply_tint = info.px_apply_tint } };
-                        }
-                    }
-                }
-                mz = 0;
-                while (mz < constants.chunk_size_z) : (mz += 1) {
-                    var ly0: usize = 0;
-                    while (ly0 < constants.section_height) : (ly0 += 1) {
-                        const base_idx: usize = mz * constants.section_height + ly0;
-                        if (!mask_x[base_idx].present) continue;
-                        const mkey: FaceMat = mask_x[base_idx].m;
-                        var w: usize = 1;
-                        while ((ly0 + w) < constants.section_height) : (w += 1) {
-                            const idx2 = mz * constants.section_height + (ly0 + w);
-                            if (!(mask_x[idx2].present and Mat.eq(mask_x[idx2].m, mkey))) break;
-                        }
-                        var h: usize = 1;
-                        outer_xp: while ((mz + h) < constants.chunk_size_z) : (h += 1) {
-                            var ky: usize = 0;
-                            while (ky < w) : (ky += 1) {
-                                const idx3 = (mz + h) * constants.section_height + (ly0 + ky);
-                                if (!(mask_x[idx3].present and Mat.eq(mask_x[idx3].m, mkey))) break :outer_xp;
-                            }
-                        }
-                        const x1: f32 = base_x + @as(f32, @floatFromInt(lx_face + 1));
-                        const y0: f32 = @as(f32, @floatFromInt(section_base_y)) + @as(f32, @floatFromInt(ly0));
-                        const y1: f32 = y0 + @as(f32, @floatFromInt(w));
-                        const z0: f32 = base_z + @as(f32, @floatFromInt(mz));
-                        const z1: f32 = z0 + @as(f32, @floatFromInt(h));
-                        const du: f32 = mkey.uv.u1 - mkey.uv.u0;
-                        const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
-                        const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
-                        const rsize = [2]f32{ du, dv };
-                        const uvs_px_s = uvmap.sideTileUVs(1, w, h);
-                        emitQuad(alloc, out, .{ x1, y0, z0 }, .{ x1, y1, z0 }, .{ x1, y1, z1 }, .{ x1, y0, z1 }, uvs_px_s[0], uvs_px_s[1], uvs_px_s[2], uvs_px_s[3], rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
-                        var hz: usize = 0;
-                        while (hz < h) : (hz += 1) {
-                            var wy: usize = 0;
-                            while (wy < w) : (wy += 1) mask_x[(mz + hz) * constants.section_height + (ly0 + wy)].present = false;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Greedy -Z/+Z per Z-slice
-        var lz_face: usize = 0;
-        while (lz_face < constants.chunk_size_z) : (lz_face += 1) {
-            // -Z
-            {
-                var mask_z: [constants.section_height * constants.chunk_size_x]struct { present: bool, m: FaceMat } = undefined;
-                var lx: usize = 0;
-                while (lx < constants.chunk_size_x) : (lx += 1) {
-                    var ly: usize = 0;
-                    while (ly < constants.section_height) : (ly += 1) {
-                        const idxm: usize = lx * constants.section_height + ly;
-                        mask_z[idxm].present = false;
-                        const src_idx: usize = lz_face * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
-                        const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, src_idx, bpi));
-                        if (pidx >= pal_info.items.len) continue;
-                        const info = pal_info.items[pidx];
-                        if (!info.draw) continue;
-                        const abs_y: i32 = section_base_y + @as(i32, @intCast(ly));
-                        if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y, @as(i32, @intCast(lz_face)) - 1)) {
-                            mask_z[idxm] = .{ .present = true, .m = .{ .uv = info.nz_uv, .apply_tint = info.nz_apply_tint } };
-                        }
-                    }
-                }
-                lx = 0;
-                while (lx < constants.chunk_size_x) : (lx += 1) {
-                    var ly0: usize = 0;
-                    while (ly0 < constants.section_height) : (ly0 += 1) {
-                        const base_idx: usize = lx * constants.section_height + ly0;
-                        if (!mask_z[base_idx].present) continue;
-                        const mkey: FaceMat = mask_z[base_idx].m;
-                        var w: usize = 1;
-                        while ((lx + w) < constants.chunk_size_x) : (w += 1) {
-                            const idx2 = (lx + w) * constants.section_height + ly0;
-                            if (!(mask_z[idx2].present and Mat.eq(mask_z[idx2].m, mkey))) break;
-                        }
-                        var h: usize = 1;
-                        outer_zn: while ((ly0 + h) < constants.section_height) : (h += 1) {
-                            var kx: usize = 0;
-                            while (kx < w) : (kx += 1) {
-                                const idx3 = (lx + kx) * constants.section_height + (ly0 + h);
-                                if (!(mask_z[idx3].present and Mat.eq(mask_z[idx3].m, mkey))) break :outer_zn;
-                            }
-                        }
-                        const z0: f32 = base_z + @as(f32, @floatFromInt(lz_face));
-                        const x0: f32 = base_x + @as(f32, @floatFromInt(lx));
-                        const x1: f32 = x0 + @as(f32, @floatFromInt(w));
-                        const y0: f32 = @as(f32, @floatFromInt(section_base_y)) + @as(f32, @floatFromInt(ly0));
-                        const y1: f32 = y0 + @as(f32, @floatFromInt(h));
-                        const du: f32 = mkey.uv.u1 - mkey.uv.u0;
-                        const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
-                        const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
-                        const rsize = [2]f32{ du, dv };
-                        // -Z face: U along X (w), V along Y (h), flip V so texture top maps to +Y
-                        const uvs_nz_s = uvmap.sideTileUVs(4, w, h);
-                        emitQuad(alloc, out, .{ x0, y0, z0 }, .{ x0, y1, z0 }, .{ x1, y1, z0 }, .{ x1, y0, z0 }, uvs_nz_s[0], uvs_nz_s[1], uvs_nz_s[2], uvs_nz_s[3], rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
-                        var wy: usize = 0;
-                        while (wy < h) : (wy += 1) {
-                            var wx: usize = 0;
-                            while (wx < w) : (wx += 1) mask_z[(lx + wx) * constants.section_height + (ly0 + wy)].present = false;
-                        }
-                    }
-                }
-            }
-            // +Z
-            {
-                var mask_z: [constants.section_height * constants.chunk_size_x]struct { present: bool, m: FaceMat } = undefined;
-                var lx: usize = 0;
-                while (lx < constants.chunk_size_x) : (lx += 1) {
-                    var ly: usize = 0;
-                    while (ly < constants.section_height) : (ly += 1) {
-                        const idxm: usize = lx * constants.section_height + ly;
-                        mask_z[idxm].present = false;
-                        const src_idx: usize = lz_face * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
-                        const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, src_idx, bpi));
-                        if (pidx >= pal_info.items.len) continue;
-                        const info = pal_info.items[pidx];
-                        if (!info.draw) continue;
-                        const abs_y: i32 = section_base_y + @as(i32, @intCast(ly));
-                        if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y, @as(i32, @intCast(lz_face)) + 1)) {
-                            mask_z[idxm] = .{ .present = true, .m = .{ .uv = info.pz_uv, .apply_tint = info.pz_apply_tint } };
-                        }
-                    }
-                }
-                lx = 0;
-                while (lx < constants.chunk_size_x) : (lx += 1) {
-                    var ly0: usize = 0;
-                    while (ly0 < constants.section_height) : (ly0 += 1) {
-                        const base_idx: usize = lx * constants.section_height + ly0;
-                        if (!mask_z[base_idx].present) continue;
-                        const mkey: FaceMat = mask_z[base_idx].m;
-                        var w: usize = 1;
-                        while ((lx + w) < constants.chunk_size_x) : (w += 1) {
-                            const idx2 = (lx + w) * constants.section_height + ly0;
-                            if (!(mask_z[idx2].present and Mat.eq(mask_z[idx2].m, mkey))) break;
-                        }
-                        var h: usize = 1;
-                        outer_zp: while ((ly0 + h) < constants.section_height) : (h += 1) {
-                            var kx: usize = 0;
-                            while (kx < w) : (kx += 1) {
-                                const idx3 = (lx + kx) * constants.section_height + (ly0 + h);
-                                if (!(mask_z[idx3].present and Mat.eq(mask_z[idx3].m, mkey))) break :outer_zp;
-                            }
-                        }
-                        const z1: f32 = base_z + @as(f32, @floatFromInt(lz_face + 1));
-                        const x0: f32 = base_x + @as(f32, @floatFromInt(lx));
-                        const x1: f32 = x0 + @as(f32, @floatFromInt(w));
-                        const y0: f32 = @as(f32, @floatFromInt(section_base_y)) + @as(f32, @floatFromInt(ly0));
-                        const y1: f32 = y0 + @as(f32, @floatFromInt(h));
-                        const du: f32 = mkey.uv.u1 - mkey.uv.u0;
-                        const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
-                        const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
-                        const rsize = [2]f32{ du, dv };
-                        const uvs_pz_s = uvmap.sideTileUVs(5, w, h);
-                        // Use (v0,v1,v2,v3) for +Z to ensure CCW with cull BACK
-                        emitQuad(alloc, out, .{ x0, y0, z1 }, .{ x1, y0, z1 }, .{ x1, y1, z1 }, .{ x0, y1, z1 }, uvs_pz_s[0], uvs_pz_s[3], uvs_pz_s[2], uvs_pz_s[1], rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
-                        var wy: usize = 0;
-                        while (wy < h) : (wy += 1) {
-                            var wx: usize = 0;
-                            while (wx < w) : (wx += 1) mask_z[(lx + wx) * constants.section_height + (ly0 + wy)].present = false;
-                        }
-                    }
-                }
-            }
-        }
+        client_mesher_mod.buildSectionVerticesFromSnapshot(self, snap, ch, sy, base_x, base_z, out, alloc);
     }
 
     fn meshRegionFromSnapshot(self: *Client, alloc: std.mem.Allocator, snap: *const RegionSnapshot) MeshingResult {
-        var draws = self.allocator.alloc(SectionDraw, snap.chunks.len * @as(usize, @intCast(snap.section_count_y))) catch return .{ .rpos = snap.rpos, .built_chunk_count = 0, .verts = &[_]Vertex{}, .draws = &[_]SectionDraw{} };
-        var draws_len: usize = 0;
-        var verts = std.ArrayList(Vertex).initCapacity(alloc, 0) catch {
-            self.allocator.free(draws);
-            return .{ .rpos = snap.rpos, .built_chunk_count = 0, .verts = &[_]Vertex{}, .draws = &[_]SectionDraw{} };
-        };
-        defer verts.deinit(alloc);
-        for (snap.chunks) |ch| {
-            const base_x: f32 = @floatFromInt(ch.pos.x * @as(i32, @intCast(constants.chunk_size_x)));
-            const base_z: f32 = @floatFromInt(ch.pos.z * @as(i32, @intCast(constants.chunk_size_z)));
-            var sy: usize = 0;
-            while (sy < ch.sections.len) : (sy += 1) {
-                const start: usize = verts.items.len;
-                self.buildSectionVerticesFromSnapshot(snap, &ch, sy, base_x, base_z, &verts, alloc);
-                const count: usize = verts.items.len - start;
-                if (count > 0) {
-                    draws[draws_len] = .{ .chunk_pos = ch.pos, .sy = @intCast(sy), .first = @intCast(start), .count = @intCast(count) };
-                    draws_len += 1;
-                }
-            }
-        }
-        // shrink draws
-        if (draws_len < draws.len) {
-            const new_draws = self.allocator.alloc(SectionDraw, draws_len) catch {
-                // keep existing draws oversized
-                return .{ .rpos = snap.rpos, .built_chunk_count = snap.chunks.len, .verts = blk: {
-                    if (verts.items.len == 0) break :blk &[_]Vertex{};
-                    const owned = alloc.alloc(Vertex, verts.items.len) catch break :blk &[_]Vertex{};
-                    @memcpy(owned[0..verts.items.len], verts.items[0..verts.items.len]);
-                    break :blk owned;
-                }, .draws = draws };
-            };
-            @memcpy(new_draws[0..draws_len], draws[0..draws_len]);
-            self.allocator.free(draws);
-            draws = new_draws;
-        }
-        // copy verts into owned slice
-        var verts_owned: []Vertex = &[_]Vertex{};
-        if (verts.items.len > 0) {
-            verts_owned = alloc.alloc(Vertex, verts.items.len) catch &[_]Vertex{};
-            if (verts_owned.len == verts.items.len) @memcpy(verts_owned[0..verts.items.len], verts.items[0..verts.items.len]);
-        }
-        return .{ .rpos = snap.rpos, .built_chunk_count = snap.chunks.len, .verts = verts_owned, .draws = draws };
+        return client_mesher_mod.meshRegionFromSnapshot(self, alloc, snap);
     }
 
     fn adoptMesherResults(self: *Client) void {
-        var processed: u32 = 0;
-        while (processed < self.adopt_budget_per_frame) {
-            // fetch one result
-            self.mesher_mutex.lock();
-            if (self.mesher_results.items.len == 0) {
-                self.mesher_mutex.unlock();
-                break;
-            }
-            const mr = self.mesher_results.items[self.mesher_results.items.len - 1];
-            _ = self.mesher_results.pop();
-            self.mesher_mutex.unlock();
-
-            // Upload GPU buffer
-            var buf: sg.Buffer = .{};
-            if (mr.verts.len > 0) {
-                buf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true }, .data = sg.asRange(mr.verts) });
-            }
-
-            // Swap into cache
-            if (self.region_mesh_cache.getPtr(mr.rpos)) |existing| {
-                const old = existing.*;
-                existing.* = .{ .vbuf = buf, .draws = mr.draws, .built_chunk_count = mr.built_chunk_count, .dirty = false, .inflight = false, .last_built_frame = self.frame_index };
-                if (old.vbuf.id != 0) sg.destroyBuffer(old.vbuf);
-                self.allocator.free(old.draws);
-            } else {
-                if (self.regionMeshCacheCount() < REGION_MESH_BUDGET) {
-                    const rm: RegionMesh = .{ .vbuf = buf, .draws = mr.draws, .built_chunk_count = mr.built_chunk_count, .dirty = false, .inflight = false, .last_built_frame = self.frame_index };
-                    _ = self.region_mesh_cache.put(mr.rpos, rm) catch {
-                        if (rm.vbuf.id != 0) sg.destroyBuffer(rm.vbuf);
-                        self.allocator.free(mr.draws);
-                    };
-                } else {
-                    // over budget: drop result
-                    if (buf.id != 0) sg.destroyBuffer(buf);
-                    self.allocator.free(mr.draws);
-                }
-            }
-
-            // Mark region tint dirty (biome tints may have changed in updated chunks)
-            if (self.region_tint_cache.getPtr(mr.rpos)) |entry| entry.dirty = true;
-
-            // free CPU verts
-            if (mr.verts.len > 0) std.heap.page_allocator.free(mr.verts);
-            processed += 1;
-        }
-        self.dbg_last_adopted = processed;
+        client_mesher_scheduler_mod.adoptMesherResults(self);
     }
 
-    fn ensureRegionMesh(self: *Client, rpos: simulation.RegionPos, expected_chunk_count: usize) void {
-        // If nothing to build yet, avoid scheduling and clear any stale inflight
-        if (expected_chunk_count == 0) {
-            if (self.region_mesh_cache.getPtr(rpos)) |existing0| {
-                existing0.built_chunk_count = 0;
-                existing0.inflight = false;
-            }
-            return;
-        }
-        // If cache entry exists and is up-to-date, nothing to do
-        if (self.region_mesh_cache.getPtr(rpos)) |existing| {
-            // If marked dirty, schedule a rebuild immediately (ignoring cooldown), unless already inflight or out of budget
-            if (existing.dirty and !existing.inflight and (self.rebuilds_issued_this_frame < self.rebuild_budget_per_frame)) {
-                existing.inflight = true;
-                // leave existing.dirty set; it will be cleared when adopting results
-                self.mesher_mutex.lock();
-                self.mesher_jobs.append(self.allocator, .{ .rpos = rpos }) catch {};
-                self.mesher_cv.broadcast();
-                self.mesher_mutex.unlock();
-                self.rebuilds_issued_this_frame += 1;
-                return;
-            }
-            if (existing.built_chunk_count == expected_chunk_count and existing.vbuf.id != 0) return;
-            // If a rebuild is already in-flight but appears stuck, allow reschedule after cooldown
-            if (existing.inflight) {
-                if ((self.frame_index - existing.last_built_frame) < self.rebuild_cooldown_frames) return;
-                // Reset and fall through to schedule a fresh job
-                existing.inflight = false;
-            }
-            // Throttle job issuance
-            if (self.rebuilds_issued_this_frame >= self.rebuild_budget_per_frame) return;
-            if ((self.frame_index - existing.last_built_frame) < self.rebuild_cooldown_frames) return;
-            // Mark inflight and enqueue job
-            existing.inflight = true;
-            self.mesher_mutex.lock();
-            self.mesher_jobs.append(self.allocator, .{ .rpos = rpos }) catch {};
-            self.mesher_cv.broadcast();
-            self.mesher_mutex.unlock();
-            self.rebuilds_issued_this_frame += 1;
-            return;
-        }
-        // No cache entry: if under budget, insert placeholder and schedule build
-        if (self.rebuilds_issued_this_frame >= self.rebuild_budget_per_frame) return;
-        if (self.regionMeshCacheCount() >= REGION_MESH_BUDGET) return;
-        const placeholder: RegionMesh = .{ .vbuf = .{}, .draws = &[_]SectionDraw{}, .built_chunk_count = 0, .dirty = false, .inflight = true, .last_built_frame = self.frame_index };
-        _ = self.region_mesh_cache.put(rpos, placeholder) catch return;
-        self.mesher_mutex.lock();
-        self.mesher_jobs.append(self.allocator, .{ .rpos = rpos }) catch {};
-        self.mesher_cv.broadcast();
-        self.mesher_mutex.unlock();
-        self.rebuilds_issued_this_frame += 1;
-    }
-
-    fn renderWorldCached(self: *Client, vs_in: *const shd_mod.VsParams) void {
-        // Adopt up to N meshing results per frame on the render thread
-        self.adoptMesherResults();
-        const wk = "minecraft:overworld";
-        // Snapshot region positions and chunk counts under world lock
-        var regions = std.ArrayList(struct { rpos: simulation.RegionPos, chunk_count: usize }).initCapacity(self.allocator, 0) catch return;
-        defer regions.deinit(self.allocator);
-        self.sim.worlds_mutex.lock();
-        const ws = self.sim.worlds_state.getPtr(wk);
-        var world_sections_below: u16 = 0;
-        if (ws) |ws_ptr| {
-            world_sections_below = ws_ptr.sections_below;
-            var reg_it = ws_ptr.regions.iterator();
-            while (reg_it.next()) |rentry| {
-                const rpos = rentry.key_ptr.*;
-                const rs_ptr = rentry.value_ptr;
-                const count = rs_ptr.chunks.items.len;
-                regions.append(self.allocator, .{ .rpos = rpos, .chunk_count = count }) catch {};
-            }
-        }
-        self.sim.worlds_mutex.unlock();
-
-        var vs_loc: shd_mod.VsParams = .{ .mvp = vs_in.mvp, .region_info = .{ 0, 0, 1.0 / 512.0, 0 } };
-
-        // reset per-frame rebuild counter
-        self.rebuilds_issued_this_frame = 0;
-
-        // Iterate regions without holding world lock
-        var i: usize = 0;
-        while (i < regions.items.len) : (i += 1) {
-            const rp = regions.items[i].rpos;
-            const expected_chunks = regions.items[i].chunk_count;
-            // Ensure mesh scheduled or up-to-date
-            self.ensureRegionMesh(rp, expected_chunks);
-            const rmesh = self.region_mesh_cache.getPtr(rp) orelse continue;
-            if (rmesh.vbuf.id == 0 or rmesh.draws.len == 0) continue;
-
-            // Set region uniforms (origin in blocks and inv region dim)
-            const region_origin_x: f32 = @floatFromInt(rp.x * 32 * @as(i32, @intCast(constants.chunk_size_x)));
-            const region_origin_z: f32 = @floatFromInt(rp.z * 32 * @as(i32, @intCast(constants.chunk_size_z)));
-            vs_loc.region_info = .{ region_origin_x, region_origin_z, 1.0 / 512.0, 0 };
-
-            // Prepare base bindings; per-draw we will set views and apply
-            var b = self.bind;
-            b.vertex_buffers[0] = rmesh.vbuf;
-
-            // Draw visible sections in this region
-            var di: usize = 0;
-            while (di < rmesh.draws.len) : (di += 1) {
-                const d = rmesh.draws[di];
-                // Section-level culling
-                if (self.frustum_valid) {
-                    const base_x: f32 = @floatFromInt(d.chunk_pos.x * @as(i32, @intCast(constants.chunk_size_x)));
-                    const base_z: f32 = @floatFromInt(d.chunk_pos.z * @as(i32, @intCast(constants.chunk_size_z)));
-                    const y_off_sections: f32 = -@as(f32, @floatFromInt(@as(i32, @intCast(world_sections_below)) * @as(i32, @intCast(constants.section_height))));
-                    const minp_s: [3]f32 = .{ base_x, y_off_sections + @as(f32, @floatFromInt((@as(usize, d.sy) * constants.section_height))), base_z };
-                    const maxp_s: [3]f32 = .{ base_x + 16.0, y_off_sections + @as(f32, @floatFromInt(((@as(usize, d.sy) + 1) * constants.section_height))), base_z + 16.0 };
-                    const cam = self.camera.pos;
-                    const vis_sec = aabbContainsPoint(minp_s, maxp_s, cam) or aabbInFrustum(self.frustum_planes, minp_s, maxp_s, 0.5);
-                    if (!vis_sec) continue;
-                }
-                // ensure per-region tint view bound for this region
-                const tint_view = self.ensureRegionTintView(rp);
-                var bdraw = self.bind;
-                bdraw.vertex_buffers[0] = rmesh.vbuf;
-                if (self.atlas_count > 0) bdraw.views[1] = self.atlas_views[0];
-                if (self.atlas_count > 1) bdraw.views[5] = self.atlas_views[1];
-                if (self.atlas_count > 2) bdraw.views[6] = self.atlas_views[2];
-                if (self.atlas_count > 3) bdraw.views[7] = self.atlas_views[3];
-                if (tint_view.id != 0) bdraw.views[3] = tint_view;
-                sg.applyBindings(bdraw);
-                sg.applyUniforms(0, sg.asRange(&vs_loc));
-                sg.draw(d.first, d.count, 1);
-                _ = self.last_visible_frame_chunk.put(d.chunk_pos, self.frame_index) catch {};
-            }
-            _ = self.last_visible_frame_region.put(rp, self.frame_index) catch {};
-        }
-
-        // Evict old or excess region meshes to bound pool usage
-        self.evictRegionMeshes(REGION_MESH_BUDGET, 10);
+    pub fn ensureRegionMesh(self: *Client, rpos: simulation.RegionPos, expected_chunk_count: usize) void {
+        client_mesher_scheduler_mod.ensureRegionMesh(self, rpos, expected_chunk_count);
     }
 
     fn clearMovementInputs(self: *Client) void {
@@ -4168,100 +2132,13 @@ pub const Client = struct {
         self.jump_pending = false;
     }
 
-    // Basic 4x4 column-major matrix helpers
-    fn matMul(a: [16]f32, b: [16]f32) [16]f32 {
-        var r: [16]f32 = undefined;
-        var i: usize = 0;
-        while (i < 4) : (i += 1) {
-            var j: usize = 0;
-            while (j < 4) : (j += 1) {
-                // column-major: r[col*4+row]
-                r[i * 4 + j] =
-                    a[0 * 4 + j] * b[i * 4 + 0] +
-                    a[1 * 4 + j] * b[i * 4 + 1] +
-                    a[2 * 4 + j] * b[i * 4 + 2] +
-                    a[3 * 4 + j] * b[i * 4 + 3];
-            }
-        }
-        return r;
-    }
-
-    fn transpose4(m: [16]f32) [16]f32 {
-        var r: [16]f32 = undefined;
-        var c: usize = 0;
-        while (c < 4) : (c += 1) {
-            var rrow: usize = 0;
-            while (rrow < 4) : (rrow += 1) {
-                r[c * 4 + rrow] = m[rrow * 4 + c];
-            }
-        }
-        return r;
-    }
-
-    // Extract 6 view-frustum planes from a column-major MVP matrix.
-    // Plane order: left, right, bottom, top, near, far. Each plane is (a,b,c,d) with outward normal.
-    fn extractFrustumPlanes(m: [16]f32) [6][4]f32 {
-        // rows in column-major storage
-        const r0 = [4]f32{ m[0], m[4], m[8], m[12] };
-        const r1 = [4]f32{ m[1], m[5], m[9], m[13] };
-        const r2 = [4]f32{ m[2], m[6], m[10], m[14] };
-        const r3 = [4]f32{ m[3], m[7], m[11], m[15] };
-        var planes: [6][4]f32 = undefined;
-        // left = r3 + r0
-        planes[0] = .{ r3[0] + r0[0], r3[1] + r0[1], r3[2] + r0[2], r3[3] + r0[3] };
-        // right = r3 - r0
-        planes[1] = .{ r3[0] - r0[0], r3[1] - r0[1], r3[2] - r0[2], r3[3] - r0[3] };
-        // bottom = r3 + r1
-        planes[2] = .{ r3[0] + r1[0], r3[1] + r1[1], r3[2] + r1[2], r3[3] + r1[3] };
-        // top = r3 - r1
-        planes[3] = .{ r3[0] - r1[0], r3[1] - r1[1], r3[2] - r1[2], r3[3] - r1[3] };
-        // near = r3 + r2
-        planes[4] = .{ r3[0] + r2[0], r3[1] + r2[1], r3[2] + r2[2], r3[3] + r2[3] };
-        // far = r3 - r2
-        planes[5] = .{ r3[0] - r2[0], r3[1] - r2[1], r3[2] - r2[2], r3[3] - r2[3] };
-        // normalize planes
-        var pi: usize = 0;
-        while (pi < 6) : (pi += 1) {
-            const a = planes[pi][0];
-            const b = planes[pi][1];
-            const c = planes[pi][2];
-            const inv_len = 1.0 / @max(0.000001, @sqrt(a * a + b * b + c * c));
-            planes[pi][0] = a * inv_len;
-            planes[pi][1] = b * inv_len;
-            planes[pi][2] = c * inv_len;
-            planes[pi][3] = planes[pi][3] * inv_len;
-        }
-        return planes;
-    }
-
-    fn aabbInFrustum(planes: [6][4]f32, min: [3]f32, max: [3]f32, margin: f32) bool {
-        var p: [3]f32 = undefined;
-        var i: usize = 0;
-        while (i < 6) : (i += 1) {
-            const a = planes[i][0];
-            const b = planes[i][1];
-            const c = planes[i][2];
-            const d = planes[i][3];
-            p[0] = if (a >= 0) max[0] else min[0];
-            p[1] = if (b >= 0) max[1] else min[1];
-            p[2] = if (c >= 0) max[2] else min[2];
-            const dist = a * p[0] + b * p[1] + c * p[2] + d;
-            if (dist < -margin) return false;
-        }
-        return true;
-    }
-
     fn updateFrustum(self: *Client, mvp: [16]f32) void {
         if (self.frustum_valid) {
             self.prev_frustum_planes = self.frustum_planes;
             self.prev_frustum_valid = true;
         }
-        self.frustum_planes = extractFrustumPlanes(mvp);
+        self.frustum_planes = client_camera_mod.extractFrustumPlanes(mvp);
         self.frustum_valid = true;
-    }
-
-    fn aabbContainsPoint(min: [3]f32, max: [3]f32, p: [3]f32) bool {
-        return p[0] >= min[0] and p[0] <= max[0] and p[1] >= min[1] and p[1] <= max[1] and p[2] >= min[2] and p[2] <= max[2];
     }
 
     // Local physics step using shared routine
@@ -4373,298 +2250,8 @@ pub const Client = struct {
         self.jump_pending = false;
     }
 
-    fn makePerspective(fovy_radians: f32, aspect: f32, znear: f32, zfar: f32) [16]f32 {
-        const f: f32 = 1.0 / @tan(fovy_radians / 2.0);
-        var m: [16]f32 = [_]f32{0} ** 16;
-        m[0] = f / aspect;
-        m[5] = f;
-        m[10] = (zfar + znear) / (znear - zfar);
-        m[11] = -1.0;
-        m[14] = (2.0 * zfar * znear) / (znear - zfar);
-        return m;
-    }
-
-    fn ensureRegionTintView(self: *Client, rpos: simulation.RegionPos) sg.View {
-        // Return cached view if available
-        if (self.region_tint_cache.getPtr(rpos)) |entry| {
-            entry.last_used = self.frame_index;
-            if (entry.dirty) {
-                // rebuild pixels and recreate image (simpler than crafting updateImage subimages)
-                var pixels: [512 * 512 * 4]u8 = [_]u8{0} ** (512 * 512 * 4);
-                self.fillRegionTintPixels(rpos, &pixels);
-                if (entry.view.id != 0) sg.destroyView(entry.view);
-                if (entry.img.id != 0) sg.destroyImage(entry.img);
-                const new_img = sg.makeImage(.{
-                    .width = 512,
-                    .height = 512,
-                    .pixel_format = .RGBA8,
-                    .data = .{ .subimage = .{
-                        .{ sg.asRange(pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                        .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                        .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                        .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                        .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                        .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                    } },
-                });
-                const new_view = if (new_img.id != 0) sg.makeView(.{ .texture = .{ .image = new_img } }) else self.white_view;
-                entry.img = new_img;
-                entry.view = new_view;
-                entry.dirty = false;
-            }
-            return entry.view;
-        }
-        // Build 512x512 RGBA8 tint from biomes at Y=0 across the region
-        var pixels: [512 * 512 * 4]u8 = [_]u8{0} ** (512 * 512 * 4);
-        self.fillRegionTintPixels(rpos, &pixels);
-        // Upload image and create view
-        const img = sg.makeImage(.{
-            .width = 512,
-            .height = 512,
-            .pixel_format = .RGBA8,
-            .data = .{ .subimage = .{
-                .{ sg.asRange(pixels[0..]), .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-                .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
-            } },
-        });
-        const view = if (img.id != 0) sg.makeView(.{ .texture = .{ .image = img } }) else self.white_view;
-        _ = self.region_tint_cache.put(rpos, .{ .img = img, .view = view, .last_used = self.frame_index, .dirty = false }) catch {};
-        return if (view.id != 0) view else self.white_view;
-    }
-
-    fn fillRegionTintPixels(self: *Client, rpos: simulation.RegionPos, pixels: *[512 * 512 * 4]u8) void {
-        // Fill the 512x512 RGBA8 pixels for the given region from biome tints at Y=0
-        const wk = "minecraft:overworld";
-        // Default to white
-        var i: usize = 0;
-        while (i < pixels.len) : (i += 4) {
-            pixels.*[i + 0] = 255;
-            pixels.*[i + 1] = 255;
-            pixels.*[i + 2] = 255;
-            pixels.*[i + 3] = 255;
-        }
-        self.sim.worlds_mutex.lock();
-        const ws = self.sim.worlds_state.getPtr(wk);
-        if (ws) |wsp| {
-            const base_cx: i32 = rpos.x * 32;
-            const base_cz: i32 = rpos.z * 32;
-            var cz_off: i32 = 0;
-            while (cz_off < 32) : (cz_off += 1) {
-                var cx_off: i32 = 0;
-                while (cx_off < 32) : (cx_off += 1) {
-                    const cpos = gs.ChunkPos{ .x = base_cx + cx_off, .z = base_cz + cz_off };
-                    const rp = simulation.RegionPos{ .x = @divFloor(cpos.x, 32), .z = @divFloor(cpos.z, 32) };
-                    if (wsp.regions.getPtr(rp)) |rs| {
-                        if (rs.chunk_index.get(cpos)) |cidx| {
-                            const ch = rs.chunks.items[cidx];
-                            const sb: i32 = @as(i32, @intCast(wsp.sections_below));
-                            const sy0: usize = if (sb > 0) @intCast(sb - 1) else 0;
-                            if (sy0 < ch.sections.len) {
-                                const s = ch.sections[sy0];
-                                const bpi_biome: u6 = bitsFor(s.biome_palette.len);
-                                var lz: usize = 0;
-                                while (lz < 16) : (lz += 1) {
-                                    var lx: usize = 0;
-                                    while (lx < 16) : (lx += 1) {
-                                        const idx3d: usize = lz * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + 0;
-                                        var tint_rgb: [3]f32 = .{ 1, 1, 1 };
-                                        if (s.biome_palette.len > 0 and s.biome_indices_bits.len > 0) {
-                                            const pidx_u32: u32 = unpackBitsGet(s.biome_indices_bits, idx3d, bpi_biome);
-                                            const pidx: usize = @intCast(pidx_u32);
-                                            if (pidx < s.biome_palette.len) {
-                                                const biome_id = s.biome_palette[pidx];
-                                                if (self.sim.reg.getBiomeTint(biome_id, "grass")) |c|
-                                                    tint_rgb = c;
-                                            }
-                                        }
-                                        const px: usize = (@as(usize, @intCast(cx_off)) * 16) + lx;
-                                        const pz: usize = (@as(usize, @intCast(cz_off)) * 16) + lz;
-                                        const off: usize = (pz * 512 + px) * 4;
-                                        const r = std.math.clamp(tint_rgb[0], 0.0, 1.0);
-                                        const g = std.math.clamp(tint_rgb[1], 0.0, 1.0);
-                                        const b = std.math.clamp(tint_rgb[2], 0.0, 1.0);
-                                        pixels.*[off + 0] = @intFromFloat(r * 255.0);
-                                        pixels.*[off + 1] = @intFromFloat(g * 255.0);
-                                        pixels.*[off + 2] = @intFromFloat(b * 255.0);
-                                        pixels.*[off + 3] = 255;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        self.sim.worlds_mutex.unlock();
-    }
-
-    fn drawPlayerAabb(self: *Client, vs_in: *const shd_mod.VsParams) void {
-        // Construct a solid box from the client's local predicted AABB
-        const hx = self.local_aabb_half_extents[0];
-        const hy = self.local_aabb_half_extents[1];
-        const hz = self.local_aabb_half_extents[2];
-        const x0: f32 = self.local_pos[0] - hx;
-        const x1: f32 = self.local_pos[0] + hx;
-        // Physics pos[1] is center Y; debug box should span [center - hy, center + hy]
-        const y0: f32 = self.local_pos[1] - hy;
-        const y1: f32 = self.local_pos[1] + hy;
-        const z0: f32 = self.local_pos[2] - hz;
-        const z1: f32 = self.local_pos[2] + hz;
-        var verts: [36]Vertex = undefined;
-        var i: usize = 0;
-        const uv00 = [2]f32{ 0, 0 };
-        const uv01 = [2]f32{ 0, 1 };
-        const uv11 = [2]f32{ 1, 1 };
-        const uv10 = [2]f32{ 1, 0 };
-        const addTri = struct {
-            fn call(list: *[36]Vertex, idx: *usize, p0: [3]f32, p1: [3]f32, p2: [3]f32, t0: [2]f32, t1: [2]f32, t2: [2]f32) void {
-                list.*[idx.*] = .{ .pos = p0, .uv = t0, .rect_min = .{ 0, 0 }, .rect_size = .{ 1, 1 }, .layer = 0, .apply_tint = 0 };
-                idx.* += 1;
-                list.*[idx.*] = .{ .pos = p1, .uv = t1, .rect_min = .{ 0, 0 }, .rect_size = .{ 1, 1 }, .layer = 0, .apply_tint = 0 };
-                idx.* += 1;
-                list.*[idx.*] = .{ .pos = p2, .uv = t2, .rect_min = .{ 0, 0 }, .rect_size = .{ 1, 1 }, .layer = 0, .apply_tint = 0 };
-                idx.* += 1;
-            }
-        }.call;
-        // +X
-        addTri(&verts, &i, .{ x1, y0, z0 }, .{ x1, y1, z0 }, .{ x1, y1, z1 }, uv00, uv01, uv11);
-        addTri(&verts, &i, .{ x1, y0, z0 }, .{ x1, y1, z1 }, .{ x1, y0, z1 }, uv00, uv11, uv10);
-        // -X
-        addTri(&verts, &i, .{ x0, y0, z1 }, .{ x0, y1, z1 }, .{ x0, y1, z0 }, uv00, uv01, uv11);
-        addTri(&verts, &i, .{ x0, y0, z1 }, .{ x0, y1, z0 }, .{ x0, y0, z0 }, uv00, uv11, uv10);
-        // +Y (top)
-        addTri(&verts, &i, .{ x0, y1, z0 }, .{ x0, y1, z1 }, .{ x1, y1, z1 }, uv00, uv01, uv11);
-        addTri(&verts, &i, .{ x0, y1, z0 }, .{ x1, y1, z1 }, .{ x1, y1, z0 }, uv00, uv11, uv10);
-        // -Y (bottom)
-        addTri(&verts, &i, .{ x0, y0, z1 }, .{ x0, y0, z0 }, .{ x1, y0, z0 }, uv00, uv01, uv11);
-        addTri(&verts, &i, .{ x0, y0, z1 }, .{ x1, y0, z0 }, .{ x1, y0, z1 }, uv00, uv11, uv10);
-        // +Z
-        addTri(&verts, &i, .{ x1, y0, z1 }, .{ x1, y1, z1 }, .{ x0, y1, z1 }, uv00, uv01, uv11);
-        addTri(&verts, &i, .{ x1, y0, z1 }, .{ x0, y1, z1 }, .{ x0, y0, z1 }, uv00, uv11, uv10);
-        // -Z
-        addTri(&verts, &i, .{ x0, y0, z0 }, .{ x0, y1, z0 }, .{ x1, y1, z0 }, uv00, uv01, uv11);
-        addTri(&verts, &i, .{ x0, y0, z0 }, .{ x1, y1, z0 }, .{ x1, y0, z0 }, uv00, uv11, uv10);
-        if (i != verts.len) return; // safety
-        // Use the 3D pipeline (depth test on). Override binding to use green texture and UI buffer.
-        sg.applyPipeline(self.pip);
-        var vs_params: shd_mod.VsParams = .{ .mvp = vs_in.mvp, .region_info = .{ 0, 0, 1.0 / 512.0, 0 } };
-        sg.applyUniforms(0, sg.asRange(&vs_params));
-        var b = self.bind;
-        b.vertex_buffers[0] = self.aabb_vbuf;
-        if (self.green_view.id != 0) b.views[1] = self.green_view;
-        sg.applyBindings(b);
-        const needed_bytes: usize = verts.len * @sizeOf(Vertex);
-        if (self.aabb_vbuf_capacity_bytes < needed_bytes) {
-            if (self.aabb_vbuf.id != 0) sg.destroyBuffer(self.aabb_vbuf);
-            self.aabb_vbuf = sg.makeBuffer(.{ .usage = .{ .vertex_buffer = true, .stream_update = true }, .size = @intCast(needed_bytes) });
-            self.aabb_vbuf_capacity_bytes = needed_bytes;
-        }
-        sg.updateBuffer(self.aabb_vbuf, sg.asRange(&verts));
-        sg.draw(0, @intCast(verts.len), 1);
-    }
-
-    fn makeViewConv(eye: [3]f32, forward: [3]f32, up_in: [3]f32, conventional: bool) [16]f32 {
-        // normalize forward
-        const f0 = forward[0];
-        const f1 = forward[1];
-        const f2 = forward[2];
-        const flen: f32 = @sqrt(f0 * f0 + f1 * f1 + f2 * f2);
-        const fx = if (flen > 0.000001) (f0 / flen) else 1.0;
-        const fy = if (flen > 0.000001) (f1 / flen) else 0.0;
-        const fz = if (flen > 0.000001) (f2 / flen) else 0.0;
-        // s = normalize(cross(f, up)) (conventional) or cross(up, f)
-        var sx0: f32 = undefined;
-        var sy0: f32 = undefined;
-        var sz0: f32 = undefined;
-        if (conventional) {
-            // cross(f, up)
-            sx0 = fy * up_in[2] - fz * up_in[1];
-            sy0 = fz * up_in[0] - fx * up_in[2];
-            sz0 = fx * up_in[1] - fy * up_in[0];
-        } else {
-            // cross(up, f)
-            sx0 = up_in[1] * fz - up_in[2] * fy;
-            sy0 = up_in[2] * fx - up_in[0] * fz;
-            sz0 = up_in[0] * fy - up_in[1] * fx;
-        }
-        const slen: f32 = @sqrt(sx0 * sx0 + sy0 * sy0 + sz0 * sz0);
-        const sx = sx0 / slen;
-        const sy = sy0 / slen;
-        const sz = sz0 / slen;
-        // u = cross(s, f)
-        const ux = sy * fz - sz * fy;
-        const uy = sz * fx - sx * fz;
-        const uz = sx * fy - sy * fx;
-        return makeViewFromBasis(eye, .{ sx, sy, sz }, .{ ux, uy, uz }, .{ fx, fy, fz });
-    }
-
-    fn makeViewFromBasis(eye: [3]f32, s: [3]f32, u: [3]f32, f: [3]f32) [16]f32 {
-        var m: [16]f32 = undefined;
-        m[0] = s[0];
-        m[4] = u[0];
-        // Use OpenGL-style view with -f in the third column (camera looks down -Z in view space)
-        m[8] = -f[0];
-        m[12] = 0;
-        m[1] = s[1];
-        m[5] = u[1];
-        m[9] = -f[1];
-        m[13] = 0;
-        m[2] = s[2];
-        m[6] = u[2];
-        m[10] = -f[2];
-        m[14] = 0;
-        m[3] = 0;
-        m[7] = 0;
-        m[11] = 0;
-        m[15] = 1;
-        var t: [16]f32 = [_]f32{0} ** 16;
-        t[0] = 1;
-        t[5] = 1;
-        t[10] = 1;
-        t[15] = 1;
-        t[12] = -eye[0];
-        t[13] = -eye[1];
-        t[14] = -eye[2];
-        return matMul(m, t);
-    }
-
-    fn transposeView3x3WithEye(self: *Client, v: [16]f32) [16]f32 {
-        var m = v;
-        // transpose rotation 3x3 in upper-left
-        const m00 = m[0];
-        const m01 = m[4];
-        const m02 = m[8];
-        const m10 = m[1];
-        const m11 = m[5];
-        const m12 = m[9];
-        const m20 = m[2];
-        const m21 = m[6];
-        const m22 = m[10];
-        m[0] = m00;
-        m[4] = m10;
-        m[8] = m20;
-        m[1] = m01;
-        m[5] = m11;
-        m[9] = m21;
-        m[2] = m02;
-        m[6] = m12;
-        m[10] = m22;
-        // recompute translation column using new rotation and current camera eye
-        const eye = self.camera.pos;
-        const neg_eye0 = -eye[0];
-        const neg_eye1 = -eye[1];
-        const neg_eye2 = -eye[2];
-        m[12] = m[0] * neg_eye0 + m[4] * neg_eye1 + m[8] * neg_eye2;
-        m[13] = m[1] * neg_eye0 + m[5] * neg_eye1 + m[9] * neg_eye2;
-        m[14] = m[2] * neg_eye0 + m[6] * neg_eye1 + m[10] * neg_eye2;
-        return m;
-    }
-
     fn makeViewNoRoll(self: *Client, eye: [3]f32, yaw: f32, pitch: f32) [16]f32 {
+        // This function remains here to capture debug basis into Client fields.
         const cy = @cos(yaw);
         const sy = @sin(yaw);
         const cp = @cos(pitch);
@@ -4692,75 +2279,13 @@ pub const Client = struct {
         self.dbg_f = f;
         self.dbg_s = s;
         self.dbg_u = u;
-        return makeViewFromBasis(eye, s, u, f);
+        return client_camera_mod.makeViewFromBasis(eye, s, u, f);
     }
 
-    fn regionMeshCacheCount(self: *Client) usize {
+    pub fn regionMeshCacheCount(self: *Client) usize {
         var cnt: usize = 0;
         var it = self.region_mesh_cache.keyIterator();
         while (it.next()) |_| cnt += 1;
         return cnt;
-    }
-
-    fn evictRegionMeshes(self: *Client, max_count: usize, ttl_frames: u32) void {
-        // Collect stale regions (older than ttl_frames)
-        var to_remove = std.ArrayList(simulation.RegionPos).initCapacity(self.allocator, 0) catch {
-            return;
-        };
-        defer to_remove.deinit(self.allocator);
-        var it = self.region_mesh_cache.iterator();
-        while (it.next()) |entry| {
-            const pos = entry.key_ptr.*;
-            const last_opt = self.last_visible_frame_region.get(pos);
-            const last_seen: u32 = last_opt orelse 0;
-            const age = self.frame_index - last_seen;
-            if (age > ttl_frames) {
-                to_remove.append(self.allocator, pos) catch {};
-            }
-        }
-        // Remove stale
-        var i: usize = 0;
-        while (i < to_remove.items.len) : (i += 1) {
-            const pos = to_remove.items[i];
-            if (self.region_mesh_cache.get(pos)) |rm| {
-                if (rm.vbuf.id != 0) sg.destroyBuffer(rm.vbuf);
-                self.allocator.free(rm.draws);
-            }
-            _ = self.region_mesh_cache.remove(pos);
-        }
-
-        // If still over budget, remove oldest until under limit
-        var count = self.regionMeshCacheCount();
-        if (count <= max_count) return;
-
-        var candidates = std.ArrayList(struct { pos: simulation.RegionPos, last: u32 }).initCapacity(self.allocator, 0) catch {
-            return;
-        };
-        defer candidates.deinit(self.allocator);
-        var it2 = self.region_mesh_cache.iterator();
-        while (it2.next()) |entry| {
-            const pos = entry.key_ptr.*;
-            const last = self.last_visible_frame_region.get(pos) orelse 0;
-            candidates.append(self.allocator, .{ .pos = pos, .last = last }) catch {};
-        }
-        while (count > max_count and candidates.items.len > 0) {
-            var min_idx: usize = 0;
-            var min_last: u32 = candidates.items[0].last;
-            var j: usize = 1;
-            while (j < candidates.items.len) : (j += 1) {
-                if (candidates.items[j].last < min_last) {
-                    min_last = candidates.items[j].last;
-                    min_idx = j;
-                }
-            }
-            const pos = candidates.items[min_idx].pos;
-            if (self.region_mesh_cache.get(pos)) |rm| {
-                if (rm.vbuf.id != 0) sg.destroyBuffer(rm.vbuf);
-                self.allocator.free(rm.draws);
-            }
-            _ = self.region_mesh_cache.remove(pos);
-            _ = candidates.swapRemove(min_idx);
-            count -= 1;
-        }
     }
 };
