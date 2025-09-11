@@ -267,7 +267,7 @@ pub const Simulation = struct {
         }
     }
 
-    fn blockLookupCall(ctx: ?*anyopaque, name: []const u8) ?ids.BlockStateId {
+    fn blockLookupCall(ctx: ?*anyopaque, name: []const u8) ?ids.BlockId {
         if (ctx) |p| {
             const regp: *registry.Registry = @ptrCast(@alignCast(p));
             for (regp.blocks.items, 0..) |b, i| {
@@ -515,11 +515,12 @@ pub const Simulation = struct {
                 const idx3d: usize = lz * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
                 const pidx: usize = @intCast(unpackBitsGetLocal(s.blocks_indices_bits, idx3d, bpi));
                 if (pidx >= s.palette.len) return false;
-                const bid: u32 = s.palette[pidx];
+                const st = s.palette[pidx];
+                const bid: u32 = st.block_id;
                 if (bid == 0) return false;
                 // respect collision flag from registry if known
                 if (bid < sim.reg.blocks.items.len) {
-                    return sim.reg.blocks.items[@intCast(bid)].full_block_collision;
+                    return sim.reg.blocks.items[@intCast(bid)].collision;
                 }
                 // unknown: treat as solid conservatively
                 return true;

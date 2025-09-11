@@ -3,13 +3,13 @@ const ids = @import("ids");
 const constants = @import("constants");
 
 pub const Params = struct {
-    blocks: []const ids.BlockStateId = &[_]ids.BlockStateId{},
+    blocks: []const ids.BlockId = &[_]ids.BlockId{},
     biomes: []const ids.BiomeId = &[_]ids.BiomeId{},
 };
 
 pub const BlockLookup = struct {
     ctx: ?*anyopaque,
-    call: *const fn (ctx: ?*anyopaque, name: []const u8) ?ids.BlockStateId,
+    call: *const fn (ctx: ?*anyopaque, name: []const u8) ?ids.BlockId,
 };
 
 // Shared proto-chunk used during staged worldgen.
@@ -20,7 +20,7 @@ pub const ProtoChunk = struct {
     pos: struct { x: i32, z: i32 },
     status: u4 = 0, // gs.ChunkStatus-like; 0==empty
     biomes_buf: ?[]ids.BiomeId = null,
-    blocks_buf: ?[]ids.BlockStateId = null,
+    blocks_buf: ?[]ids.BlockId = null,
     tops: []i32, // per-column height tracking
 
     pub fn totalSections(self: *const ProtoChunk) u16 {
@@ -43,7 +43,7 @@ pub fn ensureBiomesAllocated(proto: *ProtoChunk) !void {
 pub fn ensureBlocksAllocated(proto: *ProtoChunk) !void {
     if (proto.blocks_buf == null) {
         const count = totalVoxels(proto.sections_below, proto.sections_above);
-        proto.blocks_buf = try proto.allocator.alloc(ids.BlockStateId, count);
+        proto.blocks_buf = try proto.allocator.alloc(ids.BlockId, count);
     }
 }
 

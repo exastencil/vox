@@ -77,8 +77,15 @@ vec3 sample_atlas(float idx, vec2 uv) {
 }
 
 void main() {
-    // Convert tile-space to atlas-space: rect_min + fract(tile_uv) * rect_size
-    vec2 uv_atlas = v_rect_min + fract(v_uv_tile) * v_rect_size;
+    // Convert tile-space to atlas-space, but bias away from tile boundaries to avoid sampling
+    // the padded atlas border twice at shared edges (prevents visible "double lines").
+    // We clamp the tile-space UV to [eps, 1-eps] where eps ~= half a texel for 32px tiles.
+    // This is a small, data-independent bias that works well for 16–32px textures typical
+    // of our resources and keeps seams clean even after face flips/rotations.
+    const float EPS_T = 1.0 / 32.0; // ~0.5 texel for 32px tiles, 0.25 texel for 16px tiles
+    vec2 uv_tile = fract(v_uv_tile);
+    uv_tile = clamp(uv_tile, vec2(EPS_T), vec2(1.0 - EPS_T));
+    vec2 uv_atlas = v_rect_min + uv_tile * v_rect_size;
     vec3 c = sample_atlas(floor(v_layer + 0.5), uv_atlas);
     if (v_apply_tint > 0.5) {
         vec3 tint = texture(sampler2D(chunk_tint_tex, chunk_tint_smp), v_chunk_uv).rgb;

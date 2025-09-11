@@ -3,7 +3,7 @@ const ids = @import("ids");
 
 pub const GenSpec = struct {
     key: []const u8,
-    blocks: []const ids.BlockStateId = &[_]ids.BlockStateId{},
+    blocks: []const ids.BlockId = &[_]ids.BlockId{},
     biomes: []const ids.BiomeId = &[_]ids.BiomeId{},
 };
 
@@ -14,7 +14,7 @@ pub const Def = struct {
     sections_below: u16, // sections with y<0
     sections_above: u16, // sections with y>=0
     gen_key: []const u8,
-    gen_blocks: []const ids.BlockStateId,
+    gen_blocks: []const ids.BlockId,
     gen_biomes: []const ids.BiomeId,
 };
 
@@ -49,7 +49,7 @@ pub const Registry = struct {
         const k = try self.allocator.dupe(u8, key);
         const dn = try self.allocator.dupe(u8, display_name);
         const gk = try self.allocator.dupe(u8, gen.key);
-        const blocks = try self.allocator.alloc(ids.BlockStateId, gen.blocks.len);
+        const blocks = try self.allocator.alloc(ids.BlockId, gen.blocks.len);
         @memcpy(blocks, gen.blocks);
         const biomes = try self.allocator.alloc(ids.BiomeId, gen.biomes.len);
         @memcpy(biomes, gen.biomes);

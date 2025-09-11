@@ -62,6 +62,13 @@ pub const EntityRecord = struct {
     // attributes or component data can be referenced/serialized separately
 };
 
+// Runtime block state in the section palette
+pub const BlockState = struct {
+    block_id: ids.BlockId,
+    direction: ids.Direction = .up,
+    tags: u32 = 0,
+};
+
 pub const Section = struct {
     // Constants for convenience
     pub const width = constants.chunk_size_x;
@@ -70,7 +77,7 @@ pub const Section = struct {
     pub const voxel_count = width * height * depth;
 
     // Blocks: palette + bit-packed indices
-    palette: []const ids.BlockStateId,
+    palette: []const BlockState,
     blocks_indices_bits: []const u32, // bitpacked indices into the palette
 
     // Lighting: nibble-packed arrays (two voxels per byte), length = voxel_count/2

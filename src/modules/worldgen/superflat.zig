@@ -20,7 +20,7 @@ fn hook_noise(seed: u64, proto: *wapi.ProtoChunk, params: WorldGen.Params, looku
     if (proto.sections_below < 1) return error.RequiresAtLeastOneSectionBelow;
 
     try wapi.ensureBlocksAllocated(proto);
-    const air: ids.BlockStateId = lookup.call(lookup.ctx, "core:air") orelse 0;
+    const air: ids.BlockId = lookup.call(lookup.ctx, "core:air") orelse 0;
 
     const nb: usize = params.blocks.len;
     const last_idx: usize = if (nb > 0) nb - 1 else 0;
@@ -36,7 +36,7 @@ fn hook_noise(seed: u64, proto: *wapi.ProtoChunk, params: WorldGen.Params, looku
             for (0..constants.chunk_size_x) |lx| {
                 for (0..constants.section_height) |ly| {
                     const wy: i32 = y_base + @as(i32, @intCast(ly));
-                    var bid: ids.BlockStateId = air;
+                    var bid: ids.BlockId = air;
                     if (wy < 0 and nb > 0) {
                         // Distance below 0 in layers, 1..bottom_depth
                         const d: usize = @intCast(-wy);

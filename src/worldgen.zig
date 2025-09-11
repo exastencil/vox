@@ -52,7 +52,7 @@ pub fn advanceOnePhase(
     def: wgen.Def,
     params: wgen.Params,
     lookup: wgen.BlockLookup,
-    air_id: ids.BlockStateId,
+    air_id: ids.BlockId,
 ) !?gs.Chunk {
     _ = air_id; // not used by hook APIs directly; blocks should be set explicitly by noise/surface hooks
     switch (@as(gs.ChunkStatus, @enumFromInt(proto.status))) {
@@ -121,12 +121,12 @@ fn buildChunkFromBuffers(proto: *const wapi.ProtoChunk) !gs.Chunk {
     var sy: usize = 0;
     while (sy < sections_len) : (sy += 1) {
         // Build palettes for this section
-        var block_map = std.AutoHashMap(ids.BlockStateId, u32).init(allocator);
+        var block_map = std.AutoHashMap(ids.BlockId, u32).init(allocator);
         defer block_map.deinit();
         var biome_map = std.AutoHashMap(ids.BiomeId, u32).init(allocator);
         defer biome_map.deinit();
 
-        var block_palette_list = try std.ArrayList(ids.BlockStateId).initCapacity(allocator, 0);
+        var block_palette_list = try std.ArrayList(ids.BlockId).initCapacity(allocator, 0);
         defer block_palette_list.deinit(allocator);
         var biome_palette_list = try std.ArrayList(ids.BiomeId).initCapacity(allocator, 0);
         defer biome_palette_list.deinit(allocator);
@@ -159,7 +159,11 @@ fn buildChunkFromBuffers(proto: *const wapi.ProtoChunk) !gs.Chunk {
         const words_per_section: usize = ceilDiv(voxel_count * bpi, 32);
         const light_bytes_per_section: usize = voxel_count / 2;
 
-        const palette = try allocator.dupe(ids.BlockStateId, block_palette_list.items);
+        var palette = try allocator.alloc(gs.BlockState, block_palette_list.items.len);
+        var k: usize = 0;
+        while (k < block_palette_list.items.len) : (k += 1) {
+            palette[k] = .{ .block_id = block_palette_list.items[k], .direction = .up, .tags = 0 };
+        }
         const indices_bits = try allocator.alloc(u32, words_per_section);
         @memset(indices_bits, 0);
         const skylight = try allocator.alloc(u8, light_bytes_per_section);
@@ -202,7 +206,7 @@ fn buildChunkFromBuffers(proto: *const wapi.ProtoChunk) !gs.Chunk {
     var new_len: usize = sections.len;
     while (new_len > 0) {
         const last = sections[new_len - 1];
-        if (last.palette.len == 1 and last.palette[0] == 0 and last.block_entities.len == 0) {
+        if (last.palette.len == 1 and last.palette[0].block_id == 0 and last.block_entities.len == 0) {
             // free this section's memory and shrink
             allocator.free(last.palette);
             allocator.free(last.blocks_indices_bits);
@@ -337,7 +341,7 @@ test "worldgen: void generator produces all-air sections and -1 heightmap" {
     }.call;
 
     const selBlock = struct {
-        fn call(seed: u64, biome: ids.BiomeId, pos: gs.BlockPos, params: wgen.Params, lookup: wgen.BlockLookup) ids.BlockStateId {
+        fn call(seed: u64, biome: ids.BiomeId, pos: gs.BlockPos, params: wgen.Params, lookup: wgen.BlockLookup) ids.BlockId {
             _ = seed;
             _ = biome;
             _ = pos;
@@ -347,9 +351,9 @@ test "worldgen: void generator produces all-air sections and -1 heightmap" {
         }
     }.call;
 
-    const air_id: ids.BlockStateId = 0;
+    const air_id: ids.BlockId = 0;
     const biome_id: ids.BiomeId = 7;
-    const params: wgen.Params = .{ .blocks = &[_]ids.BlockStateId{}, .biomes = &[_]ids.BiomeId{biome_id} };
+    const params: wgen.Params = .{ .blocks = &[_]ids.BlockId{}, .biomes = &[_]ids.BiomeId{biome_id} };
     const dummy_lookup: wgen.BlockLookup = .{ .ctx = null, .call = undefined };
 
     var chunk = try generateChunk(allocator, 2, .{ .x = 0, .z = 0 }, 42, selBiome, selBlock, params, dummy_lookup, air_id);
@@ -358,7 +362,7 @@ test "worldgen: void generator produces all-air sections and -1 heightmap" {
     // All sections should have only air in the palette
     for (chunk.sections) |s| {
         try testing.expectEqual(@as(usize, 1), s.palette.len);
-        try testing.expectEqual(air_id, s.palette[0]);
+        try testing.expectEqual(air_id, s.palette[0].block_id);
         try testing.expectEqual(@as(usize, 1), s.biome_palette.len);
         try testing.expectEqual(biome_id, s.biome_palette[0]);
     }
@@ -385,7 +389,7 @@ test "worldgen: flat surface at y<=2 yields top height 2 and two-block palette" 
     }.call;
 
     const selBlock = struct {
-        fn call(seed: u64, biome: ids.BiomeId, pos: gs.BlockPos, params: wgen.Params, lookup: wgen.BlockLookup) ids.BlockStateId {
+        fn call(seed: u64, biome: ids.BiomeId, pos: gs.BlockPos, params: wgen.Params, lookup: wgen.BlockLookup) ids.BlockId {
             _ = seed;
             _ = biome;
             _ = lookup;
@@ -396,10 +400,10 @@ test "worldgen: flat surface at y<=2 yields top height 2 and two-block palette" 
         }
     }.call;
 
-    const air_id: ids.BlockStateId = 0;
-    const surface_id: ids.BlockStateId = 2;
+    const air_id: ids.BlockId = 0;
+    const surface_id: ids.BlockId = 2;
     const biome_id: ids.BiomeId = 3;
-    const params: wgen.Params = .{ .blocks = &[_]ids.BlockStateId{surface_id}, .biomes = &[_]ids.BiomeId{biome_id} };
+    const params: wgen.Params = .{ .blocks = &[_]ids.BlockId{surface_id}, .biomes = &[_]ids.BiomeId{biome_id} };
     const dummy_lookup: wgen.BlockLookup = .{ .ctx = null, .call = undefined };
 
     var chunk = try generateChunk(allocator, 1, .{ .x = 0, .z = 0 }, 99, selBiome, selBlock, params, dummy_lookup, air_id);
@@ -410,9 +414,9 @@ test "worldgen: flat surface at y<=2 yields top height 2 and two-block palette" 
         try testing.expectEqual(@as(usize, 2), s.palette.len);
         var saw_air = false;
         var saw_surface = false;
-        for (s.palette) |bid| {
-            if (bid == air_id) saw_air = true;
-            if (bid == surface_id) saw_surface = true;
+        for (s.palette) |st| {
+            if (st.block_id == air_id) saw_air = true;
+            if (st.block_id == surface_id) saw_surface = true;
         }
         try testing.expect(saw_air);
         try testing.expect(saw_surface);
@@ -435,9 +439,9 @@ test "worldgen: alternating biomes across columns produce two-biome palette and 
 
     const biome_a: ids.BiomeId = 5;
     const biome_b: ids.BiomeId = 6;
-    const surface_a: ids.BlockStateId = 10;
-    const surface_b: ids.BlockStateId = 11;
-    const air_id: ids.BlockStateId = 0;
+    const surface_a: ids.BlockId = 10;
+    const surface_b: ids.BlockId = 11;
+    const air_id: ids.BlockId = 0;
 
     const selBiome = struct {
         fn call(seed: u64, pos: gs.BlockPos, params: wgen.Params) ids.BiomeId {
@@ -450,7 +454,7 @@ test "worldgen: alternating biomes across columns produce two-biome palette and 
     }.call;
 
     const selBlock = struct {
-        fn call(seed: u64, biome: ids.BiomeId, pos: gs.BlockPos, params: wgen.Params, lookup: wgen.BlockLookup) ids.BlockStateId {
+        fn call(seed: u64, biome: ids.BiomeId, pos: gs.BlockPos, params: wgen.Params, lookup: wgen.BlockLookup) ids.BlockId {
             _ = seed;
             _ = lookup;
             if (pos.y == 0) {
@@ -464,7 +468,7 @@ test "worldgen: alternating biomes across columns produce two-biome palette and 
         }
     }.call;
 
-    const params: wgen.Params = .{ .blocks = &[_]ids.BlockStateId{ surface_a, surface_b }, .biomes = &[_]ids.BiomeId{ biome_a, biome_b } };
+    const params: wgen.Params = .{ .blocks = &[_]ids.BlockId{ surface_a, surface_b }, .biomes = &[_]ids.BiomeId{ biome_a, biome_b } };
     const dummy_lookup: wgen.BlockLookup = .{ .ctx = null, .call = undefined };
 
     var chunk = try generateChunk(allocator, 1, .{ .x = 0, .z = 0 }, 12345, selBiome, selBlock, params, dummy_lookup, air_id);
@@ -478,10 +482,10 @@ test "worldgen: alternating biomes across columns produce two-biome palette and 
     var saw_air = false;
     var saw_a = false;
     var saw_b = false;
-    for (s.palette) |bid| {
-        if (bid == air_id) saw_air = true;
-        if (bid == surface_a) saw_a = true;
-        if (bid == surface_b) saw_b = true;
+    for (s.palette) |st| {
+        if (st.block_id == air_id) saw_air = true;
+        if (st.block_id == surface_a) saw_a = true;
+        if (st.block_id == surface_b) saw_b = true;
     }
     try testing.expect(saw_air);
     try testing.expect(saw_a);

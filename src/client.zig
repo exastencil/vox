@@ -3,6 +3,8 @@ const simulation = @import("simulation.zig");
 const player = @import("player.zig");
 const constants = @import("constants");
 const gs = @import("gs");
+const ids = @import("ids");
+const block = @import("registry/block.zig");
 const sokol = @import("sokol");
 const physics = @import("physics.zig");
 const sg = sokol.gfx;
@@ -10,6 +12,7 @@ const sapp = sokol.app;
 const sglue = sokol.glue;
 const sdtx = sokol.debugtext;
 const shd_mod = @import("shaders/chunk_shd.zig");
+const uvmap = @import("uvmap.zig");
 const builtin = @import("builtin");
 
 // macOS-only: warp the mouse cursor to a point that is guaranteed to be inside our app window.
@@ -424,7 +427,7 @@ const MeshingResult = struct { rpos: simulation.RegionPos, built_chunk_count: us
 
 // Snapshot types for background meshing
 const SectionSnapshot = struct {
-    palette: []u32,
+    palette: []gs.BlockState,
     blocks_indices_bits: []u32,
 };
 
@@ -445,7 +448,7 @@ const RegionSnapshot = struct {
 };
 
 // Temporary slice-ref structs for capturing under lock, then copying outside the lock
-const SectionSliceRefs = struct { pal_ptr: [*]const u32, pal_len: usize, bits_ptr: [*]const u32, bits_len: usize };
+const SectionSliceRefs = struct { pal_ptr: [*]const gs.BlockState, pal_len: usize, bits_ptr: [*]const u32, bits_len: usize };
 const ChunkSliceRefs = struct { pos: gs.ChunkPos, sections: []SectionSliceRefs };
 const RegionSliceRefs = struct { rpos: simulation.RegionPos, section_count_y: u16, sections_below: u16, base_cx: i32, base_cz: i32, chunks: []ChunkSliceRefs };
 
@@ -511,6 +514,72 @@ fn packBitsSet(dst: []u32, idx: usize, bits_per_index: u6, value: u32) void {
         const hi_mask: u32 = (@as(u32, 1) << @as(u5, @intCast(hi_bits))) - 1;
         dst[word_idx + 1] = (dst[word_idx + 1] & ~hi_mask) | hi_val;
     }
+}
+
+// Map a world-facing face index to a block-relative Face, given the block's "up" direction.
+// World face order: 0:-X, 1:+X, 2:-Y, 3:+Y, 4:-Z, 5:+Z
+inline fn worldToRelativeFace(dir: ids.Direction, world_face: u3) block.Face {
+    const BF = block.Face;
+    // For each orientation, define which world face each block face points to.
+    // This arbitrarily fixes a yaw for non-up orientations; current content does not
+    // distinguish front/back vs left/right in visuals, so this is sufficient.
+    const bf_to_wf: [6]u3 = switch (dir) {
+        .up => .{
+            5, // front -> +Z
+            4, // back  -> -Z
+            0, // left  -> -X
+            1, // right -> +X
+            3, // up    -> +Y
+            2, // down  -> -Y
+        },
+        .down => .{
+            5, // front -> +Z
+            4, // back  -> -Z
+            1, // left  -> +X (flip)
+            0, // right -> -X (flip)
+            2, // up    -> -Y
+            3, // down  -> +Y
+        },
+        .front => .{
+            3, // front -> +Y
+            2, // back  -> -Y
+            0, // left  -> -X
+            1, // right -> +X
+            5, // up    -> +Z
+            4, // down  -> -Z
+        },
+        .back => .{
+            3, // front -> +Y
+            2, // back  -> -Y
+            1, // left  -> +X
+            0, // right -> -X
+            4, // up    -> -Z
+            5, // down  -> +Z
+        },
+        .right => .{
+            5, // front -> +Z
+            4, // back  -> -Z
+            3, // left  -> +Y
+            2, // right -> -Y
+            1, // up    -> +X
+            0, // down  -> -X
+        },
+        .left => .{
+            5, // front -> +Z
+            4, // back  -> -Z
+            2, // left  -> -Y
+            3, // right -> +Y
+            0, // up    -> -X
+            1, // down  -> +X
+        },
+    };
+    // Invert mapping: find which block face has the given world face index
+    var i: u3 = 0;
+    while (i < 6) : (i += 1) {
+        if (bf_to_wf[i] == world_face) return @enumFromInt(i);
+    }
+    // Fallback
+    return BF.up;
 }
 
 fn buildQuadVerts(out: []Vertex, x0: f32, y0: f32, size: f32) usize {
@@ -631,9 +700,9 @@ fn addUniqueId(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), s
     try list.append(allocator, s);
 }
 
-fn findIndexForId(ids: []const []const u8, s: []const u8) ?usize {
+fn findIndexForId(id_list: []const []const u8, s: []const u8) ?usize {
     var i: usize = 0;
-    while (i < ids.len) : (i += 1) if (std.mem.eql(u8, ids[i], s)) return i;
+    while (i < id_list.len) : (i += 1) if (std.mem.eql(u8, id_list[i], s)) return i;
     return null;
 }
 
@@ -650,13 +719,13 @@ fn inferTileSide(len_rgba: usize) ?u32 {
 fn loadAllTxtrSlices(_: *Client, allocator: std.mem.Allocator) !struct { pixels: []u8, w: u32, h: u32, ids: [][]const u8 } {
     const texbin = @import("texture.zig");
     // Collect all .txtr files under resources/
-    var ids = std.ArrayList([]const u8).empty;
+    var id_list = std.ArrayList([]const u8).empty;
     var slices = std.ArrayList(struct { w: u32, h: u32, pixels: []u8 }).empty;
     errdefer {
         for (slices.items) |s| if (s.pixels.len > 0) allocator.free(s.pixels);
         slices.deinit(allocator);
-        for (ids.items) |id| allocator.free(id);
-        ids.deinit(allocator);
+        for (id_list.items) |id| allocator.free(id);
+        id_list.deinit(allocator);
     }
 
     var stack = std.ArrayList([]const u8).empty;
@@ -702,7 +771,7 @@ fn loadAllTxtrSlices(_: *Client, allocator: std.mem.Allocator) !struct { pixels:
                 };
                 // Own id slice and rgba copy (we own the buffer already; tex references it)
                 const id_bytes = try allocator.dupe(u8, tex.idSpan());
-                try ids.append(allocator, id_bytes);
+                try id_list.append(allocator, id_bytes);
                 // Move pixels ownership into slices; keep buf around until texture is appended
                 try slices.append(allocator, .{ .w = side, .h = side, .pixels = buf });
             }
@@ -746,21 +815,21 @@ fn loadAllTxtrSlices(_: *Client, allocator: std.mem.Allocator) !struct { pixels:
     // free ArrayList backing storage for slices
     slices.deinit(allocator);
 
-    return .{ .pixels = all_pixels, .w = tile_w, .h = tile_h, .ids = try ids.toOwnedSlice(allocator) };
+    return .{ .pixels = all_pixels, .w = tile_w, .h = tile_h, .ids = try id_list.toOwnedSlice(allocator) };
 }
 
 fn buildBlockAtlases(self: *Client) void {
     const texbin = @import("texture.zig");
     const atlas = @import("atlas.zig");
     // Gather inputs (ids and rgba8) from resources/*.txtr
-    var ids = std.ArrayList([]const u8).empty; // will be transferred into self.atlas_id_storage to keep keys alive
+    var id_list = std.ArrayList([]const u8).empty; // will be transferred into self.atlas_id_storage to keep keys alive
     var inputs = std.ArrayList(atlas.TextureRef).empty;
     var bufs = std.ArrayList([]u8).empty;
     var ids_cstr = std.ArrayList([]u8).empty;
     defer {
-        // ids are transferred to self.atlas_id_storage to keep key memory alive
+        // id_list items are transferred to self.atlas_id_storage to keep key memory alive
         // (freed in Client.deinit)
-        // ids.deinit is called after transfer below
+        // id_list.deinit is called after transfer below
         // free owned buffers after use below
         for (bufs.items) |b| if (b.len > 0) self.allocator.free(b);
         bufs.deinit(self.allocator);
@@ -811,7 +880,7 @@ fn buildBlockAtlases(self: *Client) void {
                 bufs.append(self.allocator, buf) catch {};
                 const id_bytes = tx.idSpan();
                 const id_owned = self.allocator.dupe(u8, id_bytes) catch continue;
-                ids.append(self.allocator, id_owned) catch {};
+                id_list.append(self.allocator, id_owned) catch {};
                 // make an owned 0-terminated copy for TextureRef.id
                 const id_c = self.allocator.alloc(u8, id_bytes.len + 1) catch continue;
                 @memcpy(id_c[0..id_bytes.len], id_bytes);
@@ -888,7 +957,7 @@ fn buildBlockAtlases(self: *Client) void {
     self.atlas_uvs_by_id.clearRetainingCapacity();
     inline for ([_]u32{0}) |_| {}
     var mapped: usize = 0;
-    for (ids.items, 0..) |id_bytes, idx| {
+    for (id_list.items, 0..) |id_bytes, idx| {
         _ = idx;
         // Find entry by matching span against entries (strip 0-terminator on entry id)
         var ei: usize = 0;
@@ -910,7 +979,7 @@ fn buildBlockAtlases(self: *Client) void {
         }
     }
     // After transfer, drop the temporary list structure but NOT the strings
-    ids.deinit(self.allocator);
+    id_list.deinit(self.allocator);
     // mapped count only used in debug builds; intentionally unused in release
     // Mark textures ready after successful atlas upload and mapping
     self.textures_ready = true;
@@ -1316,6 +1385,7 @@ pub const Client = struct {
         var odesc: sg.PipelineDesc = pdesc;
         odesc.label = "outline-tris";
         odesc.primitive_type = .TRIANGLES;
+        // keep outlines render-through
         odesc.cull_mode = .NONE;
         odesc.depth = .{ .compare = .ALWAYS, .write_enabled = false };
         self.pip_outline = sg.makePipeline(odesc);
@@ -2070,9 +2140,9 @@ pub const Client = struct {
                 const idx3d: usize = lz * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
                 const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx3d, bpi));
                 if (pidx >= s.palette.len) continue;
-                const bid: u32 = s.palette[pidx];
+                const bid: u32 = s.palette[pidx].block_id;
                 if (bid == 0) continue;
-                if (bid < self.sim.reg.blocks.items.len and !self.sim.reg.blocks.items[@intCast(bid)].full_block_collision) continue;
+                if (bid < self.sim.reg.blocks.items.len and !self.sim.reg.blocks.items[@intCast(bid)].collision) continue;
                 // set highlight
                 self.highlight_has = true;
                 self.highlight_min = .{ @as(f32, @floatFromInt(ix)), @as(f32, @floatFromInt(iy)), @as(f32, @floatFromInt(iz)) };
@@ -2179,10 +2249,10 @@ pub const Client = struct {
                     const idx3d: usize = lz * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
                     const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx3d, bpi));
                     if (pidx >= s.palette.len) continue;
-                    const bid: u32 = s.palette[pidx];
+                    const bid: u32 = s.palette[pidx].block_id;
                     if (bid == 0) continue;
                     if (bid < cli.sim.reg.blocks.items.len) {
-                        if (cli.sim.reg.blocks.items[@intCast(bid)].full_block_collision) {
+                        if (cli.sim.reg.blocks.items[@intCast(bid)].collision) {
                             // occluded by another solid block
                             return false;
                         }
@@ -2389,11 +2459,11 @@ pub const Client = struct {
                 const idx3d: usize = lz * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
                 const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx3d, bpi));
                 if (pidx >= s.palette.len) continue;
-                const bid: u32 = s.palette[pidx];
+                const bid: u32 = s.palette[pidx].block_id;
                 if (bid == 0) continue;
                 // respect collision flag
                 if (bid < self.sim.reg.blocks.items.len) {
-                    if (!self.sim.reg.blocks.items[@intCast(bid)].full_block_collision) continue;
+                    if (!self.sim.reg.blocks.items[@intCast(bid)].collision) continue;
                 }
                 // hit!
                 hit_found = true;
@@ -2426,7 +2496,7 @@ pub const Client = struct {
                                 var air_pidx: ?u32 = null;
                                 var pi: usize = 0;
                                 while (pi < pal_len) : (pi += 1) {
-                                    if (sref.palette[pi] == 0) {
+                                    if (sref.palette[pi].block_id == 0) {
                                         air_pidx = @intCast(pi);
                                         break;
                                     }
@@ -2451,10 +2521,10 @@ pub const Client = struct {
                                                 const idx_scan: usize = hit_lz * (constants.chunk_size_x * constants.section_height) + hit_lx * constants.section_height + ly_u;
                                                 const p_scan: usize = @intCast(unpackBitsGet(sscan.blocks_indices_bits, idx_scan, bpi_scan));
                                                 if (p_scan >= sscan.palette.len) continue;
-                                                const bid_scan: u32 = sscan.palette[p_scan];
+                                                const bid_scan: u32 = sscan.palette[p_scan].block_id;
                                                 if (bid_scan != 0) {
                                                     // respect solid flag
-                                                    if (bid_scan < self.sim.reg.blocks.items.len and !self.sim.reg.blocks.items[@intCast(bid_scan)].full_block_collision) {
+                                                    if (bid_scan < self.sim.reg.blocks.items.len and !self.sim.reg.blocks.items[@intCast(bid_scan)].collision) {
                                                         continue;
                                                     }
                                                     const abs_y: i32 = (@as(i32, @intCast(sy_u)) * @as(i32, @intCast(constants.section_height)) + @as(i32, @intCast(ly_u))) - @as(i32, @intCast(wsp.sections_below)) * @as(i32, @intCast(constants.section_height));
@@ -2620,10 +2690,10 @@ pub const Client = struct {
         const idx: usize = @as(usize, @intCast(nz)) * (constants.chunk_size_x * constants.section_height) + @as(usize, @intCast(nx)) * constants.section_height + n_ly;
         const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx, bpi));
         if (pidx >= s.palette.len) return false;
-        const bid: u32 = s.palette[pidx];
+        const bid: u32 = s.palette[pidx].block_id;
         if (bid == 0) return false;
         if (bid < self.sim.reg.blocks.items.len) {
-            return self.sim.reg.blocks.items[@intCast(bid)].full_block_collision;
+            return self.sim.reg.blocks.items[@intCast(bid)].collision;
         }
         return true;
     }
@@ -2636,9 +2706,19 @@ pub const Client = struct {
         const PalInfo = struct {
             draw: bool,
             solid: bool,
+            // Per-world-face materials
             top_uv: AtlasUv,
-            side_uv: AtlasUv,
             top_apply_tint: bool,
+            bot_uv: AtlasUv,
+            bot_apply_tint: bool,
+            nx_uv: AtlasUv,
+            nx_apply_tint: bool,
+            px_uv: AtlasUv,
+            px_apply_tint: bool,
+            nz_uv: AtlasUv,
+            nz_apply_tint: bool,
+            pz_uv: AtlasUv,
+            pz_apply_tint: bool,
         };
         var pal_info = std.ArrayList(PalInfo).initCapacity(self.allocator, pal_len) catch {
             return;
@@ -2646,44 +2726,76 @@ pub const Client = struct {
         defer pal_info.deinit(self.allocator);
         var pi: usize = 0;
         while (pi < pal_len) : (pi += 1) {
-            const bid: u32 = s.palette[pi];
+            const bid: u32 = s.palette[pi].block_id;
             var pinfo: PalInfo = .{
                 .draw = true,
                 .solid = true,
                 .top_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
-                .side_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
                 .top_apply_tint = false,
+                .bot_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
+                .bot_apply_tint = false,
+                .nx_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
+                .nx_apply_tint = false,
+                .px_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
+                .px_apply_tint = false,
+                .nz_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
+                .nz_apply_tint = false,
+                .pz_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
+                .pz_apply_tint = false,
             };
             if (bid < self.sim.reg.blocks.items.len) {
-                pinfo.solid = self.sim.reg.blocks.items[@intCast(bid)].full_block_collision;
+                pinfo.solid = self.sim.reg.blocks.items[@intCast(bid)].collision;
             }
             if (bid == 0) {
                 pinfo.draw = false;
                 pinfo.solid = false;
             } else {
-                const name = self.sim.reg.getBlockName(@intCast(bid));
-                if (self.sim.reg.resources.get(name)) |res| switch (res) {
-                    .Void => {
-                        pinfo.draw = false;
-                        pinfo.solid = false;
-                    },
-                    .Uniform => |u| {
-                        if (self.atlas_uvs_by_id.get(u.all_id)) |uv| {
-                            pinfo.top_uv = uv;
-                            pinfo.side_uv = uv;
+                // Resolve per-world-face materials via Block.Def FaceConfigs and BlockState.direction
+                const def = self.sim.reg.blocks.items[@intCast(bid)];
+                const state = s.palette[pi];
+                inline for (.{ 0, 1, 2, 3, 4, 5 }) |wf| {
+                    const rel: block.Face = worldToRelativeFace(state.direction, @intCast(wf));
+                    const fidx: usize = @intCast(def.face_config_index[@intFromEnum(rel)]);
+                    if (fidx < def.face_configs.len) {
+                        const fc = def.face_configs[fidx];
+                        if (fc.layers.len > 0) {
+                            switch (fc.layers[0]) {
+                                .Texture => |t| {
+                                    const uv_opt = self.atlas_uvs_by_id.get(t.tex);
+                                    if (uv_opt) |uv| {
+                                        switch (wf) {
+                                            3 => {
+                                                pinfo.top_uv = uv;
+                                                pinfo.top_apply_tint = (t.tint != null);
+                                            },
+                                            2 => {
+                                                pinfo.bot_uv = uv;
+                                                pinfo.bot_apply_tint = (t.tint != null);
+                                            },
+                                            0 => {
+                                                pinfo.nx_uv = uv;
+                                                pinfo.nx_apply_tint = (t.tint != null);
+                                            },
+                                            1 => {
+                                                pinfo.px_uv = uv;
+                                                pinfo.px_apply_tint = (t.tint != null);
+                                            },
+                                            4 => {
+                                                pinfo.nz_uv = uv;
+                                                pinfo.nz_apply_tint = (t.tint != null);
+                                            },
+                                            5 => {
+                                                pinfo.pz_uv = uv;
+                                                pinfo.pz_apply_tint = (t.tint != null);
+                                            },
+                                            else => {},
+                                        }
+                                    }
+                                },
+                            }
                         }
-                    },
-                    .Facing => |f| {
-                        if (self.atlas_uvs_by_id.get(f.face_id)) |uvt| pinfo.top_uv = uvt;
-                        if (self.atlas_uvs_by_id.get(f.other_id)) |uvs| pinfo.side_uv = uvs;
-                    },
-                    .AxisAlignedTintedPrimary => |a| {
-                        if (self.atlas_uvs_by_id.get(a.primary_face_id)) |uvt| pinfo.top_uv = uvt;
-                        if (self.atlas_uvs_by_id.get(a.side_face_id)) |uvs| pinfo.side_uv = uvs;
-                        _ = a.bottom_face_id; // bottom uses side_uv
-                        pinfo.top_apply_tint = true;
-                    },
-                };
+                    }
+                }
             }
             pal_info.appendAssumeCapacity(pinfo);
         }
@@ -2755,10 +2867,10 @@ pub const Client = struct {
                     const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
                     const rsize = [2]f32{ du, dv };
                     const uv00: [2]f32 = .{ 0, 0 };
-                    const uv0h: [2]f32 = .{ 0, @floatFromInt(h) };
-                    const uvwh: [2]f32 = .{ @floatFromInt(w), @floatFromInt(h) };
-                    const uvw0: [2]f32 = .{ @floatFromInt(w), 0 };
-                    emitQuad(self.allocator, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv0h, uvwh, uvw0, rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
+                    const uvh0: [2]f32 = .{ @floatFromInt(h), 0 };
+                    const uvhw: [2]f32 = .{ @floatFromInt(h), @floatFromInt(w) };
+                    const uv0w: [2]f32 = .{ 0, @floatFromInt(w) };
+                    emitQuad(self.allocator, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uvh0, uvhw, uv0w, rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
                     // clear mask for used cells
                     var zz: usize = 0;
                     while (zz < h) : (zz += 1) {
@@ -2771,51 +2883,314 @@ pub const Client = struct {
             }
         }
 
-        // Now emit the remaining faces (bottom and sides) per-voxel
-        for (0..constants.chunk_size_z) |lz| {
-            for (0..constants.chunk_size_x) |lx| {
-                for (0..constants.section_height) |ly| {
-                    const idx: usize = lz * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
-                    const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx, bpi));
+        // Greedy bottom faces per Y-slice (-Y)
+        ly_top = 0;
+        while (ly_top < constants.section_height) : (ly_top += 1) {
+            const abs_y: i32 = section_base_y + @as(i32, @intCast(ly_top));
+            var mask: [constants.chunk_size_z * constants.chunk_size_x]MaskCell = undefined;
+            var mz: usize = 0;
+            while (mz < constants.chunk_size_z) : (mz += 1) {
+                var mx: usize = 0;
+                while (mx < constants.chunk_size_x) : (mx += 1) {
+                    const idxm: usize = mz * constants.chunk_size_x + mx;
+                    mask[idxm].present = false;
+                    const src_idx: usize = mz * (constants.chunk_size_x * constants.section_height) + mx * constants.section_height + ly_top;
+                    const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, src_idx, bpi));
                     if (pidx >= pal_info.items.len) continue;
                     const info = pal_info.items[pidx];
                     if (!info.draw) continue;
-
-                    const wx0: f32 = base_x + @as(f32, @floatFromInt(lx));
-                    const wy0: f32 = @as(f32, @floatFromInt(section_base_y + @as(i32, @intCast(ly))));
-                    const wz0: f32 = base_z + @as(f32, @floatFromInt(lz));
-                    const wx1: f32 = wx0 + 1.0;
-                    const wy1: f32 = wy0 + 1.0;
-                    const wz1: f32 = wz0 + 1.0;
-
-                    const abs_y_this: i32 = section_base_y + @as(i32, @intCast(ly));
-
-                    // Side/bottom faces: 0..1 tile UVs mapped into atlas rect
-                    const du_s: f32 = info.side_uv.u1 - info.side_uv.u0;
-                    const dv_s: f32 = info.side_uv.v1 - info.side_uv.v0;
-                    const rmin = [2]f32{ info.side_uv.u0, info.side_uv.v0 };
-                    const rsize = [2]f32{ du_s, dv_s };
-                    // Tile-space UVs chosen to map atlas top to world top (v=1 at top)
-                    const t00: [2]f32 = .{ 0, 1 };
-                    const t01: [2]f32 = .{ 0, 0 };
-                    const t11: [2]f32 = .{ 1, 0 };
-                    const t10: [2]f32 = .{ 1, 1 };
-
-                    if (false) {}
-                    if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this - 1, @as(i32, @intCast(lz)))) {
-                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, t00, t01, t11, t10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
+                    if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(mx)), abs_y - 1, @as(i32, @intCast(mz)))) {
+                        mask[idxm] = .{ .present = true, .m = .{ .uv = info.bot_uv, .apply_tint = info.bot_apply_tint } };
                     }
-                    if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) - 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                        emitQuad(self.allocator, out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, t00, t01, t11, t10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
+                }
+            }
+            // rectangles over mask (x along width, z along height)
+            mz = 0;
+            while (mz < constants.chunk_size_z) : (mz += 1) {
+                var mx: usize = 0;
+                while (mx < constants.chunk_size_x) : (mx += 1) {
+                    const base_idx: usize = mz * constants.chunk_size_x + mx;
+                    if (!mask[base_idx].present) continue;
+                    const mkey: FaceMat = mask[base_idx].m;
+                    var w: usize = 1;
+                    while ((mx + w) < constants.chunk_size_x) : (w += 1) {
+                        const idx2 = mz * constants.chunk_size_x + (mx + w);
+                        if (!(mask[idx2].present and Mat.eq(mask[idx2].m, mkey))) break;
                     }
-                    if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) + 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                        emitQuad(self.allocator, out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, t00, t01, t11, t10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
+                    var h: usize = 1;
+                    outer_b: while ((mz + h) < constants.chunk_size_z) : (h += 1) {
+                        var kx: usize = 0;
+                        while (kx < w) : (kx += 1) {
+                            const idx3 = (mz + h) * constants.chunk_size_x + (mx + kx);
+                            if (!(mask[idx3].present and Mat.eq(mask[idx3].m, mkey))) break :outer_b;
+                        }
                     }
-                    if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) - 1)) {
-                        emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, t00, t01, t11, t10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
+                    const wx0: f32 = base_x + @as(f32, @floatFromInt(mx));
+                    const wz0: f32 = base_z + @as(f32, @floatFromInt(mz));
+                    const wx1: f32 = base_x + @as(f32, @floatFromInt(mx + w));
+                    const wz1: f32 = base_z + @as(f32, @floatFromInt(mz + h));
+                    const wy0: f32 = @as(f32, @floatFromInt(abs_y));
+                    const du: f32 = mkey.uv.u1 - mkey.uv.u0;
+                    const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
+                    const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
+                    const rsize = [2]f32{ du, dv };
+                    const uv00_b: [2]f32 = .{ 0, 0 };
+                    const uvw0: [2]f32 = .{ @floatFromInt(w), 0 };
+                    const uvwh: [2]f32 = .{ @floatFromInt(w), @floatFromInt(h) };
+                    const uv0h: [2]f32 = .{ 0, @floatFromInt(h) };
+                    emitQuad(self.allocator, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00_b, uvw0, uvwh, uv0h, rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
+                    var zz: usize = 0;
+                    while (zz < h) : (zz += 1) {
+                        var xx: usize = 0;
+                        while (xx < w) : (xx += 1) mask[(mz + zz) * constants.chunk_size_x + (mx + xx)].present = false;
                     }
-                    if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) + 1)) {
-                        emitQuad(self.allocator, out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, t00, t01, t11, t10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
+                }
+            }
+        }
+
+        // Greedy -X and +X faces per X-slice
+        var lx_face: usize = 0;
+        while (lx_face < constants.chunk_size_x) : (lx_face += 1) {
+            // -X
+            {
+                var mask_x: [constants.section_height * constants.chunk_size_z]MaskCell = undefined;
+                var mz: usize = 0;
+                while (mz < constants.chunk_size_z) : (mz += 1) {
+                    var ly: usize = 0;
+                    while (ly < constants.section_height) : (ly += 1) {
+                        const idxm: usize = mz * constants.section_height + ly;
+                        mask_x[idxm].present = false;
+                        const src_idx: usize = mz * (constants.chunk_size_x * constants.section_height) + lx_face * constants.section_height + ly;
+                        const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, src_idx, bpi));
+                        if (pidx >= pal_info.items.len) continue;
+                        const info = pal_info.items[pidx];
+                        if (!info.draw) continue;
+                        const abs_y: i32 = section_base_y + @as(i32, @intCast(ly));
+                        if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx_face)) - 1, abs_y, @as(i32, @intCast(mz)))) {
+                            mask_x[idxm] = .{ .present = true, .m = .{ .uv = info.nx_uv, .apply_tint = info.nx_apply_tint } };
+                        }
+                    }
+                }
+                // rectangles over (ly as width, mz as height)
+                mz = 0;
+                while (mz < constants.chunk_size_z) : (mz += 1) {
+                    var ly0: usize = 0;
+                    while (ly0 < constants.section_height) : (ly0 += 1) {
+                        const base_idx: usize = mz * constants.section_height + ly0;
+                        if (!mask_x[base_idx].present) continue;
+                        const mkey: FaceMat = mask_x[base_idx].m;
+                        var w: usize = 1;
+                        while ((ly0 + w) < constants.section_height) : (w += 1) {
+                            const idx2 = mz * constants.section_height + (ly0 + w);
+                            if (!(mask_x[idx2].present and Mat.eq(mask_x[idx2].m, mkey))) break;
+                        }
+                        var h: usize = 1;
+                        outer_xn: while ((mz + h) < constants.chunk_size_z) : (h += 1) {
+                            var ky: usize = 0;
+                            while (ky < w) : (ky += 1) {
+                                const idx3 = (mz + h) * constants.section_height + (ly0 + ky);
+                                if (!(mask_x[idx3].present and Mat.eq(mask_x[idx3].m, mkey))) break :outer_xn;
+                            }
+                        }
+                        const x0: f32 = base_x + @as(f32, @floatFromInt(lx_face));
+                        const y0: f32 = @as(f32, @floatFromInt(section_base_y)) + @as(f32, @floatFromInt(ly0));
+                        const y1: f32 = y0 + @as(f32, @floatFromInt(w));
+                        const z0: f32 = base_z + @as(f32, @floatFromInt(mz));
+                        const z1: f32 = z0 + @as(f32, @floatFromInt(h));
+                        const du: f32 = mkey.uv.u1 - mkey.uv.u0;
+                        const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
+                        const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
+                        const rsize = [2]f32{ du, dv };
+                        const uvs_nx = uvmap.sideTileUVs(0, w, h);
+                        emitQuad(self.allocator, out, .{ x0, y0, z0 }, .{ x0, y0, z1 }, .{ x0, y1, z1 }, .{ x0, y1, z0 }, uvs_nx[0], uvs_nx[1], uvs_nx[2], uvs_nx[3], rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
+                        var hz: usize = 0;
+                        while (hz < h) : (hz += 1) {
+                            var wy: usize = 0;
+                            while (wy < w) : (wy += 1) mask_x[(mz + hz) * constants.section_height + (ly0 + wy)].present = false;
+                        }
+                    }
+                }
+            }
+            // +X
+            {
+                var mask_x: [constants.section_height * constants.chunk_size_z]MaskCell = undefined;
+                var mz: usize = 0;
+                while (mz < constants.chunk_size_z) : (mz += 1) {
+                    var ly: usize = 0;
+                    while (ly < constants.section_height) : (ly += 1) {
+                        const idxm: usize = mz * constants.section_height + ly;
+                        mask_x[idxm].present = false;
+                        const src_idx: usize = mz * (constants.chunk_size_x * constants.section_height) + lx_face * constants.section_height + ly;
+                        const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, src_idx, bpi));
+                        if (pidx >= pal_info.items.len) continue;
+                        const info = pal_info.items[pidx];
+                        if (!info.draw) continue;
+                        const abs_y: i32 = section_base_y + @as(i32, @intCast(ly));
+                        if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx_face)) + 1, abs_y, @as(i32, @intCast(mz)))) {
+                            mask_x[idxm] = .{ .present = true, .m = .{ .uv = info.px_uv, .apply_tint = info.px_apply_tint } };
+                        }
+                    }
+                }
+                mz = 0;
+                while (mz < constants.chunk_size_z) : (mz += 1) {
+                    var ly0: usize = 0;
+                    while (ly0 < constants.section_height) : (ly0 += 1) {
+                        const base_idx: usize = mz * constants.section_height + ly0;
+                        if (!mask_x[base_idx].present) continue;
+                        const mkey: FaceMat = mask_x[base_idx].m;
+                        var w: usize = 1;
+                        while ((ly0 + w) < constants.section_height) : (w += 1) {
+                            const idx2 = mz * constants.section_height + (ly0 + w);
+                            if (!(mask_x[idx2].present and Mat.eq(mask_x[idx2].m, mkey))) break;
+                        }
+                        var h: usize = 1;
+                        outer_xp: while ((mz + h) < constants.chunk_size_z) : (h += 1) {
+                            var ky: usize = 0;
+                            while (ky < w) : (ky += 1) {
+                                const idx3 = (mz + h) * constants.section_height + (ly0 + ky);
+                                if (!(mask_x[idx3].present and Mat.eq(mask_x[idx3].m, mkey))) break :outer_xp;
+                            }
+                        }
+                        const x1: f32 = base_x + @as(f32, @floatFromInt(lx_face + 1));
+                        const y0: f32 = @as(f32, @floatFromInt(section_base_y)) + @as(f32, @floatFromInt(ly0));
+                        const y1: f32 = y0 + @as(f32, @floatFromInt(w));
+                        const z0: f32 = base_z + @as(f32, @floatFromInt(mz));
+                        const z1: f32 = z0 + @as(f32, @floatFromInt(h));
+                        const du: f32 = mkey.uv.u1 - mkey.uv.u0;
+                        const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
+                        const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
+                        const rsize = [2]f32{ du, dv };
+                        const uvs_px = uvmap.sideTileUVs(1, w, h);
+                        emitQuad(self.allocator, out, .{ x1, y0, z0 }, .{ x1, y1, z0 }, .{ x1, y1, z1 }, .{ x1, y0, z1 }, uvs_px[0], uvs_px[1], uvs_px[2], uvs_px[3], rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
+                        var hz: usize = 0;
+                        while (hz < h) : (hz += 1) {
+                            var wy: usize = 0;
+                            while (wy < w) : (wy += 1) mask_x[(mz + hz) * constants.section_height + (ly0 + wy)].present = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Greedy -Z and +Z faces per Z-slice
+        var lz_face: usize = 0;
+        while (lz_face < constants.chunk_size_z) : (lz_face += 1) {
+            // -Z
+            {
+                var mask_z: [constants.section_height * constants.chunk_size_x]MaskCell = undefined;
+                var lx: usize = 0;
+                while (lx < constants.chunk_size_x) : (lx += 1) {
+                    var ly: usize = 0;
+                    while (ly < constants.section_height) : (ly += 1) {
+                        const idxm: usize = lx * constants.section_height + ly;
+                        mask_z[idxm].present = false;
+                        const src_idx: usize = lz_face * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
+                        const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, src_idx, bpi));
+                        if (pidx >= pal_info.items.len) continue;
+                        const info = pal_info.items[pidx];
+                        if (!info.draw) continue;
+                        const abs_y: i32 = section_base_y + @as(i32, @intCast(ly));
+                        if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y, @as(i32, @intCast(lz_face)) - 1)) {
+                            mask_z[idxm] = .{ .present = true, .m = .{ .uv = info.nz_uv, .apply_tint = info.nz_apply_tint } };
+                        }
+                    }
+                }
+                lx = 0;
+                while (lx < constants.chunk_size_x) : (lx += 1) {
+                    var ly0: usize = 0;
+                    while (ly0 < constants.section_height) : (ly0 += 1) {
+                        const base_idx: usize = lx * constants.section_height + ly0;
+                        if (!mask_z[base_idx].present) continue;
+                        const mkey: FaceMat = mask_z[base_idx].m;
+                        var w: usize = 1;
+                        while ((lx + w) < constants.chunk_size_x) : (w += 1) {
+                            const idx2 = (lx + w) * constants.section_height + ly0;
+                            if (!(mask_z[idx2].present and Mat.eq(mask_z[idx2].m, mkey))) break;
+                        }
+                        var h: usize = 1;
+                        outer_zn: while ((ly0 + h) < constants.section_height) : (h += 1) {
+                            var kx: usize = 0;
+                            while (kx < w) : (kx += 1) {
+                                const idx3 = (lx + kx) * constants.section_height + (ly0 + h);
+                                if (!(mask_z[idx3].present and Mat.eq(mask_z[idx3].m, mkey))) break :outer_zn;
+                            }
+                        }
+                        const z0: f32 = base_z + @as(f32, @floatFromInt(lz_face));
+                        const x0: f32 = base_x + @as(f32, @floatFromInt(lx));
+                        const x1: f32 = x0 + @as(f32, @floatFromInt(w));
+                        const y0: f32 = @as(f32, @floatFromInt(section_base_y)) + @as(f32, @floatFromInt(ly0));
+                        const y1: f32 = y0 + @as(f32, @floatFromInt(h));
+                        const du: f32 = mkey.uv.u1 - mkey.uv.u0;
+                        const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
+                        const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
+                        const rsize = [2]f32{ du, dv };
+                        const uvs_nz = uvmap.sideTileUVs(4, w, h);
+                        emitQuad(self.allocator, out, .{ x0, y0, z0 }, .{ x0, y1, z0 }, .{ x1, y1, z0 }, .{ x1, y0, z0 }, uvs_nz[0], uvs_nz[1], uvs_nz[2], uvs_nz[3], rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
+                        var wy: usize = 0;
+                        while (wy < h) : (wy += 1) {
+                            var wx: usize = 0;
+                            while (wx < w) : (wx += 1) mask_z[(lx + wx) * constants.section_height + (ly0 + wy)].present = false;
+                        }
+                    }
+                }
+            }
+            // +Z
+            {
+                var mask_z: [constants.section_height * constants.chunk_size_x]MaskCell = undefined;
+                var lx: usize = 0;
+                while (lx < constants.chunk_size_x) : (lx += 1) {
+                    var ly: usize = 0;
+                    while (ly < constants.section_height) : (ly += 1) {
+                        const idxm: usize = lx * constants.section_height + ly;
+                        mask_z[idxm].present = false;
+                        const src_idx: usize = lz_face * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
+                        const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, src_idx, bpi));
+                        if (pidx >= pal_info.items.len) continue;
+                        const info = pal_info.items[pidx];
+                        if (!info.draw) continue;
+                        const abs_y: i32 = section_base_y + @as(i32, @intCast(ly));
+                        if (!self.isSolidAt(ws, ch, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y, @as(i32, @intCast(lz_face)) + 1)) {
+                            mask_z[idxm] = .{ .present = true, .m = .{ .uv = info.pz_uv, .apply_tint = info.pz_apply_tint } };
+                        }
+                    }
+                }
+                lx = 0;
+                while (lx < constants.chunk_size_x) : (lx += 1) {
+                    var ly0: usize = 0;
+                    while (ly0 < constants.section_height) : (ly0 += 1) {
+                        const base_idx: usize = lx * constants.section_height + ly0;
+                        if (!mask_z[base_idx].present) continue;
+                        const mkey: FaceMat = mask_z[base_idx].m;
+                        var w: usize = 1;
+                        while ((lx + w) < constants.chunk_size_x) : (w += 1) {
+                            const idx2 = (lx + w) * constants.section_height + ly0;
+                            if (!(mask_z[idx2].present and Mat.eq(mask_z[idx2].m, mkey))) break;
+                        }
+                        var h: usize = 1;
+                        outer_zp: while ((ly0 + h) < constants.section_height) : (h += 1) {
+                            var kx: usize = 0;
+                            while (kx < w) : (kx += 1) {
+                                const idx3 = (lx + kx) * constants.section_height + (ly0 + h);
+                                if (!(mask_z[idx3].present and Mat.eq(mask_z[idx3].m, mkey))) break :outer_zp;
+                            }
+                        }
+                        const z1: f32 = base_z + @as(f32, @floatFromInt(lz_face + 1));
+                        const x0: f32 = base_x + @as(f32, @floatFromInt(lx));
+                        const x1: f32 = x0 + @as(f32, @floatFromInt(w));
+                        const y0: f32 = @as(f32, @floatFromInt(section_base_y)) + @as(f32, @floatFromInt(ly0));
+                        const y1: f32 = y0 + @as(f32, @floatFromInt(h));
+                        const du: f32 = mkey.uv.u1 - mkey.uv.u0;
+                        const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
+                        const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
+                        const rsize = [2]f32{ du, dv };
+                        const uvs_pz = uvmap.sideTileUVs(5, w, h);
+                        // Use (v0,v1,v2,v3) for +Z to ensure CCW with cull BACK
+                        emitQuad(self.allocator, out, .{ x0, y0, z1 }, .{ x1, y0, z1 }, .{ x1, y1, z1 }, .{ x0, y1, z1 }, uvs_pz[0], uvs_pz[3], uvs_pz[2], uvs_pz[1], rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
+                        var wy: usize = 0;
+                        while (wy < h) : (wy += 1) {
+                            var wx: usize = 0;
+                            while (wx < w) : (wx += 1) mask_z[(lx + wx) * constants.section_height + (ly0 + wy)].present = false;
+                        }
                     }
                 }
             }
@@ -2934,10 +3309,10 @@ pub const Client = struct {
             var sy: usize = 0;
             while (sy < secs.len) : (sy += 1) {
                 const sref = chref.sections[sy];
-                var pal: []u32 = &[_]u32{};
+                var pal: []gs.BlockState = &[_]gs.BlockState{};
                 var bits: []u32 = &[_]u32{};
                 if (sref.pal_len > 0) {
-                    pal = alloc.alloc(u32, sref.pal_len) catch &[_]u32{};
+                    pal = alloc.alloc(gs.BlockState, sref.pal_len) catch &[_]gs.BlockState{};
                     if (pal.len == sref.pal_len) @memcpy(pal[0..pal.len], sref.pal_ptr[0..sref.pal_len]);
                 }
                 if (sref.bits_len > 0) {
@@ -3026,12 +3401,12 @@ pub const Client = struct {
                                 const idx3d_live: usize = @as(usize, @intCast(lz)) * (constants.chunk_size_x * constants.section_height) + @as(usize, @intCast(lx)) * constants.section_height + ly_live;
                                 const pidx_live: usize = @intCast(unpackBitsGet(s_live.blocks_indices_bits, idx3d_live, bpi_live));
                                 if (pidx_live < s_live.palette.len) {
-                                    const bid_live: u32 = s_live.palette[pidx_live];
+                                    const bid_live: u32 = s_live.palette[pidx_live].block_id;
                                     if (bid_live == 0) {
                                         self.sim.worlds_mutex.unlock();
                                         return false;
                                     }
-                                    const solid_live: bool = if (bid_live < self.sim.reg.blocks.items.len) self.sim.reg.blocks.items[@intCast(bid_live)].full_block_collision else true;
+                                    const solid_live: bool = if (bid_live < self.sim.reg.blocks.items.len) self.sim.reg.blocks.items[@intCast(bid_live)].collision else true;
                                     self.sim.worlds_mutex.unlock();
                                     return solid_live;
                                 }
@@ -3056,9 +3431,9 @@ pub const Client = struct {
         const idx3d: usize = @as(usize, @intCast(lz)) * (constants.chunk_size_x * constants.section_height) + @as(usize, @intCast(lx)) * constants.section_height + ly;
         const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx3d, bpi));
         if (pidx >= s.palette.len) return false;
-        const bid: u32 = s.palette[pidx];
+        const bid: u32 = s.palette[pidx].block_id;
         if (bid == 0) return false;
-        if (bid < self.sim.reg.blocks.items.len) return self.sim.reg.blocks.items[@intCast(bid)].full_block_collision;
+        if (bid < self.sim.reg.blocks.items.len) return self.sim.reg.blocks.items[@intCast(bid)].collision;
         return true;
     }
 
@@ -3070,8 +3445,17 @@ pub const Client = struct {
             draw: bool,
             solid: bool,
             top_uv: AtlasUv,
-            side_uv: AtlasUv,
             top_apply_tint: bool,
+            bot_uv: AtlasUv,
+            bot_apply_tint: bool,
+            nx_uv: AtlasUv,
+            nx_apply_tint: bool,
+            px_uv: AtlasUv,
+            px_apply_tint: bool,
+            nz_uv: AtlasUv,
+            nz_apply_tint: bool,
+            pz_uv: AtlasUv,
+            pz_apply_tint: bool,
         };
         var pal_info = std.ArrayList(PalInfo).initCapacity(self.allocator, pal_len) catch {
             return;
@@ -3079,44 +3463,75 @@ pub const Client = struct {
         defer pal_info.deinit(self.allocator);
         var pi: usize = 0;
         while (pi < pal_len) : (pi += 1) {
-            const bid: u32 = s.palette[pi];
+            const bid: u32 = s.palette[pi].block_id;
             var pinfo: PalInfo = .{
                 .draw = true,
                 .solid = true,
                 .top_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
-                .side_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
                 .top_apply_tint = false,
+                .bot_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
+                .bot_apply_tint = false,
+                .nx_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
+                .nx_apply_tint = false,
+                .px_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
+                .px_apply_tint = false,
+                .nz_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
+                .nz_apply_tint = false,
+                .pz_uv = .{ .aidx = 0, .u0 = 0, .v0 = 0, .u1 = 1, .v1 = 1 },
+                .pz_apply_tint = false,
             };
             if (bid < self.sim.reg.blocks.items.len) {
-                pinfo.solid = self.sim.reg.blocks.items[@intCast(bid)].full_block_collision;
+                pinfo.solid = self.sim.reg.blocks.items[@intCast(bid)].collision;
             }
             if (bid == 0) {
                 pinfo.draw = false;
                 pinfo.solid = false;
             } else {
-                const name = self.sim.reg.getBlockName(@intCast(bid));
-                if (self.sim.reg.resources.get(name)) |res| switch (res) {
-                    .Void => {
-                        pinfo.draw = false;
-                        pinfo.solid = false;
-                    },
-                    .Uniform => |u| {
-                        if (self.atlas_uvs_by_id.get(u.all_id)) |uv| {
-                            pinfo.top_uv = uv;
-                            pinfo.side_uv = uv;
+                const def = self.sim.reg.blocks.items[@intCast(bid)];
+                const state = s.palette[pi];
+                inline for (.{ 0, 1, 2, 3, 4, 5 }) |wf| {
+                    const rel: block.Face = worldToRelativeFace(state.direction, @intCast(wf));
+                    const fidx: usize = @intCast(def.face_config_index[@intFromEnum(rel)]);
+                    if (fidx < def.face_configs.len) {
+                        const fc = def.face_configs[fidx];
+                        if (fc.layers.len > 0) {
+                            switch (fc.layers[0]) {
+                                .Texture => |t| {
+                                    const uv_opt = self.atlas_uvs_by_id.get(t.tex);
+                                    if (uv_opt) |uv| {
+                                        switch (wf) {
+                                            3 => {
+                                                pinfo.top_uv = uv;
+                                                pinfo.top_apply_tint = (t.tint != null);
+                                            },
+                                            2 => {
+                                                pinfo.bot_uv = uv;
+                                                pinfo.bot_apply_tint = (t.tint != null);
+                                            },
+                                            0 => {
+                                                pinfo.nx_uv = uv;
+                                                pinfo.nx_apply_tint = (t.tint != null);
+                                            },
+                                            1 => {
+                                                pinfo.px_uv = uv;
+                                                pinfo.px_apply_tint = (t.tint != null);
+                                            },
+                                            4 => {
+                                                pinfo.nz_uv = uv;
+                                                pinfo.nz_apply_tint = (t.tint != null);
+                                            },
+                                            5 => {
+                                                pinfo.pz_uv = uv;
+                                                pinfo.pz_apply_tint = (t.tint != null);
+                                            },
+                                            else => {},
+                                        }
+                                    }
+                                },
+                            }
                         }
-                    },
-                    .Facing => |f| {
-                        if (self.atlas_uvs_by_id.get(f.face_id)) |uvt| pinfo.top_uv = uvt;
-                        if (self.atlas_uvs_by_id.get(f.other_id)) |uvs| pinfo.side_uv = uvs;
-                    },
-                    .AxisAlignedTintedPrimary => |a| {
-                        if (self.atlas_uvs_by_id.get(a.primary_face_id)) |uvt| pinfo.top_uv = uvt;
-                        if (self.atlas_uvs_by_id.get(a.side_face_id)) |uvs| pinfo.side_uv = uvs;
-                        _ = a.bottom_face_id; // currently sides/bottom use side_uv
-                        pinfo.top_apply_tint = true;
-                    },
-                };
+                    }
+                }
             }
             pal_info.appendAssumeCapacity(pinfo);
         }
@@ -3183,11 +3598,11 @@ pub const Client = struct {
                     const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
                     const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
                     const rsize = [2]f32{ du, dv };
-                    const uv00: [2]f32 = .{ 0, 0 };
-                    const uv0h: [2]f32 = .{ 0, @floatFromInt(h) };
-                    const uvwh: [2]f32 = .{ @floatFromInt(w), @floatFromInt(h) };
-                    const uvw0: [2]f32 = .{ @floatFromInt(w), 0 };
-                    emitQuad(alloc, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv0h, uvwh, uvw0, rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
+                    const uv00_s: [2]f32 = .{ 0, 0 };
+                    const uvh0_s: [2]f32 = .{ @floatFromInt(h), 0 };
+                    const uvhw_s: [2]f32 = .{ @floatFromInt(h), @floatFromInt(w) };
+                    const uv0w_s: [2]f32 = .{ 0, @floatFromInt(w) };
+                    emitQuad(alloc, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00_s, uvh0_s, uvhw_s, uv0w_s, rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
                     // clear mask
                     var zz: usize = 0;
                     while (zz < h) : (zz += 1) {
@@ -3198,52 +3613,313 @@ pub const Client = struct {
             }
         }
 
-        // Remaining faces per-voxel
-        for (0..constants.chunk_size_z) |lz| {
-            for (0..constants.chunk_size_x) |lx| {
-                for (0..constants.section_height) |ly| {
-                    const idx: usize = lz * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
-                    const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx, bpi));
+        // Greedy bottom faces per Y-slice (-Y)
+        ly_top = 0;
+        while (ly_top < constants.section_height) : (ly_top += 1) {
+            const abs_y: i32 = section_base_y + @as(i32, @intCast(ly_top));
+            var mask: [constants.chunk_size_z * constants.chunk_size_x]struct { present: bool, m: FaceMat } = undefined;
+            var mz: usize = 0;
+            while (mz < constants.chunk_size_z) : (mz += 1) {
+                var mx: usize = 0;
+                while (mx < constants.chunk_size_x) : (mx += 1) {
+                    const idxm: usize = mz * constants.chunk_size_x + mx;
+                    mask[idxm].present = false;
+                    const src_idx: usize = mz * (constants.chunk_size_x * constants.section_height) + mx * constants.section_height + ly_top;
+                    const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, src_idx, bpi));
                     if (pidx >= pal_info.items.len) continue;
                     const info = pal_info.items[pidx];
                     if (!info.draw) continue;
+                    if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(mx)), abs_y - 1, @as(i32, @intCast(mz)))) {
+                        mask[idxm] = .{ .present = true, .m = .{ .uv = info.bot_uv, .apply_tint = info.bot_apply_tint } };
+                    }
+                }
+            }
+            mz = 0;
+            while (mz < constants.chunk_size_z) : (mz += 1) {
+                var mx: usize = 0;
+                while (mx < constants.chunk_size_x) : (mx += 1) {
+                    const base_idx: usize = mz * constants.chunk_size_x + mx;
+                    if (!mask[base_idx].present) continue;
+                    const mkey: FaceMat = mask[base_idx].m;
+                    var w: usize = 1;
+                    while ((mx + w) < constants.chunk_size_x) : (w += 1) {
+                        const idx2 = mz * constants.chunk_size_x + (mx + w);
+                        if (!(mask[idx2].present and Mat.eq(mask[idx2].m, mkey))) break;
+                    }
+                    var h: usize = 1;
+                    outer_b: while ((mz + h) < constants.chunk_size_z) : (h += 1) {
+                        var kx: usize = 0;
+                        while (kx < w) : (kx += 1) {
+                            const idx3 = (mz + h) * constants.chunk_size_x + (mx + kx);
+                            if (!(mask[idx3].present and Mat.eq(mask[idx3].m, mkey))) break :outer_b;
+                        }
+                    }
+                    const wx0: f32 = base_x + @as(f32, @floatFromInt(mx));
+                    const wz0: f32 = base_z + @as(f32, @floatFromInt(mz));
+                    const wx1: f32 = base_x + @as(f32, @floatFromInt(mx + w));
+                    const wz1: f32 = base_z + @as(f32, @floatFromInt(mz + h));
+                    const wy0: f32 = @as(f32, @floatFromInt(abs_y));
+                    const du: f32 = mkey.uv.u1 - mkey.uv.u0;
+                    const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
+                    const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
+                    const rsize = [2]f32{ du, dv };
+                    const uv00_bs: [2]f32 = .{ 0, 0 };
+                    const uvw0_s: [2]f32 = .{ @floatFromInt(w), 0 };
+                    const uvwh_s: [2]f32 = .{ @floatFromInt(w), @floatFromInt(h) };
+                    const uv0h_s: [2]f32 = .{ 0, @floatFromInt(h) };
+                    emitQuad(alloc, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00_bs, uvw0_s, uvwh_s, uv0h_s, rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
+                    var zz: usize = 0;
+                    while (zz < h) : (zz += 1) {
+                        var xx: usize = 0;
+                        while (xx < w) : (xx += 1) mask[(mz + zz) * constants.chunk_size_x + (mx + xx)].present = false;
+                    }
+                }
+            }
+        }
 
-                    const wx0: f32 = base_x + @as(f32, @floatFromInt(lx));
-                    const wy0: f32 = @as(f32, @floatFromInt(section_base_y + @as(i32, @intCast(ly))));
-                    const wz0: f32 = base_z + @as(f32, @floatFromInt(lz));
-                    const wx1: f32 = wx0 + 1.0;
-                    const wy1: f32 = wy0 + 1.0;
-                    const wz1: f32 = wz0 + 1.0;
+        // Greedy -X/+X per X-slice
+        var lx_face: usize = 0;
+        while (lx_face < constants.chunk_size_x) : (lx_face += 1) {
+            // -X
+            {
+                var mask_x: [constants.section_height * constants.chunk_size_z]struct { present: bool, m: FaceMat } = undefined;
+                var mz: usize = 0;
+                while (mz < constants.chunk_size_z) : (mz += 1) {
+                    var ly: usize = 0;
+                    while (ly < constants.section_height) : (ly += 1) {
+                        const idxm: usize = mz * constants.section_height + ly;
+                        mask_x[idxm].present = false;
+                        const src_idx: usize = mz * (constants.chunk_size_x * constants.section_height) + lx_face * constants.section_height + ly;
+                        const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, src_idx, bpi));
+                        if (pidx >= pal_info.items.len) continue;
+                        const info = pal_info.items[pidx];
+                        if (!info.draw) continue;
+                        const abs_y: i32 = section_base_y + @as(i32, @intCast(ly));
+                        if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx_face)) - 1, abs_y, @as(i32, @intCast(mz)))) {
+                            mask_x[idxm] = .{ .present = true, .m = .{ .uv = info.nx_uv, .apply_tint = info.nx_apply_tint } };
+                        }
+                    }
+                }
+                mz = 0;
+                while (mz < constants.chunk_size_z) : (mz += 1) {
+                    var ly0: usize = 0;
+                    while (ly0 < constants.section_height) : (ly0 += 1) {
+                        const base_idx: usize = mz * constants.section_height + ly0;
+                        if (!mask_x[base_idx].present) continue;
+                        const mkey: FaceMat = mask_x[base_idx].m;
+                        var w: usize = 1;
+                        while ((ly0 + w) < constants.section_height) : (w += 1) {
+                            const idx2 = mz * constants.section_height + (ly0 + w);
+                            if (!(mask_x[idx2].present and Mat.eq(mask_x[idx2].m, mkey))) break;
+                        }
+                        var h: usize = 1;
+                        outer_xn: while ((mz + h) < constants.chunk_size_z) : (h += 1) {
+                            var ky: usize = 0;
+                            while (ky < w) : (ky += 1) {
+                                const idx3 = (mz + h) * constants.section_height + (ly0 + ky);
+                                if (!(mask_x[idx3].present and Mat.eq(mask_x[idx3].m, mkey))) break :outer_xn;
+                            }
+                        }
+                        const x0: f32 = base_x + @as(f32, @floatFromInt(lx_face));
+                        const y0: f32 = @as(f32, @floatFromInt(section_base_y)) + @as(f32, @floatFromInt(ly0));
+                        const y1: f32 = y0 + @as(f32, @floatFromInt(w));
+                        const z0: f32 = base_z + @as(f32, @floatFromInt(mz));
+                        const z1: f32 = z0 + @as(f32, @floatFromInt(h));
+                        const du: f32 = mkey.uv.u1 - mkey.uv.u0;
+                        const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
+                        const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
+                        const rsize = [2]f32{ du, dv };
+                        const uvs_nx_s = uvmap.sideTileUVs(0, w, h);
+                        emitQuad(alloc, out, .{ x0, y0, z0 }, .{ x0, y0, z1 }, .{ x0, y1, z1 }, .{ x0, y1, z0 }, uvs_nx_s[0], uvs_nx_s[1], uvs_nx_s[2], uvs_nx_s[3], rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
+                        var hz: usize = 0;
+                        while (hz < h) : (hz += 1) {
+                            var wy: usize = 0;
+                            while (wy < w) : (wy += 1) mask_x[(mz + hz) * constants.section_height + (ly0 + wy)].present = false;
+                        }
+                    }
+                }
+            }
+            // +X
+            {
+                var mask_x: [constants.section_height * constants.chunk_size_z]struct { present: bool, m: FaceMat } = undefined;
+                var mz: usize = 0;
+                while (mz < constants.chunk_size_z) : (mz += 1) {
+                    var ly: usize = 0;
+                    while (ly < constants.section_height) : (ly += 1) {
+                        const idxm: usize = mz * constants.section_height + ly;
+                        mask_x[idxm].present = false;
+                        const src_idx: usize = mz * (constants.chunk_size_x * constants.section_height) + lx_face * constants.section_height + ly;
+                        const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, src_idx, bpi));
+                        if (pidx >= pal_info.items.len) continue;
+                        const info = pal_info.items[pidx];
+                        if (!info.draw) continue;
+                        const abs_y: i32 = section_base_y + @as(i32, @intCast(ly));
+                        if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx_face)) + 1, abs_y, @as(i32, @intCast(mz)))) {
+                            mask_x[idxm] = .{ .present = true, .m = .{ .uv = info.px_uv, .apply_tint = info.px_apply_tint } };
+                        }
+                    }
+                }
+                mz = 0;
+                while (mz < constants.chunk_size_z) : (mz += 1) {
+                    var ly0: usize = 0;
+                    while (ly0 < constants.section_height) : (ly0 += 1) {
+                        const base_idx: usize = mz * constants.section_height + ly0;
+                        if (!mask_x[base_idx].present) continue;
+                        const mkey: FaceMat = mask_x[base_idx].m;
+                        var w: usize = 1;
+                        while ((ly0 + w) < constants.section_height) : (w += 1) {
+                            const idx2 = mz * constants.section_height + (ly0 + w);
+                            if (!(mask_x[idx2].present and Mat.eq(mask_x[idx2].m, mkey))) break;
+                        }
+                        var h: usize = 1;
+                        outer_xp: while ((mz + h) < constants.chunk_size_z) : (h += 1) {
+                            var ky: usize = 0;
+                            while (ky < w) : (ky += 1) {
+                                const idx3 = (mz + h) * constants.section_height + (ly0 + ky);
+                                if (!(mask_x[idx3].present and Mat.eq(mask_x[idx3].m, mkey))) break :outer_xp;
+                            }
+                        }
+                        const x1: f32 = base_x + @as(f32, @floatFromInt(lx_face + 1));
+                        const y0: f32 = @as(f32, @floatFromInt(section_base_y)) + @as(f32, @floatFromInt(ly0));
+                        const y1: f32 = y0 + @as(f32, @floatFromInt(w));
+                        const z0: f32 = base_z + @as(f32, @floatFromInt(mz));
+                        const z1: f32 = z0 + @as(f32, @floatFromInt(h));
+                        const du: f32 = mkey.uv.u1 - mkey.uv.u0;
+                        const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
+                        const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
+                        const rsize = [2]f32{ du, dv };
+                        const uvs_px_s = uvmap.sideTileUVs(1, w, h);
+                        emitQuad(alloc, out, .{ x1, y0, z0 }, .{ x1, y1, z0 }, .{ x1, y1, z1 }, .{ x1, y0, z1 }, uvs_px_s[0], uvs_px_s[1], uvs_px_s[2], uvs_px_s[3], rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
+                        var hz: usize = 0;
+                        while (hz < h) : (hz += 1) {
+                            var wy: usize = 0;
+                            while (wy < w) : (wy += 1) mask_x[(mz + hz) * constants.section_height + (ly0 + wy)].present = false;
+                        }
+                    }
+                }
+            }
+        }
 
-                    const abs_y_this: i32 = section_base_y + @as(i32, @intCast(ly));
-                    // Tile-space 0..1 mapping with V flipped so atlas top maps to world top
-                    const du_s: f32 = info.side_uv.u1 - info.side_uv.u0;
-                    const dv_s: f32 = info.side_uv.v1 - info.side_uv.v0;
-                    const rmin = [2]f32{ info.side_uv.u0, info.side_uv.v0 };
-                    const rsize = [2]f32{ du_s, dv_s };
-                    const uv00: [2]f32 = .{ 0, 1 };
-                    const uv01: [2]f32 = .{ 0, 0 };
-                    const uv11: [2]f32 = .{ 1, 0 };
-                    const uv10: [2]f32 = .{ 1, 1 };
-
-                    // Top faces are already emitted via greedy rectangles above; skip here to avoid z-fighting
-                    // if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this + 1, @as(i32, @intCast(lz)))) {
-                    //     emitQuad(alloc, out, .{ wx0, wy1, wz0 }, .{ wx0, wy1, wz1 }, .{ wx1, wy1, wz1 }, .{ wx1, wy1, wz0 }, uv00, uv01, uv11, uv10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
-                    // }
-                    if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this - 1, @as(i32, @intCast(lz)))) {
-                        emitQuad(alloc, out, .{ wx0, wy0, wz0 }, .{ wx1, wy0, wz0 }, .{ wx1, wy0, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
+        // Greedy -Z/+Z per Z-slice
+        var lz_face: usize = 0;
+        while (lz_face < constants.chunk_size_z) : (lz_face += 1) {
+            // -Z
+            {
+                var mask_z: [constants.section_height * constants.chunk_size_x]struct { present: bool, m: FaceMat } = undefined;
+                var lx: usize = 0;
+                while (lx < constants.chunk_size_x) : (lx += 1) {
+                    var ly: usize = 0;
+                    while (ly < constants.section_height) : (ly += 1) {
+                        const idxm: usize = lx * constants.section_height + ly;
+                        mask_z[idxm].present = false;
+                        const src_idx: usize = lz_face * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
+                        const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, src_idx, bpi));
+                        if (pidx >= pal_info.items.len) continue;
+                        const info = pal_info.items[pidx];
+                        if (!info.draw) continue;
+                        const abs_y: i32 = section_base_y + @as(i32, @intCast(ly));
+                        if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y, @as(i32, @intCast(lz_face)) - 1)) {
+                            mask_z[idxm] = .{ .present = true, .m = .{ .uv = info.nz_uv, .apply_tint = info.nz_apply_tint } };
+                        }
                     }
-                    if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) - 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                        emitQuad(alloc, out, .{ wx0, wy0, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy1, wz0 }, .{ wx0, wy0, wz0 }, uv00, uv01, uv11, uv10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
+                }
+                lx = 0;
+                while (lx < constants.chunk_size_x) : (lx += 1) {
+                    var ly0: usize = 0;
+                    while (ly0 < constants.section_height) : (ly0 += 1) {
+                        const base_idx: usize = lx * constants.section_height + ly0;
+                        if (!mask_z[base_idx].present) continue;
+                        const mkey: FaceMat = mask_z[base_idx].m;
+                        var w: usize = 1;
+                        while ((lx + w) < constants.chunk_size_x) : (w += 1) {
+                            const idx2 = (lx + w) * constants.section_height + ly0;
+                            if (!(mask_z[idx2].present and Mat.eq(mask_z[idx2].m, mkey))) break;
+                        }
+                        var h: usize = 1;
+                        outer_zn: while ((ly0 + h) < constants.section_height) : (h += 1) {
+                            var kx: usize = 0;
+                            while (kx < w) : (kx += 1) {
+                                const idx3 = (lx + kx) * constants.section_height + (ly0 + h);
+                                if (!(mask_z[idx3].present and Mat.eq(mask_z[idx3].m, mkey))) break :outer_zn;
+                            }
+                        }
+                        const z0: f32 = base_z + @as(f32, @floatFromInt(lz_face));
+                        const x0: f32 = base_x + @as(f32, @floatFromInt(lx));
+                        const x1: f32 = x0 + @as(f32, @floatFromInt(w));
+                        const y0: f32 = @as(f32, @floatFromInt(section_base_y)) + @as(f32, @floatFromInt(ly0));
+                        const y1: f32 = y0 + @as(f32, @floatFromInt(h));
+                        const du: f32 = mkey.uv.u1 - mkey.uv.u0;
+                        const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
+                        const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
+                        const rsize = [2]f32{ du, dv };
+                        // -Z face: U along X (w), V along Y (h), flip V so texture top maps to +Y
+                        const uvs_nz_s = uvmap.sideTileUVs(4, w, h);
+                        emitQuad(alloc, out, .{ x0, y0, z0 }, .{ x0, y1, z0 }, .{ x1, y1, z0 }, .{ x1, y0, z0 }, uvs_nz_s[0], uvs_nz_s[1], uvs_nz_s[2], uvs_nz_s[3], rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
+                        var wy: usize = 0;
+                        while (wy < h) : (wy += 1) {
+                            var wx: usize = 0;
+                            while (wx < w) : (wx += 1) mask_z[(lx + wx) * constants.section_height + (ly0 + wy)].present = false;
+                        }
                     }
-                    if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)) + 1, abs_y_this, @as(i32, @intCast(lz)))) {
-                        emitQuad(alloc, out, .{ wx1, wy0, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy1, wz1 }, .{ wx1, wy0, wz1 }, uv00, uv01, uv11, uv10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
+                }
+            }
+            // +Z
+            {
+                var mask_z: [constants.section_height * constants.chunk_size_x]struct { present: bool, m: FaceMat } = undefined;
+                var lx: usize = 0;
+                while (lx < constants.chunk_size_x) : (lx += 1) {
+                    var ly: usize = 0;
+                    while (ly < constants.section_height) : (ly += 1) {
+                        const idxm: usize = lx * constants.section_height + ly;
+                        mask_z[idxm].present = false;
+                        const src_idx: usize = lz_face * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
+                        const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, src_idx, bpi));
+                        if (pidx >= pal_info.items.len) continue;
+                        const info = pal_info.items[pidx];
+                        if (!info.draw) continue;
+                        const abs_y: i32 = section_base_y + @as(i32, @intCast(ly));
+                        if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y, @as(i32, @intCast(lz_face)) + 1)) {
+                            mask_z[idxm] = .{ .present = true, .m = .{ .uv = info.pz_uv, .apply_tint = info.pz_apply_tint } };
+                        }
                     }
-                    if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) - 1)) {
-                        emitQuad(alloc, out, .{ wx0, wy0, wz0 }, .{ wx0, wy1, wz0 }, .{ wx1, wy1, wz0 }, .{ wx1, wy0, wz0 }, uv00, uv01, uv11, uv10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
-                    }
-                    if (!self.isSolidAtSnapshot(snap, ch.pos.x, ch.pos.z, @as(i32, @intCast(lx)), abs_y_this, @as(i32, @intCast(lz)) + 1)) {
-                        emitQuad(alloc, out, .{ wx1, wy0, wz1 }, .{ wx1, wy1, wz1 }, .{ wx0, wy1, wz1 }, .{ wx0, wy0, wz1 }, uv00, uv01, uv11, uv10, rmin, rsize, @floatFromInt(info.side_uv.aidx), 0.0);
+                }
+                lx = 0;
+                while (lx < constants.chunk_size_x) : (lx += 1) {
+                    var ly0: usize = 0;
+                    while (ly0 < constants.section_height) : (ly0 += 1) {
+                        const base_idx: usize = lx * constants.section_height + ly0;
+                        if (!mask_z[base_idx].present) continue;
+                        const mkey: FaceMat = mask_z[base_idx].m;
+                        var w: usize = 1;
+                        while ((lx + w) < constants.chunk_size_x) : (w += 1) {
+                            const idx2 = (lx + w) * constants.section_height + ly0;
+                            if (!(mask_z[idx2].present and Mat.eq(mask_z[idx2].m, mkey))) break;
+                        }
+                        var h: usize = 1;
+                        outer_zp: while ((ly0 + h) < constants.section_height) : (h += 1) {
+                            var kx: usize = 0;
+                            while (kx < w) : (kx += 1) {
+                                const idx3 = (lx + kx) * constants.section_height + (ly0 + h);
+                                if (!(mask_z[idx3].present and Mat.eq(mask_z[idx3].m, mkey))) break :outer_zp;
+                            }
+                        }
+                        const z1: f32 = base_z + @as(f32, @floatFromInt(lz_face + 1));
+                        const x0: f32 = base_x + @as(f32, @floatFromInt(lx));
+                        const x1: f32 = x0 + @as(f32, @floatFromInt(w));
+                        const y0: f32 = @as(f32, @floatFromInt(section_base_y)) + @as(f32, @floatFromInt(ly0));
+                        const y1: f32 = y0 + @as(f32, @floatFromInt(h));
+                        const du: f32 = mkey.uv.u1 - mkey.uv.u0;
+                        const dv: f32 = mkey.uv.v1 - mkey.uv.v0;
+                        const rmin = [2]f32{ mkey.uv.u0, mkey.uv.v0 };
+                        const rsize = [2]f32{ du, dv };
+                        const uvs_pz_s = uvmap.sideTileUVs(5, w, h);
+                        // Use (v0,v1,v2,v3) for +Z to ensure CCW with cull BACK
+                        emitQuad(alloc, out, .{ x0, y0, z1 }, .{ x1, y0, z1 }, .{ x1, y1, z1 }, .{ x0, y1, z1 }, uvs_pz_s[0], uvs_pz_s[3], uvs_pz_s[2], uvs_pz_s[1], rmin, rsize, @floatFromInt(mkey.uv.aidx), if (mkey.apply_tint) 1.0 else 0.0);
+                        var wy: usize = 0;
+                        while (wy < h) : (wy += 1) {
+                            var wx: usize = 0;
+                            while (wx < w) : (wx += 1) mask_z[(lx + wx) * constants.section_height + (ly0 + wy)].present = false;
+                        }
                     }
                 }
             }
@@ -3645,10 +4321,10 @@ pub const Client = struct {
                 const idx3d: usize = lz * (constants.chunk_size_x * constants.section_height) + lx * constants.section_height + ly;
                 const pidx: usize = @intCast(unpackBitsGet(s.blocks_indices_bits, idx3d, bpi));
                 if (pidx >= s.palette.len) return false;
-                const bid: u32 = s.palette[pidx];
+                const bid: u32 = s.palette[pidx].block_id;
                 if (bid == 0) return false;
                 if (bid < cli.sim.reg.blocks.items.len) {
-                    return cli.sim.reg.blocks.items[@intCast(bid)].full_block_collision;
+                    return cli.sim.reg.blocks.items[@intCast(bid)].collision;
                 }
                 return true;
             }
